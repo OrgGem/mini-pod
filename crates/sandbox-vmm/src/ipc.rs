@@ -152,6 +152,22 @@ impl IpcStream {
         let inner = UnixIpcStream::connect(socket_path)?;
         Ok(Self { inner })
     }
+
+    /// Sets the read timeout for blocking reads on this stream (`None` clears the timeout).
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    /// Sets the write timeout for blocking writes on this stream (`None` clears the timeout).
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        self.inner.set_write_timeout(timeout)
+    }
+
+    /// Sets both read and write timeouts on this stream (`None` clears both timeouts).
+    pub fn set_io_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        self.set_read_timeout(timeout)?;
+        self.set_write_timeout(timeout)
+    }
 }
 
 impl Read for IpcStream {
@@ -194,6 +210,13 @@ impl AgentIpcEndpoint {
     /// Creates a short unique owner-only runtime directory under `std::env::temp_dir()` and binds
     /// `a.sock` inside it; removes both the socket file and directory on drop.
     pub fn bind_temp(prefix: &str) -> Result<Self, SandboxError> {
+        Self::bind_temp_in(None, prefix)
+    }
+
+    /// Creates a short unique owner-only runtime directory under `parent_dir` (or
+    /// `std::env::temp_dir()` when `None`) and binds `a.sock` inside it; removes both the socket
+    /// file and directory on drop.
+    pub fn bind_temp_in(parent_dir: Option<&Path>, prefix: &str) -> Result<Self, SandboxError> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let safe_prefix: String = prefix
@@ -206,7 +229,19 @@ impl AgentIpcEndpoint {
         } else {
             &safe_prefix
         };
-        let dir = std::env::temp_dir().join(format!("{tag}-{}-{seq}", std::process::id()));
+        let base = match parent_dir {
+            Some(parent) => {
+                fs::create_dir_all(parent).map_err(|err| {
+                    SandboxError::Transport(format!(
+                        "failed to create runtime parent directory '{}': {err}",
+                        parent.display()
+                    ))
+                })?;
+                parent.to_path_buf()
+            }
+            None => std::env::temp_dir(),
+        };
+        let dir = base.join(format!("{tag}-{}-{seq}", std::process::id()));
         let socket_path = dir.join("a.sock");
 
         match IpcListener::bind(&socket_path) {
@@ -334,5 +369,47 @@ mod tests {
             !runtime_dir.exists(),
             "owned temp runtime dir should be removed on drop"
         );
+    }
+
+    #[test]
+    fn ipc_stream_read_timeout_does_not_hang_on_silent_peer() {
+        let endpoint = AgentIpcEndpoint::bind_temp("ipc-timo").expect("bind temp endpoint");
+        let client_path = endpoint.socket_path().to_path_buf();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let client_thread = thread::spawn(move || {
+            let _client = IpcStream::connect(&client_path).expect("connect silent client");
+            let _ = done_rx.recv();
+        });
+
+        let mut server = endpoint
+            .accept_timeout(Duration::from_secs(2))
+            .expect("accept silent client");
+
+        assert!(matches!(
+            server.set_read_timeout(Some(Duration::ZERO)),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            server.set_write_timeout(Some(Duration::ZERO)),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        server
+            .set_io_timeout(Some(Duration::from_millis(60)))
+            .expect("set stream timeouts");
+        let mut byte = [0u8; 1];
+        let err = server
+            .read(&mut byte)
+            .expect_err("silent peer should trigger read timeout");
+        assert!(
+            matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+            "expected TimedOut or WouldBlock, got {err:?}"
+        );
+
+        server.set_io_timeout(None).expect("clear stream timeouts");
+        let _ = done_tx.send(());
+        drop(server);
+        client_thread.join().expect("client thread completes");
     }
 }

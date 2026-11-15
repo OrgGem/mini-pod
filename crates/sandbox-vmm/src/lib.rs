@@ -5,6 +5,7 @@ pub mod accel;
 pub mod ipc;
 pub mod launch;
 pub mod os;
+pub mod spike;
 
 pub use accel::{
     classify_launch_error, discover_qemu_binary, find_qemu_binary_in_dirs, parse_accel_help,
@@ -15,3 +16,4 @@ pub use ipc::{
     MAX_UNIX_SOCKET_PATH_BYTES,
 };
 pub use launch::{QemuLaunchConfig, AGENT_VIRTIO_PORT_NAME};
+pub use spike::{SpikeBootConfig, SpikeExecOutput, SpikeSession};

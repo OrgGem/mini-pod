@@ -9,7 +9,7 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -20,9 +20,10 @@ use windows_sys::Win32::Foundation::{
     HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    accept, bind, closesocket, connect, listen, recv, send, socket, select, WSAStartup,
-    WSAGetLastError, AF_UNIX, FD_SET, INVALID_SOCKET, SOCKADDR, SOCKET, SOCKET_ERROR, SOCK_STREAM,
-    TIMEVAL, WSADATA,
+    accept, bind, closesocket, connect, listen, recv, select, send, setsockopt, socket,
+    WSAGetLastError, WSAStartup, AF_UNIX, FD_SET, INVALID_SOCKET, SOCKADDR, SOCKET, SOCKET_ERROR,
+    SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO, SO_SNDTIMEO, TIMEVAL, WSADATA, WSAENOPROTOOPT,
+    WSAEOPNOTSUPP,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -301,34 +302,10 @@ impl WindowsUnixListener {
 
     /// Waits up to `timeout` using `select` and accepts an incoming QEMU connection.
     pub fn accept_timeout(&self, timeout: Duration) -> Result<WindowsUnixStream, SandboxError> {
-        let mut read_fds = FD_SET {
-            fd_count: 1,
-            fd_array: [0; 64],
-        };
-        read_fds.fd_array[0] = self.socket.0;
-
-        let tv = TIMEVAL {
-            tv_sec: timeout.as_secs().min(i32::MAX as u64) as i32,
-            tv_usec: timeout.subsec_micros() as i32,
-        };
-
-        // SAFETY: `read_fds` contains 1 valid listening socket and `tv` is valid stack storage.
-        let ready = unsafe {
-            select(
-                0,
-                &mut read_fds,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &tv,
-            )
-        };
-        if ready == SOCKET_ERROR {
-            return Err(wsa_error(&format!(
-                "select('{}')",
-                self.path.display()
-            )));
-        }
-        if ready == 0 {
+        let ready = select_socket_ready(self.socket.0, false, timeout).map_err(|err| {
+            SandboxError::Transport(format!("select('{}') failed: {err}", self.path.display()))
+        })?;
+        if !ready {
             return Err(SandboxError::Transport(format!(
                 "timed out after {}ms waiting for connection on '{}'",
                 timeout.as_millis(),
@@ -344,18 +321,27 @@ impl WindowsUnixListener {
                 self.path.display()
             )));
         }
-        Ok(WindowsUnixStream {
-            socket: OwnedSocket(client),
-        })
+        Ok(WindowsUnixStream::new(OwnedSocket(client)))
     }
 }
 
-/// Connected WinSock2 `AF_UNIX` stream implementing `Read` + `Write`.
+/// Connected WinSock2 `AF_UNIX` stream implementing `Read` + `Write` with timeout support.
 pub struct WindowsUnixStream {
     socket: OwnedSocket,
+    // Fallback millisecond timeouts used only if WinSock `afunix` rejects `SO_RCVTIMEO`/`SO_SNDTIMEO`.
+    fallback_read_timeout_ms: AtomicU32,
+    fallback_write_timeout_ms: AtomicU32,
 }
 
 impl WindowsUnixStream {
+    fn new(socket: OwnedSocket) -> Self {
+        Self {
+            socket,
+            fallback_read_timeout_ms: AtomicU32::new(0),
+            fallback_write_timeout_ms: AtomicU32::new(0),
+        }
+    }
+
     /// Connects as a client to an existing `AF_UNIX` socket path.
     pub fn connect(socket_path: &Path) -> Result<Self, SandboxError> {
         ensure_wsa_started()?;
@@ -383,7 +369,61 @@ impl WindowsUnixStream {
                 socket_path.display()
             )));
         }
-        Ok(Self { socket: sock })
+        Ok(Self::new(sock))
+    }
+
+    /// Configures the socket receive timeout via `SO_RCVTIMEO` (`None` clears the timeout).
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        self.set_socket_timeout(
+            SO_RCVTIMEO as i32,
+            timeout,
+            "SO_RCVTIMEO",
+            &self.fallback_read_timeout_ms,
+        )
+    }
+
+    /// Configures the socket send timeout via `SO_SNDTIMEO` (`None` clears the timeout).
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        self.set_socket_timeout(
+            SO_SNDTIMEO as i32,
+            timeout,
+            "SO_SNDTIMEO",
+            &self.fallback_write_timeout_ms,
+        )
+    }
+
+    fn set_socket_timeout(
+        &self,
+        optname: i32,
+        timeout: Option<Duration>,
+        label: &str,
+        fallback_ms: &AtomicU32,
+    ) -> Result<(), SandboxError> {
+        let ms = duration_to_win_timeout_ms(timeout)?;
+        // SAFETY: `self.socket.0` is an open WinSock2 socket and `ms` is a 4-byte `DWORD` (`SO_RCVTIMEO`/`SO_SNDTIMEO`).
+        let rc = unsafe {
+            setsockopt(
+                self.socket.0,
+                SOL_SOCKET as i32,
+                optname,
+                (&ms as *const u32).cast::<u8>(),
+                size_of::<u32>() as i32,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            // SAFETY: Thread-local WinSock error code immediately after failed `setsockopt`.
+            let code = unsafe { WSAGetLastError() };
+            if code == WSAENOPROTOOPT || code == WSAEOPNOTSUPP {
+                fallback_ms.store(ms, Ordering::Release);
+                return Ok(());
+            }
+            return Err(SandboxError::Transport(format!(
+                "setsockopt({label}) failed with WinSock error {code}: {}",
+                io::Error::from_raw_os_error(code)
+            )));
+        }
+        fallback_ms.store(0, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -392,6 +432,16 @@ impl Read for WindowsUnixStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        let fallback_ms = self.fallback_read_timeout_ms.load(Ordering::Acquire);
+        if fallback_ms > 0
+            && !select_socket_ready(self.socket.0, false, Duration::from_millis(u64::from(fallback_ms)))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WinSock AF_UNIX read timed out",
+            ));
+        }
+
         let len = buf.len().min(i32::MAX as usize) as i32;
         // SAFETY: `self.socket.0` is an open connected socket and `buf` has `len` writable bytes.
         let rc = unsafe { recv(self.socket.0, buf.as_mut_ptr(), len, 0) };
@@ -409,6 +459,16 @@ impl Write for WindowsUnixStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        let fallback_ms = self.fallback_write_timeout_ms.load(Ordering::Acquire);
+        if fallback_ms > 0
+            && !select_socket_ready(self.socket.0, true, Duration::from_millis(u64::from(fallback_ms)))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WinSock AF_UNIX write timed out",
+            ));
+        }
+
         let len = buf.len().min(i32::MAX as usize) as i32;
         // SAFETY: `self.socket.0` is an open connected socket and `buf` has `len` readable bytes.
         let rc = unsafe { send(self.socket.0, buf.as_ptr(), len, 0) };
@@ -423,6 +483,44 @@ impl Write for WindowsUnixStream {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn duration_to_win_timeout_ms(timeout: Option<Duration>) -> Result<u32, SandboxError> {
+    match timeout {
+        None => Ok(0),
+        Some(dur) if dur.is_zero() => Err(SandboxError::InvalidSpec(
+            "IPC stream timeout must be greater than zero (use None to clear)".to_owned(),
+        )),
+        Some(dur) => {
+            // WinSock SO_RCVTIMEO/SO_SNDTIMEO interprets 0 as infinite, so clamp sub-ms durations to 1ms.
+            Ok(dur.as_millis().clamp(1, u32::MAX as u128) as u32)
+        }
+    }
+}
+
+fn select_socket_ready(sock: SOCKET, for_write: bool, timeout: Duration) -> io::Result<bool> {
+    let mut fds = FD_SET {
+        fd_count: 1,
+        fd_array: [0; 64],
+    };
+    fds.fd_array[0] = sock;
+    let tv = TIMEVAL {
+        tv_sec: timeout.as_secs().min(i32::MAX as u64) as i32,
+        tv_usec: timeout.subsec_micros() as i32,
+    };
+    let (readfds, writefds) = if for_write {
+        (ptr::null_mut(), &mut fds as *mut FD_SET)
+    } else {
+        (&mut fds as *mut FD_SET, ptr::null_mut())
+    };
+    // SAFETY: `fds` holds one open socket and `tv` is valid stack storage.
+    let ready = unsafe { select(0, readfds, writefds, ptr::null_mut(), &tv) };
+    if ready == SOCKET_ERROR {
+        // SAFETY: Thread-local WinSock error code immediately after failed `select`.
+        let code = unsafe { WSAGetLastError() };
+        return Err(io::Error::from_raw_os_error(code));
+    }
+    Ok(ready > 0)
 }
 
 /// Returns the current process user's SID string (e.g. `S-1-5-21-...`).

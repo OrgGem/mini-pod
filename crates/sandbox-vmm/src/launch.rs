@@ -44,17 +44,7 @@ impl QemuLaunchConfig {
             ));
         }
         validate_socket_path(&self.agent_socket_path)?;
-
-        match &self.network {
-            NetworkPolicy::Isolated => {}
-            NetworkPolicy::InternetOnly
-            | NetworkPolicy::DomainAllowList { .. }
-            | NetworkPolicy::Unrestricted => {
-                return Err(SandboxError::PolicyViolation(
-                    "host egress proxy is not enabled until Phase 5; refusing non-Isolated QEMU network policy".to_owned(),
-                ));
-            }
-        }
+        validate_isolated_network(&self.network)?;
 
         let sock_str = self
             .agent_socket_path
@@ -110,6 +100,17 @@ impl QemuLaunchConfig {
         args.push(format!("virtserialport,chardev=agent0,name={AGENT_VIRTIO_PORT_NAME}").into());
 
         Ok(args)
+    }
+}
+
+pub(crate) fn validate_isolated_network(network: &NetworkPolicy) -> Result<(), SandboxError> {
+    match network {
+        NetworkPolicy::Isolated => Ok(()),
+        NetworkPolicy::InternetOnly
+        | NetworkPolicy::DomainAllowList { .. }
+        | NetworkPolicy::Unrestricted => Err(SandboxError::PolicyViolation(
+            "host egress proxy is not enabled until Phase 5; refusing non-Isolated QEMU network policy".to_owned(),
+        )),
     }
 }
 

@@ -179,6 +179,30 @@ impl UnixIpcStream {
         })?;
         Ok(Self { stream })
     }
+
+    /// Configures the read timeout on the underlying Unix domain stream (`None` clears it).
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        if matches!(timeout, Some(d) if d.is_zero()) {
+            return Err(SandboxError::InvalidSpec(
+                "IPC stream read timeout must be greater than zero (use None to clear)".to_owned(),
+            ));
+        }
+        self.stream.set_read_timeout(timeout).map_err(|err| {
+            SandboxError::Transport(format!("failed to set Unix stream read timeout: {err}"))
+        })
+    }
+
+    /// Configures the write timeout on the underlying Unix domain stream (`None` clears it).
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
+        if matches!(timeout, Some(d) if d.is_zero()) {
+            return Err(SandboxError::InvalidSpec(
+                "IPC stream write timeout must be greater than zero (use None to clear)".to_owned(),
+            ));
+        }
+        self.stream.set_write_timeout(timeout).map_err(|err| {
+            SandboxError::Transport(format!("failed to set Unix stream write timeout: {err}"))
+        })
+    }
 }
 
 impl Read for UnixIpcStream {
