@@ -30,6 +30,7 @@ sandbox-docker-compat = { path = "crates/sandbox-docker-compat" }
 sandbox-client = { path = "crates/sandbox-client" }
 async-trait = "0.1"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+getrandom = "0.2"
 sha2 = "0.10"
 windows-sys = "0.59"
 
