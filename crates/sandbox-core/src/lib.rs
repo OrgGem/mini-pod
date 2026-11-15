@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 //! Domain types, policy contracts, capability reporting, and lifecycle invariants for `mini-pod`.
 
+pub mod arch;
 pub mod error;
 pub mod exec;
 pub mod lifecycle;
 pub mod policy;
 
+pub use arch::GuestArch;
 pub use error::SandboxError;
 pub use exec::{ExecExitStatus, ExecRequest, ExecTarget};
 pub use lifecycle::{
