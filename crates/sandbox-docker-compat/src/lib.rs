@@ -5,6 +5,9 @@
 pub mod hijack;
 pub mod http1;
 pub mod policy;
+pub mod ports;
+pub mod rewrite;
+pub mod server;
 
 pub use hijack::relay_upgraded;
 pub use http1::{
@@ -16,3 +19,8 @@ pub use policy::{
     sanitize_container_create, DockerCompatPolicy, PolicyRejection, ReaperSocketPolicy,
     RequestedPortBinding, SanitizedCreatePlan,
 };
+pub use ports::{ActivePortForward, PortForwardRegistry};
+pub use rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json, RewriteError};
+#[cfg(unix)]
+pub use server::UnixServerHandle;
+pub use server::{DockerCompatServer, HttpServerHandle};

@@ -555,7 +555,7 @@ fn parse_host_port(val: Option<&Value>) -> Result<Option<u16>, PolicyRejection> 
     Ok(Some(port))
 }
 
-fn parse_port_key(key: &str) -> Result<(u16, String), PolicyRejection> {
+pub(crate) fn parse_port_key(key: &str) -> Result<(u16, String), PolicyRejection> {
     let (port_str, proto) = match key.split_once('/') {
         Some((p, pr)) => {
             if pr.contains('/') || pr.is_empty() {

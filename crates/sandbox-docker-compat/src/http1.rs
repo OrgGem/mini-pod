@@ -566,9 +566,8 @@ pub async fn read_body_bytes<R: AsyncRead + Unpin>(
 
 /// Streams an HTTP/1.1 body through in fixed-size slices without buffering unbounded streams in RAM.
 ///
-/// For [`BodyMode::Chunked`], validates each chunk header and preserves valid HTTP/1.1 chunked
-/// wire framing while flushing after every chunk so `/logs` and `/events` stream in real time.
-/// Returns the total payload bytes forwarded.
+/// Flushes writes after every read slice and every chunk so streaming endpoints (`/logs?follow=1`,
+/// `/events`) deliver output incrementally in real time. Returns total payload bytes forwarded.
 pub async fn forward_body<R, W>(
     reader: &mut PrefixedReader<R>,
     writer: &mut W,
@@ -590,9 +589,9 @@ where
                     return Err(HttpError::UnexpectedEof);
                 }
                 writer.write_all(&buf[..n]).await?;
+                writer.flush().await?;
                 remaining -= n as u64;
             }
-            writer.flush().await?;
             Ok(total)
         }
         BodyMode::UntilEof => {
@@ -637,6 +636,7 @@ where
                         return Err(HttpError::UnexpectedEof);
                     }
                     writer.write_all(&buf[..n]).await?;
+                    writer.flush().await?;
                     remaining -= n as u64;
                 }
                 expect_chunk_crlf(reader).await?;
@@ -1368,5 +1368,40 @@ mod tests {
         assert_eq!(req2.body_mode(), BodyMode::Empty);
 
         assert!(read_request_head(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn forward_body_content_length_flushes_each_slice_immediately() {
+        let (mut src_write, src_read) = tokio::io::duplex(4096);
+        let (sink_write, mut sink_read) = tokio::io::duplex(4096);
+
+        let forward_task = tokio::spawn(async move {
+            let mut r = PrefixedReader::new(src_read);
+            let mut w = sink_write;
+            forward_body(&mut r, &mut w, BodyMode::ContentLength(10))
+                .await
+                .unwrap()
+        });
+
+        src_write.write_all(b"slice").await.unwrap();
+        src_write.flush().await.unwrap();
+
+        let mut first = [0u8; 5];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sink_read.read_exact(&mut first),
+        )
+        .await
+        .expect("first slice must flush before full body arrives")
+        .unwrap();
+        assert_eq!(&first, b"slice");
+
+        src_write.write_all(b"-tail").await.unwrap();
+        src_write.flush().await.unwrap();
+
+        let mut second = [0u8; 5];
+        sink_read.read_exact(&mut second).await.unwrap();
+        assert_eq!(&second, b"-tail");
+        assert_eq!(forward_task.await.unwrap(), 10);
     }
 }
