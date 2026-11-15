@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 sandbox-core = { workspace = true }
 sandbox-protocol = { workspace = true }
 sandbox-runtime = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
