@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use sandbox_core::{AccelerationPolicy, NetworkPolicy, SandboxError};
+use sandbox_core::{AccelerationPolicy, GuestArch, NetworkPolicy, SandboxError};
 use sandbox_protocol::{
     read_frame, write_frame, Frame, Message, ProtocolError, StreamChannel, StreamId,
     PROTOCOL_VERSION,
 };
 
 use crate::accel::{
-    classify_launch_error, discover_qemu_binary, probe_available_accelerators, select_accelerator,
-    Accelerator,
+    classify_launch_error, discover_qemu_binary_for_arch, probe_available_accelerators_for_arch,
+    select_accelerator, Accelerator,
 };
 use crate::ipc::{AgentIpcEndpoint, IpcStream};
 use crate::launch::{validate_isolated_network, QemuLaunchConfig};
@@ -25,12 +25,15 @@ const POWEROFF_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DIAGNOSTIC_TAIL_BYTES: usize = 4096;
 
-/// Configuration for launching and communicating with a Phase 1 QEMU spike guest.
+/// Configuration for launching and communicating with a Phase 1/2 QEMU spike guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpikeBootConfig {
     pub qemu_bin: Option<PathBuf>,
+    pub arch: GuestArch,
     pub kernel_path: PathBuf,
     pub initrd_path: PathBuf,
+    pub root_disk_qcow2: Option<PathBuf>,
+    pub kernel_cmdline_extra: Option<String>,
     pub acceleration: AccelerationPolicy,
     pub network: NetworkPolicy,
     pub vcpus: u8,
@@ -44,8 +47,11 @@ impl Default for SpikeBootConfig {
     fn default() -> Self {
         Self {
             qemu_bin: None,
+            arch: GuestArch::X86_64,
             kernel_path: PathBuf::new(),
             initrd_path: PathBuf::new(),
+            root_disk_qcow2: None,
+            kernel_cmdline_extra: None,
             acceleration: AccelerationPolicy::Preferred,
             network: NetworkPolicy::Isolated,
             vcpus: 1,
@@ -108,14 +114,22 @@ impl SpikeSession {
                 config.initrd_path.display()
             )));
         }
+        if let Some(disk_path) = &config.root_disk_qcow2 {
+            if !disk_path.is_file() {
+                return Err(SandboxError::NotFound(format!(
+                    "guest root disk '{}' does not exist or is not a file",
+                    disk_path.display()
+                )));
+            }
+        }
         if config.boot_timeout.is_zero() || config.exec_timeout.is_zero() {
             return Err(SandboxError::InvalidSpec(
                 "boot_timeout and exec_timeout must be greater than zero".to_owned(),
             ));
         }
 
-        let qemu_bin = discover_qemu_binary(config.qemu_bin.as_deref())?;
-        let available = probe_available_accelerators(&qemu_bin)?;
+        let qemu_bin = discover_qemu_binary_for_arch(config.arch, config.qemu_bin.as_deref())?;
+        let available = probe_available_accelerators_for_arch(&qemu_bin, config.arch)?;
         let attempts = build_candidate_attempts(config.acceleration, &available)?;
 
         let mut primary_failure: Option<(Accelerator, SandboxError)> = None;
@@ -296,6 +310,24 @@ impl Drop for SpikeSession {
     }
 }
 
+fn build_kernel_cmdline(config: &SpikeBootConfig) -> String {
+    let mut cmdline = match config.arch {
+        GuestArch::X86_64 => "console=ttyS0 panic=1".to_owned(),
+        GuestArch::Aarch64 => "console=ttyAMA0 panic=1".to_owned(),
+    };
+    if config.root_disk_qcow2.is_some() {
+        cmdline.push_str(" minipod.root=/dev/vda");
+    }
+    if let Some(extra) = &config.kernel_cmdline_extra {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(trimmed);
+        }
+    }
+    cmdline
+}
+
 fn boot_attempt(
     config: &SpikeBootConfig,
     qemu_bin: &Path,
@@ -322,10 +354,12 @@ fn boot_attempt(
     let stderr_log_path = runtime_dir.join("qemu-stderr.log");
     let launch_cfg = QemuLaunchConfig {
         qemu_bin: qemu_bin.to_path_buf(),
+        arch: config.arch,
         accelerator: accel,
         kernel_path: config.kernel_path.clone(),
         initrd_path: Some(config.initrd_path.clone()),
-        kernel_cmdline: "console=ttyS0 panic=1 rdinit=/init".to_owned(),
+        kernel_cmdline: build_kernel_cmdline(config),
+        root_disk_qcow2: config.root_disk_qcow2.clone(),
         vcpus: config.vcpus,
         ram_mb: config.ram_mb,
         agent_socket_path: socket_path,
@@ -733,12 +767,54 @@ mod tests {
             Err(SandboxError::NotFound(_))
         ));
 
+        let mut missing_disk = SpikeBootConfig::new(&kernel, &initrd);
+        missing_disk.root_disk_qcow2 = Some(dir.path().join("no-root.qcow2"));
+        assert!(matches!(
+            SpikeSession::boot(&missing_disk),
+            Err(SandboxError::NotFound(_))
+        ));
+
         let mut zero_timeout = SpikeBootConfig::new(&kernel, &initrd);
         zero_timeout.exec_timeout = Duration::ZERO;
         assert!(matches!(
             SpikeSession::boot(&zero_timeout),
             Err(SandboxError::InvalidSpec(_))
         ));
+    }
+
+    #[test]
+    fn build_kernel_cmdline_selects_console_root_and_extra() {
+        let mut x64 = SpikeBootConfig::new("vmlinuz", "initrd");
+        assert_eq!(build_kernel_cmdline(&x64), "console=ttyS0 panic=1");
+
+        x64.root_disk_qcow2 = Some(PathBuf::from("root.qcow2"));
+        assert_eq!(
+            build_kernel_cmdline(&x64),
+            "console=ttyS0 panic=1 minipod.root=/dev/vda"
+        );
+
+        x64.kernel_cmdline_extra = Some("   \t  ".to_owned());
+        assert_eq!(
+            build_kernel_cmdline(&x64),
+            "console=ttyS0 panic=1 minipod.root=/dev/vda"
+        );
+
+        x64.kernel_cmdline_extra = Some("  quiet rdinit=/init  ".to_owned());
+        assert_eq!(
+            build_kernel_cmdline(&x64),
+            "console=ttyS0 panic=1 minipod.root=/dev/vda quiet rdinit=/init"
+        );
+
+        let mut arm64 = SpikeBootConfig::new("Image", "initrd");
+        arm64.arch = GuestArch::Aarch64;
+        assert_eq!(build_kernel_cmdline(&arm64), "console=ttyAMA0 panic=1");
+
+        arm64.root_disk_qcow2 = Some(PathBuf::from("root.qcow2"));
+        arm64.kernel_cmdline_extra = Some("minipod.agent=/bin/agent".to_owned());
+        assert_eq!(
+            build_kernel_cmdline(&arm64),
+            "console=ttyAMA0 panic=1 minipod.root=/dev/vda minipod.agent=/bin/agent"
+        );
     }
 
     #[test]

@@ -4,13 +4,33 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sandbox_core::{AccelerationPolicy, SandboxError};
+use sandbox_core::{AccelerationPolicy, GuestArch, SandboxError};
 
-// shortcut: hardcoded x86_64 QEMU binary name; parameterize by guest architecture when Phase 2 adds aarch64 bundles
-#[cfg(windows)]
-const QEMU_BINARY_NAME: &str = "qemu-system-x86_64.exe";
-#[cfg(not(windows))]
-const QEMU_BINARY_NAME: &str = "qemu-system-x86_64";
+/// Returns the host-platform QEMU system emulator binary name for `arch`.
+pub const fn qemu_binary_name(arch: GuestArch) -> &'static str {
+    #[cfg(windows)]
+    match arch {
+        GuestArch::X86_64 => "qemu-system-x86_64.exe",
+        GuestArch::Aarch64 => "qemu-system-aarch64.exe",
+    }
+    #[cfg(not(windows))]
+    match arch {
+        GuestArch::X86_64 => "qemu-system-x86_64",
+        GuestArch::Aarch64 => "qemu-system-aarch64",
+    }
+}
+
+/// Returns the host-platform `qemu-img` binary name.
+pub const fn qemu_img_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "qemu-img.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "qemu-img"
+    }
+}
 
 /// Virtualization or software-emulation accelerator supported by QEMU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,11 +62,8 @@ impl Accelerator {
     }
 }
 
-/// Pure QEMU binary lookup across explicit override and caller-supplied directories.
-///
-/// When `explicit` is `Some(path)`, it is validated directly and never falls back to `search_dirs`.
-/// When `explicit` is `None`, searches `search_dirs` in order for the host QEMU binary name.
-pub fn find_qemu_binary_in_dirs(
+fn find_binary_in_dirs(
+    binary_name: &str,
     explicit: Option<&Path>,
     search_dirs: &[PathBuf],
 ) -> Result<PathBuf, SandboxError> {
@@ -62,26 +79,18 @@ pub fn find_qemu_binary_in_dirs(
     }
 
     for dir in search_dirs {
-        let candidate = dir.join(QEMU_BINARY_NAME);
+        let candidate = dir.join(binary_name);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
 
     Err(SandboxError::NotFound(format!(
-        "QEMU binary '{QEMU_BINARY_NAME}' was not found in configured search directories"
+        "QEMU binary '{binary_name}' was not found in configured search directories"
     )))
 }
 
-/// Discovers the QEMU binary using `explicit` or the host process `PATH` (plus standard Windows fallback paths).
-///
-/// Intended strictly for outer composition roots (`sandboxd`, `sandbox-cli`); inner runtime layers
-/// should pass explicit configuration or invoke [`find_qemu_binary_in_dirs`] directly.
-pub fn discover_qemu_binary(explicit: Option<&Path>) -> Result<PathBuf, SandboxError> {
-    if explicit.is_some() {
-        return find_qemu_binary_in_dirs(explicit, &[]);
-    }
-
+fn default_qemu_search_dirs() -> Vec<PathBuf> {
     let mut search_dirs = Vec::new();
     if let Some(path_var) = std::env::var_os("PATH") {
         search_dirs.extend(
@@ -97,7 +106,59 @@ pub fn discover_qemu_binary(explicit: Option<&Path>) -> Result<PathBuf, SandboxE
         search_dirs.push(PathBuf::from(r"C:\Program Files\qemu"));
     }
 
-    find_qemu_binary_in_dirs(None, &search_dirs)
+    search_dirs
+}
+
+fn discover_binary(binary_name: &str, explicit: Option<&Path>) -> Result<PathBuf, SandboxError> {
+    if explicit.is_some() {
+        return find_binary_in_dirs(binary_name, explicit, &[]);
+    }
+    let search_dirs = default_qemu_search_dirs();
+    find_binary_in_dirs(binary_name, None, &search_dirs)
+}
+
+/// Pure QEMU binary lookup for `arch` across an explicit override and caller-supplied directories.
+///
+/// When `explicit` is `Some(path)`, it is validated directly and never falls back to `search_dirs`.
+/// When `explicit` is `None`, searches `search_dirs` in order for [`qemu_binary_name`].
+pub fn find_qemu_binary_for_arch_in_dirs(
+    arch: GuestArch,
+    explicit: Option<&Path>,
+    search_dirs: &[PathBuf],
+) -> Result<PathBuf, SandboxError> {
+    find_binary_in_dirs(qemu_binary_name(arch), explicit, search_dirs)
+}
+
+/// Pure `x86_64` QEMU binary lookup across an explicit override and caller-supplied directories.
+pub fn find_qemu_binary_in_dirs(
+    explicit: Option<&Path>,
+    search_dirs: &[PathBuf],
+) -> Result<PathBuf, SandboxError> {
+    find_qemu_binary_for_arch_in_dirs(GuestArch::X86_64, explicit, search_dirs)
+}
+
+/// Discovers the QEMU binary for `arch` using `explicit` or the host process `PATH`
+/// (plus standard Windows fallback paths).
+///
+/// Intended strictly for outer composition roots (`sandboxd`, `sandbox-cli`); inner runtime layers
+/// should pass explicit configuration or invoke [`find_qemu_binary_for_arch_in_dirs`] directly.
+pub fn discover_qemu_binary_for_arch(
+    arch: GuestArch,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, SandboxError> {
+    discover_binary(qemu_binary_name(arch), explicit)
+}
+
+/// Discovers the `x86_64` QEMU binary using `explicit` or the host process `PATH`
+/// (plus standard Windows fallback paths).
+pub fn discover_qemu_binary(explicit: Option<&Path>) -> Result<PathBuf, SandboxError> {
+    discover_qemu_binary_for_arch(GuestArch::X86_64, explicit)
+}
+
+/// Discovers the `qemu-img` binary using `explicit` or the host process `PATH`
+/// (plus standard Windows fallback paths).
+pub fn discover_qemu_img_binary(explicit: Option<&Path>) -> Result<PathBuf, SandboxError> {
+    discover_binary(qemu_img_binary_name(), explicit)
 }
 
 /// Classifies an I/O error returned while probing or launching a QEMU binary into [`SandboxError`].
@@ -131,7 +192,7 @@ pub fn classify_launch_error(qemu_bin: &Path, err: &io::Error) -> SandboxError {
     }
 }
 
-/// Parses stdout from `qemu-system-x86_64 -accel help` into deduplicated [`Accelerator`] entries.
+/// Parses stdout from `qemu-system-* -accel help` into deduplicated [`Accelerator`] entries.
 pub fn parse_accel_help(stdout: &str) -> Vec<Accelerator> {
     let mut accels = Vec::new();
     for line in stdout.lines() {
@@ -157,8 +218,15 @@ pub fn parse_accel_help(stdout: &str) -> Vec<Accelerator> {
     accels
 }
 
-/// Probes `qemu_bin -accel help` and filters the reported accelerators by host OS feasibility.
-pub fn probe_available_accelerators(qemu_bin: &Path) -> Result<Vec<Accelerator>, SandboxError> {
+/// Probes `qemu_bin -accel help` and filters reported accelerators by host feasibility
+/// and compatibility with `guest_arch`.
+///
+/// Hardware accelerators (`Kvm`, `Hvf`, `Whpx`) are retained only when
+/// `GuestArch::host_native() == Some(guest_arch)`; cross-architecture emulation retains `Tcg` only.
+pub fn probe_available_accelerators_for_arch(
+    qemu_bin: &Path,
+    guest_arch: GuestArch,
+) -> Result<Vec<Accelerator>, SandboxError> {
     let output = Command::new(qemu_bin)
         .args(["-accel", "help"])
         .output()
@@ -175,7 +243,14 @@ pub fn probe_available_accelerators(qemu_bin: &Path) -> Result<Vec<Accelerator>,
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(filter_host_feasible(parse_accel_help(&stdout)))
+    let parsed = parse_accel_help(&stdout);
+    let arch_filtered = filter_arch_compatible(parsed, guest_arch, GuestArch::host_native());
+    Ok(filter_host_feasible(arch_filtered))
+}
+
+/// Probes `qemu_bin -accel help` for an `x86_64` guest and filters by host OS feasibility.
+pub fn probe_available_accelerators(qemu_bin: &Path) -> Result<Vec<Accelerator>, SandboxError> {
+    probe_available_accelerators_for_arch(qemu_bin, GuestArch::X86_64)
 }
 
 /// Resolves the [`Accelerator`] to pass to QEMU according to [`AccelerationPolicy`].
@@ -209,6 +284,18 @@ pub fn select_accelerator(
             )
         }),
     }
+}
+
+fn filter_arch_compatible(
+    accels: Vec<Accelerator>,
+    guest_arch: GuestArch,
+    host_arch: Option<GuestArch>,
+) -> Vec<Accelerator> {
+    let native_match = host_arch == Some(guest_arch);
+    accels
+        .into_iter()
+        .filter(|accel| !accel.is_hardware() || native_match)
+        .collect()
 }
 
 fn filter_host_feasible(accels: Vec<Accelerator>) -> Vec<Accelerator> {
@@ -454,20 +541,49 @@ mod tests {
     }
 
     #[test]
+    fn qemu_binary_names_match_guest_arch_and_platform() {
+        #[cfg(windows)]
+        {
+            assert_eq!(qemu_binary_name(GuestArch::X86_64), "qemu-system-x86_64.exe");
+            assert_eq!(qemu_binary_name(GuestArch::Aarch64), "qemu-system-aarch64.exe");
+            assert_eq!(qemu_img_binary_name(), "qemu-img.exe");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(qemu_binary_name(GuestArch::X86_64), "qemu-system-x86_64");
+            assert_eq!(qemu_binary_name(GuestArch::Aarch64), "qemu-system-aarch64");
+            assert_eq!(qemu_img_binary_name(), "qemu-img");
+        }
+    }
+
+    #[test]
     fn find_qemu_binary_in_dirs_resolves_hits_and_rejects_missing_explicit() {
         let empty_dir = TestTempDir::new("empty");
         let bin_dir = TestTempDir::new("bin");
-        let fake_qemu = bin_dir.path().join(QEMU_BINARY_NAME);
-        fs::write(&fake_qemu, b"dummy").expect("write dummy qemu binary");
+        let fake_qemu_x64 = bin_dir.path().join(qemu_binary_name(GuestArch::X86_64));
+        let fake_qemu_arm64 = bin_dir.path().join(qemu_binary_name(GuestArch::Aarch64));
+        let fake_qemu_img = bin_dir.path().join(qemu_img_binary_name());
+        fs::write(&fake_qemu_x64, b"dummy").expect("write dummy x86_64 qemu binary");
+        fs::write(&fake_qemu_arm64, b"dummy").expect("write dummy aarch64 qemu binary");
+        fs::write(&fake_qemu_img, b"dummy").expect("write dummy qemu-img binary");
 
         let search_dirs = vec![empty_dir.path().to_path_buf(), bin_dir.path().to_path_buf()];
 
-        let found = find_qemu_binary_in_dirs(None, &search_dirs).expect("should find in second dir");
-        assert_eq!(found, fake_qemu);
+        let found_x64 =
+            find_qemu_binary_in_dirs(None, &search_dirs).expect("should find x86_64 in second dir");
+        assert_eq!(found_x64, fake_qemu_x64);
 
-        let explicit_hit =
-            find_qemu_binary_in_dirs(Some(&fake_qemu), &[]).expect("explicit existing path");
-        assert_eq!(explicit_hit, fake_qemu);
+        let found_arm64 = find_qemu_binary_for_arch_in_dirs(GuestArch::Aarch64, None, &search_dirs)
+            .expect("should find aarch64 in second dir");
+        assert_eq!(found_arm64, fake_qemu_arm64);
+
+        let explicit_hit = find_qemu_binary_for_arch_in_dirs(
+            GuestArch::Aarch64,
+            Some(&fake_qemu_arm64),
+            &[],
+        )
+        .expect("explicit existing path");
+        assert_eq!(explicit_hit, fake_qemu_arm64);
 
         // Missing explicit path must fail instead of falling back to search_dirs.
         let missing = empty_dir.path().join("does-not-exist-qemu");
@@ -486,6 +602,67 @@ mod tests {
             find_qemu_binary_in_dirs(None, &[empty_dir.path().to_path_buf()]),
             Err(SandboxError::NotFound(_))
         ));
+
+        // Shared qemu-img lookup uses the same directory walker and explicit validation.
+        assert_eq!(
+            find_binary_in_dirs(qemu_img_binary_name(), None, &search_dirs)
+                .expect("should find qemu-img in second dir"),
+            fake_qemu_img
+        );
+        assert_eq!(
+            discover_qemu_img_binary(Some(&fake_qemu_img)).expect("explicit qemu-img path"),
+            fake_qemu_img
+        );
+        assert!(matches!(
+            discover_qemu_img_binary(Some(&missing)),
+            Err(SandboxError::NotFound(_))
+        ));
+        assert!(matches!(
+            discover_qemu_img_binary(Some(bin_dir.path())),
+            Err(SandboxError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn filter_arch_compatible_strips_hardware_accelerators_on_cross_arch() {
+        let all_reported = vec![
+            Accelerator::Kvm,
+            Accelerator::Whpx,
+            Accelerator::Hvf,
+            Accelerator::Tcg,
+        ];
+
+        // x86_64 host emulating aarch64 guest must filter out all hardware accelerators.
+        assert_eq!(
+            filter_arch_compatible(all_reported.clone(), GuestArch::Aarch64, Some(GuestArch::X86_64)),
+            vec![Accelerator::Tcg]
+        );
+
+        // aarch64 host emulating x86_64 guest must filter out all hardware accelerators.
+        assert_eq!(
+            filter_arch_compatible(all_reported.clone(), GuestArch::X86_64, Some(GuestArch::Aarch64)),
+            vec![Accelerator::Tcg]
+        );
+
+        // Unsupported host arch retains only TCG.
+        assert_eq!(
+            filter_arch_compatible(all_reported.clone(), GuestArch::X86_64, None),
+            vec![Accelerator::Tcg]
+        );
+
+        // Native host/guest match preserves hardware accelerators for host feasibility checks.
+        assert_eq!(
+            filter_arch_compatible(all_reported.clone(), GuestArch::X86_64, Some(GuestArch::X86_64)),
+            all_reported
+        );
+        assert_eq!(
+            filter_arch_compatible(
+                vec![Accelerator::Kvm, Accelerator::Hvf, Accelerator::Tcg],
+                GuestArch::Aarch64,
+                Some(GuestArch::Aarch64),
+            ),
+            vec![Accelerator::Kvm, Accelerator::Hvf, Accelerator::Tcg]
+        );
     }
 
     #[test]
@@ -493,6 +670,10 @@ mod tests {
         let missing = Path::new("mini-pod-definitely-missing-qemu-binary-12345");
         assert!(matches!(
             probe_available_accelerators(missing),
+            Err(SandboxError::NotFound(_))
+        ));
+        assert!(matches!(
+            probe_available_accelerators_for_arch(missing, GuestArch::Aarch64),
             Err(SandboxError::NotFound(_))
         ));
     }
