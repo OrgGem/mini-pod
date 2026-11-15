@@ -7,6 +7,7 @@ pub mod journal;
 pub mod manager;
 pub mod ports;
 pub mod safe_tar;
+pub mod tunnel;
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -25,9 +26,11 @@ pub use manager::{
     validate_guest_path, LocalRuntimeManager, ReconciliationReport, RuntimeManagerConfig,
 };
 pub use ports::{
-    DiskOverlayPort, PreparedOverlay, VmBootConfig, VmBootOutcome, VmRuntimePort, VmSessionPort,
+    DiskOverlayPort, PreparedOverlay, SandboxTunnelPort, VmBootConfig, VmBootOutcome, VmRuntimePort,
+    VmSessionPort,
 };
 pub use safe_tar::{extract_tar_safely, pack_host_path_to_tar};
+pub use tunnel::{TunnelStream, TunnelStreamHandle};
 
 #[async_trait::async_trait]
 pub trait RuntimeManager: Send + Sync {

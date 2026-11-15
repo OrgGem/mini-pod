@@ -540,6 +540,18 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     shutdown_requested = true;
                     break;
                 }
+                Message::ConnectStart { .. } => {
+                    if let Err(err) = outbound.push_message(
+                        stream_id,
+                        &Message::ConnectError {
+                            message: "tunnel relay not enabled until Task 4.2".to_owned(),
+                        },
+                    ) {
+                        session_res = Err(err);
+                        break;
+                    }
+                }
+                Message::ConnectAck | Message::ConnectError { .. } | Message::StreamClose => {}
                 other => {
                     session_res = Err(ProtocolError::InvalidPayload(format!(
                         "unsupported host-to-guest message {:?}",

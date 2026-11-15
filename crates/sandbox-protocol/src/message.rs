@@ -11,6 +11,13 @@ pub enum ExecTargetWire {
     Container { id_or_name: String },
 }
 
+/// Target stream endpoint inside a sandboxed guest for multiplexed host-to-guest tunnels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamTargetWire {
+    PodmanUnixSocket,
+    GuestLoopbackTcp { port: u16 },
+}
+
 /// Guest I/O stream multiplexed over `Message::StreamData` and `Message::StreamCredit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -112,6 +119,18 @@ pub enum Message {
     CopyError {
         message: String,
     },
+    /// Requests opening a multiplexed stream tunnel to the guest Podman socket or loopback TCP port.
+    ConnectStart {
+        target: StreamTargetWire,
+    },
+    /// Confirms that the guest tunnel target connection succeeded and streaming may proceed.
+    ConnectAck,
+    /// Reports failure establishing or sustaining a guest tunnel connection on [`Lane::Control`].
+    ConnectError {
+        message: String,
+    },
+    /// Aborts or closes both directions of an active tunnel stream immediately on [`Lane::Control`].
+    StreamClose,
 }
 
 impl Message {
@@ -137,6 +156,10 @@ impl Message {
             Self::CopyOutStart { .. } => FrameKind::CopyOutStart,
             Self::CopyDone { .. } => FrameKind::CopyDone,
             Self::CopyError { .. } => FrameKind::CopyError,
+            Self::ConnectStart { .. } => FrameKind::ConnectStart,
+            Self::ConnectAck => FrameKind::ConnectAck,
+            Self::ConnectError { .. } => FrameKind::ConnectError,
+            Self::StreamClose => FrameKind::StreamClose,
         }
     }
 
@@ -188,7 +211,9 @@ impl Message {
                 writer.write_u32(*bytes)?;
                 Ok(writer.finish())
             }
-            Self::ExecCancel | Self::Shutdown => Ok(Vec::new()),
+            Self::ExecCancel | Self::Shutdown | Self::ConnectAck | Self::StreamClose => {
+                Ok(Vec::new())
+            }
             Self::ExecExit {
                 code,
                 timed_out,
@@ -222,9 +247,29 @@ impl Message {
                 Ok(writer.finish())
             }
             Self::CopyDone { bytes_transferred } => Ok(bytes_transferred.to_be_bytes().to_vec()),
-            Self::CopyError { message } => {
+            Self::CopyError { message } | Self::ConnectError { message } => {
                 let mut writer = PayloadWriter::new();
                 writer.write_str(message)?;
+                Ok(writer.finish())
+            }
+            Self::ConnectStart { target } => {
+                let cap = match target {
+                    StreamTargetWire::PodmanUnixSocket => 1,
+                    StreamTargetWire::GuestLoopbackTcp { .. } => 3,
+                };
+                let mut writer = PayloadWriter::with_capacity(cap)?;
+                match target {
+                    StreamTargetWire::PodmanUnixSocket => writer.write_u8(0)?,
+                    StreamTargetWire::GuestLoopbackTcp { port } => {
+                        if *port == 0 {
+                            return Err(ProtocolError::InvalidPayload(
+                                "ConnectStart GuestLoopbackTcp port must be nonzero".to_owned(),
+                            ));
+                        }
+                        writer.write_u8(1)?;
+                        writer.write_u16(*port)?;
+                    }
+                }
                 Ok(writer.finish())
             }
         }
@@ -281,6 +326,31 @@ impl Message {
             FrameKind::CopyError => Self::CopyError {
                 message: reader.read_str()?,
             },
+            FrameKind::ConnectStart => {
+                let target = match reader.read_u8()? {
+                    0 => StreamTargetWire::PodmanUnixSocket,
+                    1 => {
+                        let port = reader.read_u16()?;
+                        if port == 0 {
+                            return Err(ProtocolError::InvalidPayload(
+                                "ConnectStart GuestLoopbackTcp port must be nonzero".to_owned(),
+                            ));
+                        }
+                        StreamTargetWire::GuestLoopbackTcp { port }
+                    }
+                    other => {
+                        return Err(ProtocolError::InvalidPayload(format!(
+                            "invalid StreamTargetWire tag byte: {other}"
+                        )));
+                    }
+                };
+                Self::ConnectStart { target }
+            }
+            FrameKind::ConnectAck => Self::ConnectAck,
+            FrameKind::ConnectError => Self::ConnectError {
+                message: reader.read_str()?,
+            },
+            FrameKind::StreamClose => Self::StreamClose,
         };
         reader.finish(kind)?;
         Ok(msg)
@@ -450,6 +520,10 @@ impl PayloadWriter {
         Ok(())
     }
 
+    fn write_u16(&mut self, value: u16) -> Result<(), ProtocolError> {
+        self.write_bytes(&value.to_be_bytes())
+    }
+
     fn write_u32(&mut self, value: u32) -> Result<(), ProtocolError> {
         self.write_bytes(&value.to_be_bytes())
     }
@@ -551,6 +625,10 @@ impl<'a> PayloadReader<'a> {
                 "invalid boolean byte for {field}: {other}"
             ))),
         }
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ProtocolError> {
+        Ok(u16::from_be_bytes(self.read_array()?))
     }
 
     fn read_u32(&mut self) -> Result<u32, ProtocolError> {
@@ -751,6 +829,38 @@ mod tests {
                 },
                 Lane::Control,
             ),
+            (
+                Message::ConnectStart {
+                    target: StreamTargetWire::PodmanUnixSocket,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ConnectStart {
+                    target: StreamTargetWire::GuestLoopbackTcp { port: 1 },
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ConnectStart {
+                    target: StreamTargetWire::GuestLoopbackTcp { port: 5432 },
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ConnectStart {
+                    target: StreamTargetWire::GuestLoopbackTcp { port: u16::MAX },
+                },
+                Lane::Control,
+            ),
+            (Message::ConnectAck, Lane::Control),
+            (
+                Message::ConnectError {
+                    message: "connection refused".to_owned(),
+                },
+                Lane::Control,
+            ),
+            (Message::StreamClose, Lane::Control),
         ];
 
         for (msg, expected_lane) in samples {
@@ -1026,6 +1136,15 @@ mod tests {
         let copy_error = Message::CopyError {
             message: "denied".to_owned(),
         };
+        let connect_unix = Message::ConnectStart {
+            target: StreamTargetWire::PodmanUnixSocket,
+        };
+        let connect_tcp = Message::ConnectStart {
+            target: StreamTargetWire::GuestLoopbackTcp { port: 8080 },
+        };
+        let connect_error = Message::ConnectError {
+            message: "dial failed".to_owned(),
+        };
 
         // Every proper prefix of every structured message must fail with InvalidPayload.
         for msg in [
@@ -1036,6 +1155,9 @@ mod tests {
             copy_out,
             copy_done,
             copy_error,
+            connect_unix,
+            connect_tcp,
+            connect_error,
         ] {
             let valid = msg.encode_payload().unwrap();
             for prefix_len in 0..valid.len() {
@@ -1084,6 +1206,8 @@ mod tests {
             (FrameKind::Ping, vec![0; 9]),
             (FrameKind::Pong, vec![0; 9]),
             (FrameKind::Shutdown, vec![1]),
+            (FrameKind::ConnectAck, vec![0]),
+            (FrameKind::StreamClose, vec![0]),
         ];
         for (kind, payload) in static_trailing_cases {
             assert!(
@@ -1136,5 +1260,51 @@ mod tests {
             too_big_copy_err.encode_payload(),
             Err(ProtocolError::PayloadTooLarge { .. })
         ));
+
+        let too_big_connect_err = Message::ConnectError {
+            message: "e".repeat(MAX_FRAME_PAYLOAD_BYTES as usize - 3),
+        };
+        assert!(matches!(
+            too_big_connect_err.encode_payload(),
+            Err(ProtocolError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn connect_start_rejects_port_zero_and_invalid_targets_and_connect_error_utf8() {
+        let zero_port = Message::ConnectStart {
+            target: StreamTargetWire::GuestLoopbackTcp { port: 0 },
+        };
+        assert!(matches!(
+            zero_port.encode_payload(),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Raw payload with GuestLoopbackTcp tag (1) and port 0 must be rejected by decode.
+        assert!(matches!(
+            Message::decode(FrameKind::ConnectStart, &[1, 0, 0]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Invalid StreamTargetWire tags.
+        for bad_tag in [2u8, 255u8] {
+            assert!(matches!(
+                Message::decode(FrameKind::ConnectStart, &[bad_tag]),
+                Err(ProtocolError::InvalidPayload(_))
+            ));
+            assert!(matches!(
+                Message::decode(FrameKind::ConnectStart, &[bad_tag, 0, 80]),
+                Err(ProtocolError::InvalidPayload(_))
+            ));
+        }
+
+        // Invalid UTF-8 in ConnectError.
+        let mut bad_connect_err = Vec::new();
+        bad_connect_err.extend_from_slice(&2u32.to_be_bytes());
+        bad_connect_err.extend_from_slice(&[0xFF, 0xFE]);
+        assert_eq!(
+            Message::decode(FrameKind::ConnectError, &bad_connect_err),
+            Err(ProtocolError::InvalidUtf8)
+        );
     }
 }

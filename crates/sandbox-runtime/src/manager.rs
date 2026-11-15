@@ -11,6 +11,7 @@ use sandbox_core::{
     CapabilityReport, DestroyStatus, EnforcementLevel, ExecRequest, ExecTarget, IsolationMode,
     NetworkPolicy, SandboxError, SandboxId, SandboxLease, SandboxSpec,
 };
+use sandbox_protocol::StreamTargetWire;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -18,8 +19,11 @@ use crate::exec_stream::ExecStream;
 use crate::journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
 };
-use crate::ports::{DiskOverlayPort, VmBootConfig, VmRuntimePort, VmSessionPort};
+use crate::ports::{
+    DiskOverlayPort, SandboxTunnelPort, VmBootConfig, VmRuntimePort, VmSessionPort,
+};
 use crate::safe_tar::{ensure_safe_dir_path, extract_tar_safely, pack_host_path_to_tar};
+use crate::tunnel::TunnelStream;
 use crate::RuntimeManager;
 
 const MAX_GUEST_PATH_BYTES: usize = 4096;
@@ -792,6 +796,30 @@ impl RuntimeManager for LocalRuntimeManager {
     }
 }
 
+#[async_trait::async_trait]
+impl SandboxTunnelPort for LocalRuntimeManager {
+    async fn open_podman_unix_stream(&self, id: &SandboxId) -> Result<TunnelStream, SandboxError> {
+        let session = self.get_active_session_for_op(id)?;
+        session.open_tunnel(StreamTargetWire::PodmanUnixSocket).await
+    }
+
+    async fn open_guest_tcp_stream(
+        &self,
+        id: &SandboxId,
+        guest_port: u16,
+    ) -> Result<TunnelStream, SandboxError> {
+        if guest_port == 0 {
+            return Err(SandboxError::InvalidSpec(
+                "guest_port must be greater than zero".to_owned(),
+            ));
+        }
+        let session = self.get_active_session_for_op(id)?;
+        session
+            .open_tunnel(StreamTargetWire::GuestLoopbackTcp { port: guest_port })
+            .await
+    }
+}
+
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1046,6 +1074,32 @@ mod tests {
                     stdout_truncated: false,
                     stderr_truncated: false,
                 }));
+            });
+            Ok(stream)
+        }
+
+        async fn open_tunnel(&self, target: StreamTargetWire) -> Result<TunnelStream, SandboxError> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            if let StreamTargetWire::GuestLoopbackTcp { port: 0 } = target {
+                return Err(SandboxError::InvalidSpec(
+                    "guest_port must be greater than zero".to_owned(),
+                ));
+            }
+            let (stream, mut handle) = TunnelStream::channel(StreamId(2));
+            tokio::spawn(async move {
+                let banner = match target {
+                    StreamTargetWire::PodmanUnixSocket => b"podman:".to_vec(),
+                    StreamTargetWire::GuestLoopbackTcp { port } => format!("tcp:{port}:").into_bytes(),
+                };
+                if handle.write_half.write_all(&banner).await.is_err() {
+                    return;
+                }
+                let mut req = Vec::new();
+                if handle.read_half.read_to_end(&mut req).await.is_ok() {
+                    let _ = handle.write_half.write_all(&req).await;
+                }
+                let _ = handle.write_half.shutdown().await;
             });
             Ok(stream)
         }
@@ -1637,5 +1691,72 @@ mod tests {
         );
         assert_eq!(r1.unwrap().unwrap(), DestroyStatus::AllResourcesCleaned);
         assert_eq!(r2.unwrap().unwrap(), DestroyStatus::AllResourcesCleaned);
+    }
+
+    #[tokio::test]
+    async fn tunnel_port_validates_port_zero_leases_and_streams_duplex() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = TestTempDir::new("mgr-tunnel");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mgr = LocalRuntimeManager::new(base_config(tmp.path().to_path_buf()), overlay, vm)
+            .unwrap();
+
+        let active_lease = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        let short_lease = mgr
+            .spawn(valid_spec(Duration::from_millis(20)))
+            .await
+            .unwrap();
+
+        // Port 0 is rejected upfront with InvalidSpec.
+        assert!(matches!(
+            mgr.open_guest_tcp_stream(&active_lease.id, 0).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        // Missing sandbox returns NotFound.
+        assert!(matches!(
+            mgr.open_podman_unix_stream(&SandboxId::new("missing")).await,
+            Err(SandboxError::NotFound(_))
+        ));
+
+        // Active Podman unix tunnel streams bidirectionally and half-closes cleanly.
+        let mut unix_tunnel = mgr.open_podman_unix_stream(&active_lease.id).await.unwrap();
+        unix_tunnel.write_all(b"GET /_ping").await.unwrap();
+        unix_tunnel.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        unix_tunnel.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(resp, b"podman:GET /_ping");
+
+        // Active guest loopback TCP tunnel targets requested port.
+        let mut tcp_tunnel = mgr
+            .open_guest_tcp_stream(&active_lease.id, 5432)
+            .await
+            .unwrap();
+        tcp_tunnel.write_all(b"hello").await.unwrap();
+        tcp_tunnel.shutdown().await.unwrap();
+        let mut tcp_resp = Vec::new();
+        tcp_tunnel.read_to_end(&mut tcp_resp).await.unwrap();
+        assert_eq!(tcp_resp, b"tcp:5432:hello");
+
+        // Expired lease returns LeaseExpired for both tunnel variants.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(matches!(
+            mgr.open_podman_unix_stream(&short_lease.id).await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+        assert!(matches!(
+            mgr.open_guest_tcp_stream(&short_lease.id, 80).await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+
+        mgr.destroy(&active_lease.id).await.unwrap();
+        mgr.destroy(&short_lease.id).await.unwrap();
+
+        assert!(matches!(
+            mgr.open_podman_unix_stream(&active_lease.id).await,
+            Err(SandboxError::NotFound(_))
+        ));
     }
 }

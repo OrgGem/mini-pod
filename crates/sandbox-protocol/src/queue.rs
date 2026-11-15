@@ -208,4 +208,63 @@ mod tests {
         assert_eq!(queue.pop(), Some(copy_done));
         assert!(queue.is_empty());
     }
+
+    #[test]
+    fn tunnel_stream_eof_stays_on_data_lane_while_connect_and_close_preempt_on_control() {
+        use crate::StreamTargetWire;
+
+        let mut queue = PriorityFrameQueue::new();
+        let data_chunk = Frame::from_message(
+            StreamId(10),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: false,
+                data: b"GET / HTTP/1.1\r\n".to_vec(),
+            },
+        )
+        .unwrap();
+        let data_eof = Frame::from_message(
+            StreamId(10),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: true,
+                data: Vec::new(),
+            },
+        )
+        .unwrap();
+        let connect_start = Frame::from_message(
+            StreamId(11),
+            &Message::ConnectStart {
+                target: StreamTargetWire::PodmanUnixSocket,
+            },
+        )
+        .unwrap();
+        let connect_ack = Frame::from_message(StreamId(11), &Message::ConnectAck).unwrap();
+        let connect_err = Frame::from_message(
+            StreamId(12),
+            &Message::ConnectError {
+                message: "refused".to_owned(),
+            },
+        )
+        .unwrap();
+        let stream_close = Frame::from_message(StreamId(10), &Message::StreamClose).unwrap();
+
+        queue.push(data_chunk.clone());
+        queue.push(data_eof.clone());
+        queue.push(connect_start.clone());
+        queue.push(connect_ack.clone());
+        queue.push(connect_err.clone());
+        queue.push(stream_close.clone());
+
+        assert_eq!(queue.control_len(), 4);
+        assert_eq!(queue.data_len(), 2);
+
+        assert_eq!(queue.pop(), Some(connect_start));
+        assert_eq!(queue.pop(), Some(connect_ack));
+        assert_eq!(queue.pop(), Some(connect_err));
+        assert_eq!(queue.pop(), Some(stream_close));
+        assert_eq!(queue.pop(), Some(data_chunk));
+        assert_eq!(queue.pop(), Some(data_eof));
+        assert!(queue.is_empty());
+    }
 }

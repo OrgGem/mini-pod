@@ -5,7 +5,7 @@
 pub mod message;
 pub mod queue;
 
-pub use message::{ExecTargetWire, Message, StreamChannel};
+pub use message::{ExecTargetWire, Message, StreamChannel, StreamTargetWire};
 pub use queue::PriorityFrameQueue;
 
 use std::{fmt, io};
@@ -60,6 +60,10 @@ pub enum FrameKind {
     CopyOutStart = 12,
     CopyDone = 13,
     CopyError = 14,
+    ConnectStart = 15,
+    ConnectAck = 16,
+    ConnectError = 17,
+    StreamClose = 18,
 }
 
 impl FrameKind {
@@ -68,7 +72,8 @@ impl FrameKind {
     /// [`FrameKind::CopyDone`] shares [`Lane::Data`] with [`FrameKind::StreamData`] so that
     /// copy-out completions preserve strict FIFO ordering behind the tar chunks they terminate
     /// inside [`PriorityFrameQueue`], while [`FrameKind::CopyError`], [`FrameKind::StreamCredit`],
-    /// and cancel/liveness frames stay on [`Lane::Control`].
+    /// tunnel lifecycle frames (`Connect*`, `StreamClose`), and cancel/liveness frames stay on
+    /// [`Lane::Control`].
     pub const fn lane(self) -> Lane {
         match self {
             Self::StreamData | Self::CopyDone => Lane::Data,
@@ -83,7 +88,11 @@ impl FrameKind {
             | Self::Shutdown
             | Self::CopyInStart
             | Self::CopyOutStart
-            | Self::CopyError => Lane::Control,
+            | Self::CopyError
+            | Self::ConnectStart
+            | Self::ConnectAck
+            | Self::ConnectError
+            | Self::StreamClose => Lane::Control,
         }
     }
 }
@@ -107,6 +116,10 @@ impl TryFrom<u8> for FrameKind {
             12 => Ok(Self::CopyOutStart),
             13 => Ok(Self::CopyDone),
             14 => Ok(Self::CopyError),
+            15 => Ok(Self::ConnectStart),
+            16 => Ok(Self::ConnectAck),
+            17 => Ok(Self::ConnectError),
+            18 => Ok(Self::StreamClose),
             other => Err(ProtocolError::InvalidFrameKind(other)),
         }
     }
@@ -423,6 +436,10 @@ mod tests {
             (12, FrameKind::CopyOutStart, Lane::Control),
             (13, FrameKind::CopyDone, Lane::Data),
             (14, FrameKind::CopyError, Lane::Control),
+            (15, FrameKind::ConnectStart, Lane::Control),
+            (16, FrameKind::ConnectAck, Lane::Control),
+            (17, FrameKind::ConnectError, Lane::Control),
+            (18, FrameKind::StreamClose, Lane::Control),
         ];
 
         for (discriminant, kind, lane) in expected {
@@ -432,8 +449,8 @@ mod tests {
         }
         assert_eq!(FrameKind::try_from(0), Err(ProtocolError::InvalidFrameKind(0)));
         assert_eq!(
-            FrameKind::try_from(15),
-            Err(ProtocolError::InvalidFrameKind(15))
+            FrameKind::try_from(19),
+            Err(ProtocolError::InvalidFrameKind(19))
         );
     }
 
@@ -492,6 +509,29 @@ mod tests {
                 },
             )
             .unwrap(),
+            Frame::from_message(
+                StreamId(9),
+                &Message::ConnectStart {
+                    target: StreamTargetWire::PodmanUnixSocket,
+                },
+            )
+            .unwrap(),
+            Frame::from_message(StreamId(9), &Message::ConnectAck).unwrap(),
+            Frame::from_message(
+                StreamId(10),
+                &Message::ConnectStart {
+                    target: StreamTargetWire::GuestLoopbackTcp { port: 8080 },
+                },
+            )
+            .unwrap(),
+            Frame::from_message(
+                StreamId(10),
+                &Message::ConnectError {
+                    message: "connection refused".to_owned(),
+                },
+            )
+            .unwrap(),
+            Frame::from_message(StreamId(9), &Message::StreamClose).unwrap(),
         ];
 
         let mut wire = Vec::new();

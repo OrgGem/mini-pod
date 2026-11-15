@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sandbox_core::{CapabilityReport, ExecRequest, SandboxError, SandboxId, SandboxSpec};
+use sandbox_protocol::StreamTargetWire;
 
 use crate::exec_stream::ExecStream;
+use crate::tunnel::TunnelStream;
+use crate::RuntimeManager;
 
 /// Per-sandbox Copy-on-Write disk overlay and verified boot artifact paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +54,7 @@ pub trait VmSessionPort: Send + Sync {
     fn artifact_paths(&self) -> &[PathBuf];
     fn is_alive(&self) -> bool;
     async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError>;
+    async fn open_tunnel(&self, target: StreamTargetWire) -> Result<TunnelStream, SandboxError>;
     async fn copy_in_tar(
         &self,
         dst_guest: &str,
@@ -86,6 +90,18 @@ impl fmt::Debug for VmBootOutcome {
             .field("capabilities", &self.capabilities)
             .finish_non_exhaustive()
     }
+}
+
+/// Extension port exposing host-to-guest Podman Unix socket and loopback TCP stream tunnels
+/// on active [`RuntimeManager`] instances without altering the core [`RuntimeManager`] contract.
+#[async_trait::async_trait]
+pub trait SandboxTunnelPort: RuntimeManager {
+    async fn open_podman_unix_stream(&self, id: &SandboxId) -> Result<TunnelStream, SandboxError>;
+    async fn open_guest_tcp_stream(
+        &self,
+        id: &SandboxId,
+        guest_port: u16,
+    ) -> Result<TunnelStream, SandboxError>;
 }
 
 /// Driven port for booting sandbox VMs and terminating verified orphan VMM processes.

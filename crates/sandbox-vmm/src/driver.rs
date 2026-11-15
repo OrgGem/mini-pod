@@ -15,12 +15,13 @@ use sandbox_core::{
 };
 use sandbox_protocol::{
     read_frame, write_frame, ExecTargetWire, Frame, Message, PriorityFrameQueue, StreamChannel,
-    StreamId,
+    StreamId, StreamTargetWire,
 };
 use sandbox_runtime::{
-    validate_guest_path, ExecOutputChunk, ExecStream, OutputStreamKind, VmBootConfig,
+    validate_guest_path, ExecOutputChunk, ExecStream, OutputStreamKind, TunnelStream, VmBootConfig,
     VmBootOutcome, VmRuntimePort, VmSessionPort,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::accel::{
@@ -39,6 +40,7 @@ use crate::spike::{
 };
 
 const MAX_HOST_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const TUNNEL_INBOUND_CHANNEL_CAPACITY: usize = 256;
 
 /// Configuration for [`QemuVmDriver`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,6 +403,11 @@ impl OutboundQueue {
     }
 }
 
+enum TunnelInbound {
+    Data { data: Vec<u8>, eof: bool },
+    RemoteClose,
+}
+
 enum StreamHandler {
     Exec {
         output_tx: mpsc::Sender<ExecOutputChunk>,
@@ -415,12 +422,17 @@ enum StreamHandler {
         buffer: Vec<u8>,
         reply_tx: Option<oneshot::Sender<Result<Vec<u8>, SandboxError>>>,
     },
+    Tunnel {
+        connect_tx: Option<oneshot::Sender<Result<(), SandboxError>>>,
+        inbound_tx: mpsc::Sender<TunnelInbound>,
+    },
 }
 
 /// Active multiplexed QEMU `virtio-serial` session implementing [`VmSessionPort`].
 pub struct QemuVmSession {
     pid: u32,
     start_token: u64,
+    io_timeout: Duration,
     artifact_paths: Vec<PathBuf>,
     process: Mutex<Option<ConfinedProcess>>,
     endpoint: Mutex<Option<AgentIpcEndpoint>>,
@@ -492,6 +504,7 @@ impl QemuVmSession {
         Ok(Self {
             pid,
             start_token,
+            io_timeout,
             artifact_paths,
             process: Mutex::new(process),
             endpoint: Mutex::new(endpoint),
@@ -658,6 +671,98 @@ impl VmSessionPort for QemuVmSession {
         });
 
         Ok(exec_stream)
+    }
+
+    async fn open_tunnel(&self, target: StreamTargetWire) -> Result<TunnelStream, SandboxError> {
+        if let StreamTargetWire::GuestLoopbackTcp { port: 0 } = target {
+            return Err(SandboxError::InvalidSpec(
+                "guest_port must be greater than zero".to_owned(),
+            ));
+        }
+        self.ensure_transport_ready()?;
+
+        let stream_id = self.allocate_stream_id()?;
+        let (tunnel_stream, tunnel_handle) = TunnelStream::channel(stream_id);
+        let (connect_tx, connect_rx) = oneshot::channel();
+        let (inbound_tx, inbound_rx) = mpsc::channel(TUNNEL_INBOUND_CHANNEL_CAPACITY);
+
+        {
+            let mut ops = lock_unpoisoned(&self.ops);
+            ops.insert(
+                stream_id,
+                StreamHandler::Tunnel {
+                    connect_tx: Some(connect_tx),
+                    inbound_tx,
+                },
+            );
+        }
+
+        if let Err(err) = self.enqueue_message(stream_id, &Message::ConnectStart { target }) {
+            lock_unpoisoned(&self.ops).remove(&stream_id);
+            return Err(err);
+        }
+
+        let mut connect_guard = TunnelConnectGuard {
+            stream_id,
+            ops: &self.ops,
+            outbound: &self.outbound,
+            armed: true,
+        };
+
+        match tokio::time::timeout(self.io_timeout, connect_rx).await {
+            Ok(Ok(Ok(()))) => {
+                connect_guard.armed = false;
+            }
+            Ok(Ok(Err(err))) => {
+                // Reader already removed stream_id on ConnectError; avoid sending StreamClose.
+                connect_guard.armed = false;
+                lock_unpoisoned(&self.ops).remove(&stream_id);
+                return Err(err);
+            }
+            Ok(Err(_)) => {
+                connect_guard.armed = false;
+                lock_unpoisoned(&self.ops).remove(&stream_id);
+                return Err(SandboxError::Transport(
+                    "tunnel connection closed before guest ConnectAck".to_owned(),
+                ));
+            }
+            Err(_) => {
+                drop(connect_guard);
+                return Err(SandboxError::Transport(format!(
+                    "timed out after {}ms waiting for guest ConnectAck on stream {stream_id}",
+                    self.io_timeout.as_millis()
+                )));
+            }
+        }
+
+        let (remote_eof_tx, remote_eof_rx) = oneshot::channel();
+        let (remote_abort_tx, remote_abort_rx) = oneshot::channel();
+        let outbound = Arc::clone(&self.outbound);
+        let ops = Arc::clone(&self.ops);
+
+        tokio::spawn(async move {
+            pump_tunnel_inbound(
+                inbound_rx,
+                tunnel_handle.write_half,
+                remote_eof_tx,
+                remote_abort_tx,
+            )
+            .await;
+        });
+        tokio::spawn(async move {
+            pump_tunnel_outbound(
+                stream_id,
+                outbound,
+                ops,
+                tunnel_handle.read_half,
+                tunnel_handle.drop_rx,
+                remote_eof_rx,
+                remote_abort_rx,
+            )
+            .await;
+        });
+
+        Ok(tunnel_stream)
     }
 
     async fn copy_in_tar(
@@ -864,6 +969,142 @@ impl VmSessionPort for QemuVmSession {
     }
 }
 
+struct TunnelConnectGuard<'a> {
+    stream_id: StreamId,
+    ops: &'a Mutex<HashMap<StreamId, StreamHandler>>,
+    outbound: &'a OutboundQueue,
+    armed: bool,
+}
+
+impl Drop for TunnelConnectGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_unpoisoned(self.ops).remove(&self.stream_id);
+            if let Ok(frame) = Frame::from_message(self.stream_id, &Message::StreamClose) {
+                let _ = self.outbound.enqueue(frame);
+            }
+        }
+    }
+}
+
+async fn pump_tunnel_inbound(
+    mut inbound_rx: mpsc::Receiver<TunnelInbound>,
+    mut write_half: WriteHalf<DuplexStream>,
+    remote_eof_tx: oneshot::Sender<()>,
+    remote_abort_tx: oneshot::Sender<()>,
+) {
+    let mut remote_eof_tx = Some(remote_eof_tx);
+    while let Some(item) = inbound_rx.recv().await {
+        match item {
+            TunnelInbound::Data { data, eof } => {
+                if !data.is_empty() && write_half.write_all(&data).await.is_err() {
+                    break;
+                }
+                if eof {
+                    if let Some(tx) = remote_eof_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    let _ = write_half.shutdown().await;
+                }
+            }
+            TunnelInbound::RemoteClose => {
+                let _ = remote_abort_tx.send(());
+                let _ = write_half.shutdown().await;
+                return;
+            }
+        }
+    }
+    let _ = write_half.shutdown().await;
+    if remote_eof_tx.is_some() {
+        let _ = remote_abort_tx.send(());
+    }
+}
+
+async fn pump_tunnel_outbound(
+    stream_id: StreamId,
+    outbound: Arc<OutboundQueue>,
+    ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    mut read_half: ReadHalf<DuplexStream>,
+    drop_rx: oneshot::Receiver<bool>,
+    remote_eof_rx: oneshot::Receiver<()>,
+    mut remote_abort_rx: oneshot::Receiver<()>,
+) {
+    let mut buf = vec![0u8; MAX_HOST_STREAM_CHUNK_BYTES];
+    let mut stdin_eof = false;
+    let mut remote_eof = false;
+    let mut drop_rx = Some(drop_rx);
+    let mut remote_eof_rx = Some(remote_eof_rx);
+
+    while !(stdin_eof && remote_eof) {
+        tokio::select! {
+            biased;
+            _ = &mut remote_abort_rx => {
+                break;
+            }
+            _ = async {
+                match remote_eof_rx.as_mut() {
+                    Some(rx) => {
+                        let _ = rx.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }, if remote_eof_rx.is_some() => {
+                remote_eof_rx = None;
+                remote_eof = true;
+            }
+            res = async {
+                match drop_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending::<Result<bool, oneshot::error::RecvError>>().await,
+                }
+            }, if drop_rx.is_some() => {
+                drop_rx = None;
+                let graceful_write = matches!(res, Ok(true));
+                if !(graceful_write && remote_eof) {
+                    if let Ok(frame) = Frame::from_message(stream_id, &Message::StreamClose) {
+                        let _ = outbound.enqueue(frame);
+                    }
+                    break;
+                }
+            }
+            read_res = read_half.read(&mut buf), if !stdin_eof => {
+                match read_res {
+                    Ok(0) => {
+                        if let Ok(frame) = Frame::from_message(
+                            stream_id,
+                            &Message::StreamData {
+                                channel: StreamChannel::Stdin,
+                                eof: true,
+                                data: Vec::new(),
+                            },
+                        ) {
+                            let _ = outbound.enqueue(frame);
+                        }
+                        stdin_eof = true;
+                    }
+                    Ok(n) => {
+                        if let Ok(frame) = Frame::from_message(
+                            stream_id,
+                            &Message::StreamData {
+                                channel: StreamChannel::Stdin,
+                                eof: false,
+                                data: buf[..n].to_vec(),
+                            },
+                        ) {
+                            if outbound.enqueue(frame).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    lock_unpoisoned(&ops).remove(&stream_id);
+}
+
 async fn pump_exec_stdin_and_cancel(
     stream_id: StreamId,
     outbound: Arc<OutboundQueue>,
@@ -983,8 +1224,13 @@ fn run_reader_loop(
         };
 
         match msg {
-            Message::StreamData { channel, data, .. } => {
-                let maybe_exec_tx = {
+            Message::StreamData { channel, eof, data } => {
+                enum DataDispatch {
+                    Exec(mpsc::Sender<ExecOutputChunk>, OutputStreamKind),
+                    Tunnel(mpsc::Sender<TunnelInbound>),
+                }
+
+                let dispatch = {
                     let mut map = lock_unpoisoned(&ops);
                     match map.get_mut(&stream_id) {
                         Some(StreamHandler::Exec { output_tx, .. }) => {
@@ -994,7 +1240,7 @@ fn run_reader_loop(
                                 StreamChannel::Stdin => None,
                             };
                             kind.filter(|_| !data.is_empty())
-                                .map(|stream_kind| (output_tx.clone(), stream_kind))
+                                .map(|stream_kind| DataDispatch::Exec(output_tx.clone(), stream_kind))
                         }
                         Some(StreamHandler::CopyOut {
                             max_bytes,
@@ -1020,14 +1266,29 @@ fn run_reader_loop(
                             }
                             None
                         }
+                        Some(StreamHandler::Tunnel { inbound_tx, .. })
+                            if channel == StreamChannel::Stdout =>
+                        {
+                            if !data.is_empty() || eof {
+                                Some(DataDispatch::Tunnel(inbound_tx.clone()))
+                            } else {
+                                None
+                            }
+                        }
                         _ => None,
                     }
                 };
-                if let Some((tx, stream_kind)) = maybe_exec_tx {
-                    let _ = tx.blocking_send(ExecOutputChunk {
-                        stream: stream_kind,
-                        data,
-                    });
+                match dispatch {
+                    Some(DataDispatch::Exec(tx, stream_kind)) => {
+                        let _ = tx.blocking_send(ExecOutputChunk {
+                            stream: stream_kind,
+                            data,
+                        });
+                    }
+                    Some(DataDispatch::Tunnel(tx)) => {
+                        let _ = tx.blocking_send(TunnelInbound::Data { data, eof });
+                    }
+                    None => {}
                 }
             }
             Message::ExecExit {
@@ -1103,6 +1364,44 @@ fn run_reader_loop(
                     _ => {}
                 }
             }
+            Message::ConnectAck => {
+                let mut map = lock_unpoisoned(&ops);
+                if let Some(StreamHandler::Tunnel { connect_tx, .. }) = map.get_mut(&stream_id) {
+                    if let Some(tx) = connect_tx.take() {
+                        let _ = tx.send(Ok(()));
+                    }
+                }
+            }
+            Message::ConnectError { message } => {
+                let removed = lock_unpoisoned(&ops).remove(&stream_id);
+                if let Some(StreamHandler::Tunnel {
+                    mut connect_tx,
+                    inbound_tx,
+                }) = removed
+                {
+                    if let Some(tx) = connect_tx.take() {
+                        let _ = tx.send(Err(SandboxError::Transport(message)));
+                    } else {
+                        let _ = inbound_tx.blocking_send(TunnelInbound::RemoteClose);
+                    }
+                }
+            }
+            Message::StreamClose => {
+                let removed = lock_unpoisoned(&ops).remove(&stream_id);
+                if let Some(StreamHandler::Tunnel {
+                    mut connect_tx,
+                    inbound_tx,
+                }) = removed
+                {
+                    if let Some(tx) = connect_tx.take() {
+                        let _ = tx.send(Err(SandboxError::Transport(
+                            "guest closed tunnel stream before ConnectAck".to_owned(),
+                        )));
+                    } else {
+                        let _ = inbound_tx.blocking_send(TunnelInbound::RemoteClose);
+                    }
+                }
+            }
             Message::Ping { seq } => {
                 if let Ok(frame) = Frame::from_message(stream_id, &Message::Pong { seq }) {
                     let _ = outbound.enqueue(frame);
@@ -1159,6 +1458,15 @@ fn fail_all_pending_ops(ops: &Mutex<HashMap<StreamId, StreamHandler>>, reason: &
                 if let Some(tx) = reply_tx.take() {
                     let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
                 }
+            }
+            StreamHandler::Tunnel {
+                mut connect_tx,
+                inbound_tx,
+            } => {
+                if let Some(tx) = connect_tx.take() {
+                    let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
+                }
+                drop(inbound_tx);
             }
         }
     }
@@ -1447,5 +1755,266 @@ mod tests {
         assert!(sock.exists());
         drop(endpoint);
         assert!(!sock.exists());
+    }
+
+    #[tokio::test]
+    async fn tunnel_supports_duplex_independent_half_closes_connect_errors_and_drop_close() {
+        use sandbox_protocol::Lane;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-tunnel").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let (drop_observed_tx, mut drop_observed_rx) = mpsc::unbounded_channel();
+        let (guest_half_close_rx_tx, guest_half_close_rx_rx) = oneshot::channel();
+
+        let mut guest_half_close_rx_tx = Some(guest_half_close_rx_tx);
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            let mut targets: HashMap<StreamId, StreamTargetWire> = HashMap::new();
+            let mut stdin_bufs: HashMap<StreamId, Vec<u8>> = HashMap::new();
+            let mut saw_unexpected_close_after_remote = false;
+
+            while let Ok(frame) = read_frame(&mut client) {
+                let sid = frame.header.stream_id;
+                match frame.decode_message().unwrap() {
+                    Message::ConnectStart { target } => {
+                        match target {
+                            StreamTargetWire::GuestLoopbackTcp { port: 9999 } => {
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(
+                                        sid,
+                                        &Message::ConnectError {
+                                            message: "connection refused on 127.0.0.1:9999"
+                                                .to_owned(),
+                                        },
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                            }
+                            StreamTargetWire::GuestLoopbackTcp { port: 7001 } => {
+                                // Guest immediately sends ConnectAck + early banner + Stdout EOF.
+                                targets.insert(sid, target);
+                                stdin_bufs.insert(sid, Vec::new());
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(sid, &Message::ConnectAck).unwrap(),
+                                )
+                                .unwrap();
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(
+                                        sid,
+                                        &Message::StreamData {
+                                            channel: StreamChannel::Stdout,
+                                            eof: true,
+                                            data: b"early-banner".to_vec(),
+                                        },
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                            }
+                            StreamTargetWire::GuestLoopbackTcp { port: 7003 } => {
+                                targets.insert(sid, target);
+                                stdin_bufs.insert(sid, Vec::new());
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(sid, &Message::ConnectAck).unwrap(),
+                                )
+                                .unwrap();
+                                // Guest immediately aborts with StreamClose after sending partial data.
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(
+                                        sid,
+                                        &Message::StreamData {
+                                            channel: StreamChannel::Stdout,
+                                            eof: false,
+                                            data: b"partial".to_vec(),
+                                        },
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(sid, &Message::StreamClose).unwrap(),
+                                )
+                                .unwrap();
+                            }
+                            other => {
+                                targets.insert(sid, other);
+                                stdin_bufs.insert(sid, Vec::new());
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(sid, &Message::ConnectAck).unwrap(),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                    Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof,
+                        data,
+                    } => {
+                        if let Some(buf) = stdin_bufs.get_mut(&sid) {
+                            buf.extend_from_slice(&data);
+                            if eof {
+                                let received = stdin_bufs.remove(&sid).unwrap_or_default();
+                                match targets.remove(&sid) {
+                                    Some(StreamTargetWire::PodmanUnixSocket) => {
+                                        // Host-to-guest half-close finished; reply in multiple chunks.
+                                        let mid = received.len() / 2;
+                                        write_frame(
+                                            &mut client,
+                                            &Frame::from_message(
+                                                sid,
+                                                &Message::StreamData {
+                                                    channel: StreamChannel::Stdout,
+                                                    eof: false,
+                                                    data: received[..mid].to_vec(),
+                                                },
+                                            )
+                                            .unwrap(),
+                                        )
+                                        .unwrap();
+                                        write_frame(
+                                            &mut client,
+                                            &Frame::from_message(
+                                                sid,
+                                                &Message::StreamData {
+                                                    channel: StreamChannel::Stdout,
+                                                    eof: true,
+                                                    data: received[mid..].to_vec(),
+                                                },
+                                            )
+                                            .unwrap(),
+                                        )
+                                        .unwrap();
+                                    }
+                                    Some(StreamTargetWire::GuestLoopbackTcp { port: 7001 }) => {
+                                        if let Some(tx) = guest_half_close_rx_tx.take() {
+                                            tx.send(received).unwrap();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Message::StreamClose => {
+                        assert_eq!(frame.header.lane, Lane::Control);
+                        if targets.get(&sid) == Some(&StreamTargetWire::GuestLoopbackTcp { port: 7002 })
+                        {
+                            let _ = drop_observed_tx.send(sid);
+                        } else if targets.get(&sid)
+                            == Some(&StreamTargetWire::GuestLoopbackTcp { port: 7003 })
+                        {
+                            saw_unexpected_close_after_remote = true;
+                        }
+                        targets.remove(&sid);
+                        stdin_bufs.remove(&sid);
+                    }
+                    Message::Shutdown => {
+                        write_frame(
+                            &mut client,
+                            &Frame::from_message(StreamId(0), &Message::Shutdown).unwrap(),
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            saw_unexpected_close_after_remote
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::from_test_stream(host_stream, Duration::from_secs(2)).unwrap();
+
+        // 1. Port 0 rejected upfront without sending ConnectStart.
+        assert!(matches!(
+            session
+                .open_tunnel(StreamTargetWire::GuestLoopbackTcp { port: 0 })
+                .await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        // 2. Guest ConnectError propagates as Transport error.
+        let err = session
+            .open_tunnel(StreamTargetWire::GuestLoopbackTcp { port: 9999 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(msg) if msg.contains("connection refused")));
+
+        // 3. PodmanUnixSocket full-duplex >64 KiB + host-to-guest half-close while guest writes back.
+        let mut podman = session
+            .open_tunnel(StreamTargetWire::PodmanUnixSocket)
+            .await
+            .unwrap();
+        let big_payload = vec![0x5Au8; 90_000];
+        podman.write_all(&big_payload).await.unwrap();
+        podman.shutdown().await.unwrap();
+
+        let mut echoed = Vec::new();
+        podman.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, big_payload);
+        drop(podman);
+
+        // 4. Guest-to-host half-close (early banner + Stdout EOF) while host keeps writing Stdin.
+        let mut guest_closed = session
+            .open_tunnel(StreamTargetWire::GuestLoopbackTcp { port: 7001 })
+            .await
+            .unwrap();
+        let mut banner = Vec::new();
+        guest_closed.read_to_end(&mut banner).await.unwrap();
+        assert_eq!(banner, b"early-banner");
+
+        guest_closed.write_all(b"after-guest-eof").await.unwrap();
+        guest_closed.shutdown().await.unwrap();
+        drop(guest_closed);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), guest_half_close_rx_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"after-guest-eof"
+        );
+
+        // 5. Early drop without shutdown sends Message::StreamClose on Lane::Control.
+        let early_drop = session
+            .open_tunnel(StreamTargetWire::GuestLoopbackTcp { port: 7002 })
+            .await
+            .unwrap();
+        let expected_sid = early_drop.stream_id();
+        drop(early_drop);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), drop_observed_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            expected_sid
+        );
+
+        // 6. Remote StreamClose closes host reader cleanly after buffered partial data without echo.
+        let mut remote_closed = session
+            .open_tunnel(StreamTargetWire::GuestLoopbackTcp { port: 7003 })
+            .await
+            .unwrap();
+        let mut partial = Vec::new();
+        remote_closed.read_to_end(&mut partial).await.unwrap();
+        assert_eq!(partial, b"partial");
+        drop(remote_closed);
+        tokio::task::yield_now().await;
+
+        assert!(session
+            .graceful_shutdown(Duration::from_millis(500))
+            .await
+            .unwrap());
+        assert!(!guest_thread.join().unwrap());
     }
 }
