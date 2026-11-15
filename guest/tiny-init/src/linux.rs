@@ -226,6 +226,7 @@ fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
     }
 
     std::env::set_current_dir("/newroot")?;
+    mount_raw(Some("."), "/", None, libc::MS_MOVE, None, false)?;
     chroot_dot()?;
     std::env::set_current_dir("/")?;
     mount_raw(

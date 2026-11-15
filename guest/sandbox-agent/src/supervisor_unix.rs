@@ -34,10 +34,21 @@ fn read_optional_table(path: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Configures child process to enter a dedicated process group (`pgid == child_pid`)
-/// and optionally switch `gid`/`uid` prior to `execve()`.
-#[allow(unsafe_code)]
+/// Configures child process to enter a dedicated process group (`pgid == child_pid`),
+/// bind `PR_SET_PDEATHSIG` to the calling thread, and optionally switch `gid`/`uid` prior to `execve()`.
 pub(crate) fn configure_command(cmd: &mut Command, user: Option<UnixUser>) {
+    configure_command_inner(cmd, user, true);
+}
+
+/// Configures a long-lived background child in a dedicated process group (`pgid == child_pid`)
+/// without `PR_SET_PDEATHSIG`, because Linux fires `PR_SET_PDEATHSIG` when the spawning worker
+/// thread exits rather than only when the whole `sandbox-agent` process terminates.
+pub(crate) fn configure_process_group(cmd: &mut Command) {
+    configure_command_inner(cmd, None, false);
+}
+
+#[allow(unsafe_code)]
+fn configure_command_inner(cmd: &mut Command, user: Option<UnixUser>, bind_pdeathsig: bool) {
     // SAFETY: The `pre_exec` hook runs between `fork()` and `execve()` and invokes only
     // async-signal-safe syscalls (`setpgid`, `prctl` on Linux, `setgid`, `setuid`) using
     // `Copy` primitive IDs resolved prior to `fork()` without allocating or locking.
@@ -47,7 +58,7 @@ pub(crate) fn configure_command(cmd: &mut Command, user: Option<UnixUser>) {
                 return Err(io::Error::last_os_error());
             }
             #[cfg(target_os = "linux")]
-            {
+            if bind_pdeathsig {
                 let _ = libc::prctl(
                     libc::PR_SET_PDEATHSIG,
                     libc::SIGKILL as libc::c_ulong,
@@ -88,4 +99,35 @@ pub(crate) fn signal_process_group(pgid: u32, sig: libc::c_int) {
 /// Immediately sends `SIGKILL` to every process in the dedicated process group `pgid`.
 pub(crate) fn kill_process_group(pgid: u32) {
     signal_process_group(pgid, libc::SIGKILL);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn configure_process_group_survives_spawning_worker_thread_exit() {
+        let mut child = thread::spawn(|| {
+            let mut cmd = Command::new("/bin/sleep");
+            cmd.arg("5").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            configure_process_group(&mut cmd);
+            cmd.spawn().expect("spawn sleep child in dedicated process group")
+        })
+        .join()
+        .expect("worker thread finished cleanly");
+
+        thread::sleep(Duration::from_millis(100));
+        let exited = child.try_wait().expect("poll child status");
+        assert!(
+            exited.is_none(),
+            "long-lived process-group child must survive spawning thread exit: {exited:?}"
+        );
+
+        let pid = child.id();
+        kill_process_group(pid);
+        let _ = child.wait();
+    }
 }

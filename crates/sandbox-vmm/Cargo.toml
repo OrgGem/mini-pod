@@ -29,4 +29,10 @@ windows-sys = { workspace = true, features = [
 libc = { workspace = true }
 
 [dev-dependencies]
+bollard = { version = "0.17", default-features = false }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+sandbox-docker-compat = { workspace = true }
 sandbox-image = { workspace = true }
+tar = { workspace = true }
+testcontainers = { version = "0.23", default-features = false }

@@ -22,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::supervisor_unix::{configure_command, kill_process_group, signal_process_group};
+use crate::supervisor_unix::{configure_process_group, kill_process_group, signal_process_group};
 
 pub(crate) const PODMAN_BIN: &str = "/usr/bin/podman";
 #[cfg(unix)]
@@ -195,6 +195,20 @@ impl PodmanServiceManager {
     pub(crate) fn shutdown(&self) {}
 
     #[cfg(unix)]
+    fn service_command(&self, stdout: std::fs::File, stderr: std::fs::File) -> Command {
+        let socket_uri = format!("unix://{}", self.socket_path.display());
+        let mut cmd = Command::new(&self.podman_bin);
+        cmd.args(["system", "service", "--time=0", &socket_uri])
+            .env("XDG_RUNTIME_DIR", &self.xdg_runtime_dir)
+            .env_remove("CONTAINER_HOST")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        configure_process_group(&mut cmd);
+        cmd
+    }
+
+    #[cfg(unix)]
     fn spawn_service(&self) -> Result<Child, String> {
         prepare_owner_only_dir(&self.run_dir)?;
         prepare_stale_socket(&self.socket_path)?;
@@ -203,17 +217,7 @@ impl PodmanServiceManager {
             .try_clone()
             .map_err(|err| format!("failed to clone podman log fd: {err}"))?;
 
-        let socket_uri = format!("unix://{}", self.socket_path.display());
-        let mut cmd = Command::new(&self.podman_bin);
-        cmd.args(["system", "service", "--time=0", &socket_uri])
-            .env("XDG_RUNTIME_DIR", &self.xdg_runtime_dir)
-            .env("CONTAINER_HOST", &socket_uri)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_err));
-
-        configure_command(&mut cmd, None);
-
+        let mut cmd = self.service_command(log_file, log_err);
         cmd.spawn().map_err(|err| {
             format!(
                 "failed to spawn '{}' system service: {err}",
@@ -447,5 +451,34 @@ mod tests {
         assert_eq!(mode, 0o700);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_command_clears_container_host_to_avoid_duplicate_uri_arg() {
+        let mgr = PodmanServiceManager::new();
+        let dev_null = fs::File::open("/dev/null").unwrap();
+        let dev_null_err = dev_null.try_clone().unwrap();
+        let cmd = mgr.service_command(dev_null, dev_null_err);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "system",
+                "service",
+                "--time=0",
+                &format!("unix://{PODMAN_SOCKET_PATH}"),
+            ]
+        );
+        let cleared_container_host = cmd
+            .get_envs()
+            .any(|(k, v)| k == "CONTAINER_HOST" && v.is_none());
+        assert!(
+            cleared_container_host,
+            "service_command must explicitly remove CONTAINER_HOST for Podman 5 compatibility"
+        );
     }
 }

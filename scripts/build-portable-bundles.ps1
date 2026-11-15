@@ -261,7 +261,9 @@ chmod 1777 "$INITRAMFS/tmp"
 
 cp /lib/modules/"$KVER"/modules.* "$INITRAMFS/lib/modules/$KVER/"
 for mod in virtio virtio_ring virtio_pci virtio_mmio virtio_console virtio_blk ext4 overlay \
-    tun veth bridge br_netfilter nf_conntrack ip_tables iptable_nat iptable_filter nf_tables nft_nat nft_chain_nat; do
+    tun veth bridge br_netfilter nf_conntrack nf_nat ip_tables iptable_nat iptable_filter iptable_mangle iptable_raw \
+    ip6_tables ip6table_nat ip6table_filter nf_tables nft_compat nft_ct nft_nat nft_chain_nat nft_masq nft_reject nft_reject_inet \
+    xt_MASQUERADE xt_nat xt_addrtype xt_comment xt_conntrack xt_mark xt_multiport xt_tcpudp xt_state; do
     modprobe -d / -S "$KVER" -D "$mod" 2>/dev/null | awk '$1=="insmod"{print $2}' | while IFS= read -r modpath; do
         rel="${modpath#*/lib/modules/$KVER/}"
         if [ "$rel" != "$modpath" ] && [ -f "/lib/modules/$KVER/$rel" ]; then
@@ -279,7 +281,9 @@ for req_mod in virtio_blk ext4 overlay tun veth bridge; do
         exit 1
     fi
 done
-for opt_mod in br_netfilter nf_conntrack ip_tables iptable_nat iptable_filter nf_tables nft_nat nft_chain_nat; do
+for opt_mod in br_netfilter nf_conntrack nf_nat ip_tables iptable_nat iptable_filter iptable_mangle iptable_raw \
+    ip6_tables ip6table_nat ip6table_filter nf_tables nft_compat nft_ct nft_nat nft_chain_nat nft_masq nft_reject nft_reject_inet \
+    xt_MASQUERADE xt_nat xt_addrtype xt_comment xt_conntrack xt_mark xt_multiport xt_tcpudp xt_state; do
     if ! grep -Eq "(^|/)${opt_mod}\.ko" "$INITRAMFS/lib/modules/$KVER/modules.dep" && \
        ! grep -Eq "(^|/)${opt_mod}\.ko" "$INITRAMFS/lib/modules/$KVER/modules.builtin"; then
         echo "WARN: netfilter kernel module '$opt_mod' not present in modules.dep/builtin" >&2
