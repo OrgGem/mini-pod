@@ -194,7 +194,7 @@ fn signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64() {
         let pre_boot_sha = sha256_file(&base_qcow2);
 
         let overlay_qcow2 = work_dir.join("worker.qcow2");
-        create_qcow2_overlay_atomic(&qemu_img, &base_qcow2, &overlay_qcow2, Some(128))
+        create_qcow2_overlay_atomic(&qemu_img, &base_qcow2, &overlay_qcow2, Some(384))
             .expect("create CoW overlay worker.qcow2");
 
         let config = SpikeBootConfig {

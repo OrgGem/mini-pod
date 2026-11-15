@@ -2,9 +2,11 @@
 //! Guest RPC daemon: streaming virtio-serial agent, Execution Supervisor, and safe tar copy.
 
 mod copy_tar;
+mod podman;
 mod supervisor;
 #[cfg(unix)]
 mod supervisor_unix;
+mod tunnel;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -20,7 +22,9 @@ use sandbox_protocol::{
 };
 
 use crate::copy_tar::{run_copy_in, run_copy_out, ActiveCopyIn};
+use crate::podman::PodmanServiceManager;
 use crate::supervisor::{run_exec, ActiveExec, ExecSpec};
+use crate::tunnel::{run_tunnel, validate_connect_request, ActiveTunnel};
 
 const VIRTIO_PORT_CANDIDATES: [&str; 2] =
     ["/dev/virtio-ports/org.minipod.agent.0", "/dev/vport0p1"];
@@ -135,6 +139,14 @@ impl OutboundQueue {
     }
 
     pub(crate) fn enqueue_exec_exit_after_data(
+        &self,
+        stream_id: StreamId,
+        msg: &Message,
+    ) -> Result<(), ProtocolError> {
+        self.enqueue_control_after_data(stream_id, msg)
+    }
+
+    pub(crate) fn enqueue_control_after_data(
         &self,
         stream_id: StreamId,
         msg: &Message,
@@ -358,12 +370,15 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
     }
 
     let outbound = Arc::new(OutboundQueue::new());
+    let podman = Arc::new(PodmanServiceManager::new());
     let active_execs: Arc<Mutex<HashMap<StreamId, Arc<ActiveExec>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let active_copy_ins: Arc<Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let active_tunnels: Arc<Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
-    thread::scope(|scope| {
+    let session_result = thread::scope(|scope| {
         let writer_outbound = outbound.clone();
         let writer_handle = scope.spawn(move || {
             while let Some(frame) = writer_outbound.pop_for_writer() {
@@ -416,7 +431,14 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     stdout_budget_bytes,
                     stderr_budget_bytes,
                 } => {
-                    if stream_id == StreamId(0) || is_stream_active(&active_execs, &active_copy_ins, stream_id) {
+                    if stream_id == StreamId(0)
+                        || is_stream_active(
+                            &active_execs,
+                            &active_copy_ins,
+                            &active_tunnels,
+                            stream_id,
+                        )
+                    {
                         session_res = Err(ProtocolError::InvalidPayload(format!(
                             "invalid or duplicate stream_id {stream_id} for ExecStart"
                         )));
@@ -441,8 +463,16 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     };
                     let worker_outbound = outbound.clone();
                     let worker_execs = active_execs.clone();
+                    let worker_podman = podman.clone();
                     workers.push(scope.spawn(move || {
-                        run_exec(spec, handle, stdin_rx, worker_outbound, worker_execs);
+                        run_exec(
+                            spec,
+                            handle,
+                            stdin_rx,
+                            worker_outbound,
+                            worker_execs,
+                            worker_podman,
+                        );
                     }));
                 }
                 Message::ExecCancel => {
@@ -480,6 +510,15 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         };
                         if let Some(copy_handle) = copy_target {
                             copy_handle.push_chunk(data, eof);
+                        } else {
+                            let tunnel_target = active_tunnels
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&stream_id)
+                                .cloned();
+                            if let Some(tunnel_handle) = tunnel_target {
+                                tunnel_handle.push_stdin(data, eof);
+                            }
                         }
                     }
                 }
@@ -496,7 +535,14 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     dst_guest,
                     max_bytes,
                 } => {
-                    if stream_id == StreamId(0) || is_stream_active(&active_execs, &active_copy_ins, stream_id) {
+                    if stream_id == StreamId(0)
+                        || is_stream_active(
+                            &active_execs,
+                            &active_copy_ins,
+                            &active_tunnels,
+                            stream_id,
+                        )
+                    {
                         session_res = Err(ProtocolError::InvalidPayload(format!(
                             "invalid or duplicate stream_id {stream_id} for CopyInStart"
                         )));
@@ -525,7 +571,14 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     src_guest,
                     max_bytes,
                 } => {
-                    if stream_id == StreamId(0) || is_stream_active(&active_execs, &active_copy_ins, stream_id) {
+                    if stream_id == StreamId(0)
+                        || is_stream_active(
+                            &active_execs,
+                            &active_copy_ins,
+                            &active_tunnels,
+                            stream_id,
+                        )
+                    {
                         session_res = Err(ProtocolError::InvalidPayload(format!(
                             "invalid or duplicate stream_id {stream_id} for CopyOutStart"
                         )));
@@ -540,18 +593,53 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     shutdown_requested = true;
                     break;
                 }
-                Message::ConnectStart { .. } => {
-                    if let Err(err) = outbound.push_message(
+                Message::ConnectStart { target } => {
+                    let in_use = is_stream_active(
+                        &active_execs,
+                        &active_copy_ins,
+                        &active_tunnels,
                         stream_id,
-                        &Message::ConnectError {
-                            message: "tunnel relay not enabled until Task 4.2".to_owned(),
-                        },
-                    ) {
-                        session_res = Err(err);
-                        break;
+                    );
+                    if let Err(reason) = validate_connect_request(stream_id, target, in_use) {
+                        if let Err(err) = outbound.push_message(
+                            stream_id,
+                            &Message::ConnectError { message: reason },
+                        ) {
+                            session_res = Err(err);
+                            break;
+                        }
+                    } else {
+                        let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
+                        active_tunnels
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(stream_id, handle.clone());
+                        let worker_outbound = outbound.clone();
+                        let worker_tunnels = active_tunnels.clone();
+                        let worker_podman = podman.clone();
+                        workers.push(scope.spawn(move || {
+                            run_tunnel(
+                                stream_id,
+                                target,
+                                handle,
+                                stdin_rx,
+                                worker_outbound,
+                                worker_tunnels,
+                                worker_podman,
+                            );
+                        }));
                     }
                 }
-                Message::ConnectAck | Message::ConnectError { .. } | Message::StreamClose => {}
+                Message::StreamClose => {
+                    let tunnel = active_tunnels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&stream_id);
+                    if let Some(handle) = tunnel {
+                        handle.close(&outbound);
+                    }
+                }
+                Message::ConnectAck | Message::ConnectError { .. } => {}
                 other => {
                     session_res = Err(ProtocolError::InvalidPayload(format!(
                         "unsupported host-to-guest message {:?}",
@@ -563,7 +651,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
         }
 
         if shutdown_requested || session_res.is_err() || outbound.is_closed() {
-            cancel_all_active(&active_execs, &active_copy_ins, &outbound);
+            cancel_all_active(&active_execs, &active_copy_ins, &active_tunnels, &outbound);
         }
 
         for handle in workers {
@@ -586,12 +674,16 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
         } else {
             Ok(())
         }
-    })
+    });
+
+    podman.shutdown();
+    session_result
 }
 
 fn is_stream_active(
     active_execs: &Mutex<HashMap<StreamId, Arc<ActiveExec>>>,
     active_copy_ins: &Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>,
+    active_tunnels: &Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>,
     stream_id: StreamId,
 ) -> bool {
     active_execs
@@ -602,11 +694,16 @@ fn is_stream_active(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&stream_id)
+        || active_tunnels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&stream_id)
 }
 
 fn cancel_all_active(
     active_execs: &Mutex<HashMap<StreamId, Arc<ActiveExec>>>,
     active_copy_ins: &Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>,
+    active_tunnels: &Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>,
     outbound: &OutboundQueue,
 ) {
     let execs: Vec<_> = active_execs
@@ -627,6 +724,16 @@ fn cancel_all_active(
         .collect();
     for handle in copy_ins {
         handle.abort();
+    }
+
+    let tunnels: Vec<_> = active_tunnels
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for handle in tunnels {
+        handle.close(outbound);
     }
 }
 
@@ -1195,7 +1302,7 @@ mod tests {
             StreamId(1),
             &Message::ExecStart {
                 target: ExecTargetWire::Container {
-                    id_or_name: "c1".to_owned(),
+                    id_or_name: "-bad-container".to_owned(),
                 },
                 argv: vec!["/bin/true".to_owned()],
                 env: BTreeMap::new(),
@@ -1212,7 +1319,7 @@ mod tests {
             collect_exec_response(&mut host_rx, StreamId(1));
         assert!(stdout_eof_c && stderr_eof_c);
         assert!(matches!(exit_c, Message::ExecExit { code: Some(125), .. }));
-        assert!(String::from_utf8_lossy(&stderr_c).contains("Phase 4"));
+        assert!(String::from_utf8_lossy(&stderr_c).contains("must not start with '-'"));
 
         send_message(
             &mut host_tx,
@@ -2024,5 +2131,121 @@ mod tests {
         assert!(matches!(exit.decode_message().unwrap(), Message::ExecExit { .. }));
         outbound_bg.finish_and_drain();
         assert!(outbound_bg.pop_for_writer().is_none());
+    }
+
+    #[test]
+    fn serve_session_relays_loopback_tcp_tunnel_and_rejects_invalid_connect() {
+        use sandbox_protocol::StreamTargetWire;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            conn.read_to_end(&mut req).unwrap();
+            assert_eq!(req, b"hello-tunnel");
+            conn.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+        });
+
+        let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead_listener.local_addr().unwrap().port();
+        drop(dead_listener);
+
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        // Refused port returns ConnectError without killing session.
+        send_message(
+            &mut host_tx,
+            StreamId(1),
+            &Message::ConnectStart {
+                target: StreamTargetWire::GuestLoopbackTcp { port: dead_port },
+            },
+        )
+        .unwrap();
+        let err_frame = read_frame(&mut host_rx).unwrap();
+        assert_eq!(err_frame.header.stream_id, StreamId(1));
+        assert!(matches!(
+            err_frame.decode_message().unwrap(),
+            Message::ConnectError { .. }
+        ));
+
+        // Open real loopback TCP tunnel on StreamId(2).
+        send_message(
+            &mut host_tx,
+            StreamId(2),
+            &Message::ConnectStart {
+                target: StreamTargetWire::GuestLoopbackTcp { port },
+            },
+        )
+        .unwrap();
+        let ack_frame = read_frame(&mut host_rx).unwrap();
+        assert_eq!(ack_frame.header.stream_id, StreamId(2));
+        assert_eq!(ack_frame.decode_message().unwrap(), Message::ConnectAck);
+
+        // Duplicate active stream_id must be rejected with ConnectError.
+        send_message(
+            &mut host_tx,
+            StreamId(2),
+            &Message::ConnectStart {
+                target: StreamTargetWire::GuestLoopbackTcp { port },
+            },
+        )
+        .unwrap();
+        let dup_frame = read_frame(&mut host_rx).unwrap();
+        assert_eq!(dup_frame.header.stream_id, StreamId(2));
+        assert!(matches!(
+            dup_frame.decode_message().unwrap(),
+            Message::ConnectError { .. }
+        ));
+
+        send_message(
+            &mut host_tx,
+            StreamId(2),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: false,
+                data: b"hello-".to_vec(),
+            },
+        )
+        .unwrap();
+        send_message(
+            &mut host_tx,
+            StreamId(2),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: true,
+                data: b"tunnel".to_vec(),
+            },
+        )
+        .unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            let f = read_frame(&mut host_rx).unwrap();
+            assert_eq!(f.header.stream_id, StreamId(2));
+            match f.decode_message().unwrap() {
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    eof,
+                    data,
+                } => {
+                    received.extend_from_slice(&data);
+                    if eof {
+                        break;
+                    }
+                }
+                other => panic!("unexpected tunnel response: {other:?}"),
+            }
+        }
+        assert_eq!(received, b"HTTP/1.1 200 OK\r\n\r\n");
+
+        send_message(&mut host_tx, StreamId(0), &Message::Ping { seq: 77 }).unwrap();
+        let pong = read_frame(&mut host_rx).unwrap();
+        assert_eq!(pong.decode_message().unwrap(), Message::Pong { seq: 77 });
+
+        server.join().unwrap();
+        shutdown_test_session(host_rx, host_tx, agent);
     }
 }

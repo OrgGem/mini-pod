@@ -14,6 +14,17 @@ pub const REQUIRED_MODULES: &[&str] = &[
     "virtio_blk",
     "ext4",
     "overlay",
+    "tun",
+    "veth",
+    "bridge",
+    "br_netfilter",
+    "nf_conntrack",
+    "ip_tables",
+    "iptable_nat",
+    "iptable_filter",
+    "nf_tables",
+    "nft_nat",
+    "nft_chain_nat",
 ];
 
 /// Mount options for the writable overlay mounted over read-only `/newroot/etc`.
@@ -23,6 +34,7 @@ pub const ETC_OVERLAY_OPTIONS: &str =
 /// Writable bind mounts mapped from `/mnt/disk/rw/*` onto read-only `/newroot/*` mountpoints.
 pub const WRITABLE_BIND_MOUNTS: &[(&str, &str)] = &[
     ("/mnt/disk/rw/containers", "/newroot/var/lib/containers"),
+    ("/mnt/disk/rw/cni", "/newroot/var/lib/cni"),
     ("/mnt/disk/rw/workspace", "/newroot/workspace"),
     ("/mnt/disk/rw/tmp", "/newroot/tmp"),
     ("/mnt/disk/rw/var-tmp", "/newroot/var/tmp"),
@@ -154,6 +166,7 @@ mod tests {
             WRITABLE_BIND_MOUNTS,
             &[
                 ("/mnt/disk/rw/containers", "/newroot/var/lib/containers"),
+                ("/mnt/disk/rw/cni", "/newroot/var/lib/cni"),
                 ("/mnt/disk/rw/workspace", "/newroot/workspace"),
                 ("/mnt/disk/rw/tmp", "/newroot/tmp"),
                 ("/mnt/disk/rw/var-tmp", "/newroot/var/tmp"),
@@ -165,8 +178,27 @@ mod tests {
             assert!(dst.starts_with("/newroot/"));
         }
 
-        for expected in ["virtio_console", "virtio_blk", "ext4", "overlay"] {
-            assert!(REQUIRED_MODULES.contains(&expected));
+        for expected in [
+            "virtio_console",
+            "virtio_blk",
+            "ext4",
+            "overlay",
+            "tun",
+            "veth",
+            "bridge",
+            "br_netfilter",
+            "nf_conntrack",
+            "ip_tables",
+            "iptable_nat",
+            "iptable_filter",
+            "nf_tables",
+            "nft_nat",
+            "nft_chain_nat",
+        ] {
+            assert!(
+                REQUIRED_MODULES.contains(&expected),
+                "missing required module {expected}"
+            );
         }
     }
 }

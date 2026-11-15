@@ -1,0 +1,576 @@
+//! Bidirectional stream tunnel relay (`GuestLoopbackTcp` and `PodmanUnixSocket`).
+
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use sandbox_protocol::{Message, ProtocolError, StreamChannel, StreamId, StreamTargetWire};
+
+use crate::podman::PodmanServiceManager;
+use crate::OutboundQueue;
+
+const TUNNEL_READ_CHUNK_BYTES: usize = 64 * 1024;
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) enum TunnelInput {
+    Data { data: Vec<u8>, eof: bool },
+}
+
+struct TunnelState {
+    closed: bool,
+    stdin_tx: Option<mpsc::Sender<TunnelInput>>,
+    abort_socket: Option<TunnelSocket>,
+}
+
+/// Active host-to-guest tunnel handle supporting concurrent input, abort, and shutdown.
+pub(crate) struct ActiveTunnel {
+    stream_id: StreamId,
+    state: Mutex<TunnelState>,
+}
+
+impl ActiveTunnel {
+    pub(crate) fn new(stream_id: StreamId) -> (Arc<Self>, mpsc::Receiver<TunnelInput>) {
+        let (stdin_tx, stdin_rx) = mpsc::channel();
+        let handle = Arc::new(Self {
+            stream_id,
+            state: Mutex::new(TunnelState {
+                closed: false,
+                stdin_tx: Some(stdin_tx),
+                abort_socket: None,
+            }),
+        });
+        (handle, stdin_rx)
+    }
+
+    pub(crate) fn push_stdin(&self, data: Vec<u8>, eof: bool) {
+        let tx = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed {
+                return;
+            }
+            if eof {
+                guard.stdin_tx.take()
+            } else {
+                guard.stdin_tx.clone()
+            }
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(TunnelInput::Data { data, eof });
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+
+    /// Aborts the tunnel immediately, closing its stdin channel and shutting down the socket.
+    pub(crate) fn close(&self, outbound: &OutboundQueue) {
+        let sock = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.closed = true;
+            guard.stdin_tx.take();
+            guard.abort_socket.take()
+        };
+        outbound.abort_stream(self.stream_id);
+        if let Some(sock) = sock {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn set_abort_socket(&self, sock: TunnelSocket) -> Result<(), TunnelSocket> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.closed {
+            return Err(sock);
+        }
+        guard.abort_socket = Some(sock);
+        Ok(())
+    }
+
+    fn close_stdin_only(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stdin_tx
+            .take();
+    }
+}
+
+enum TunnelSocket {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl TunnelSocket {
+    fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.try_clone().map(Self::Unix),
+        }
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.shutdown(how),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.shutdown(how),
+        }
+    }
+}
+
+impl Read for TunnelSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for TunnelSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.flush(),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
+/// Validates a `ConnectStart` request synchronously; returns `Err(reason)` if rejected upfront.
+pub(crate) fn validate_connect_request(
+    stream_id: StreamId,
+    target: StreamTargetWire,
+    stream_in_use: bool,
+) -> Result<(), String> {
+    if stream_id == StreamId(0) || stream_in_use {
+        return Err(format!(
+            "invalid or duplicate stream_id {stream_id} for ConnectStart"
+        ));
+    }
+    if let StreamTargetWire::GuestLoopbackTcp { port: 0 } = target {
+        return Err("guest loopback TCP port must be greater than zero".to_owned());
+    }
+    Ok(())
+}
+
+/// Connects the requested guest tunnel target, acknowledges with `ConnectAck` (or
+/// `ConnectError`), and relays bidirectional traffic until EOF or `StreamClose`.
+pub(crate) fn run_tunnel(
+    stream_id: StreamId,
+    target: StreamTargetWire,
+    handle: Arc<ActiveTunnel>,
+    stdin_rx: mpsc::Receiver<TunnelInput>,
+    outbound: Arc<OutboundQueue>,
+    active_tunnels: Arc<Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>>,
+    podman: Arc<PodmanServiceManager>,
+) {
+    let res = run_tunnel_inner(stream_id, target, &handle, stdin_rx, &outbound, &podman);
+
+    active_tunnels
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&stream_id);
+    handle.close_stdin_only();
+
+    if let Err(err) = res {
+        eprintln!("[sandbox-agent] tunnel stream {stream_id} transport error: {err}");
+    }
+}
+
+fn run_tunnel_inner(
+    stream_id: StreamId,
+    target: StreamTargetWire,
+    handle: &Arc<ActiveTunnel>,
+    stdin_rx: mpsc::Receiver<TunnelInput>,
+    outbound: &Arc<OutboundQueue>,
+    podman: &PodmanServiceManager,
+) -> Result<(), ProtocolError> {
+    let sock = match connect_target(target, podman) {
+        Ok(sock) => sock,
+        Err(reason) => {
+            if handle.is_closed() {
+                outbound.clear_stream(stream_id);
+                return Ok(());
+            }
+            outbound.clear_stream(stream_id);
+            return outbound.push_message(stream_id, &Message::ConnectError { message: reason });
+        }
+    };
+
+    let abort_sock = match sock.try_clone() {
+        Ok(cloned) => cloned,
+        Err(err) => {
+            outbound.clear_stream(stream_id);
+            return outbound.push_message(
+                stream_id,
+                &Message::ConnectError {
+                    message: format!("failed to clone guest tunnel socket: {err}"),
+                },
+            );
+        }
+    };
+    let mut writer_sock = match sock.try_clone() {
+        Ok(cloned) => cloned,
+        Err(err) => {
+            outbound.clear_stream(stream_id);
+            return outbound.push_message(
+                stream_id,
+                &Message::ConnectError {
+                    message: format!("failed to clone guest tunnel writer: {err}"),
+                },
+            );
+        }
+    };
+
+    if let Err(sock_rejected) = handle.set_abort_socket(abort_sock) {
+        let _ = sock_rejected.shutdown(Shutdown::Both);
+        outbound.clear_stream(stream_id);
+        return Ok(());
+    }
+
+    outbound.push_message(stream_id, &Message::ConnectAck)?;
+
+    let mut reader_sock = sock;
+    thread::scope(|scope| {
+        let writer_handle = Arc::clone(handle);
+        let writer_thread = scope.spawn(move || {
+            pump_tunnel_writer(stdin_rx, &mut writer_sock, &writer_handle);
+        });
+
+        let read_res = pump_tunnel_reader(stream_id, &mut reader_sock, handle, outbound);
+        let _ = writer_thread.join();
+        read_res
+    })
+}
+
+fn connect_target(
+    target: StreamTargetWire,
+    podman: &PodmanServiceManager,
+) -> Result<TunnelSocket, String> {
+    match target {
+        StreamTargetWire::GuestLoopbackTcp { port } => {
+            if port == 0 {
+                return Err("guest loopback TCP port must be greater than zero".to_owned());
+            }
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let stream = TcpStream::connect_timeout(&addr, TCP_CONNECT_TIMEOUT).map_err(|err| {
+                format!("failed to connect guest loopback 127.0.0.1:{port}: {err}")
+            })?;
+            let _ = stream.set_nodelay(true);
+            Ok(TunnelSocket::Tcp(stream))
+        }
+        StreamTargetWire::PodmanUnixSocket => {
+            #[cfg(unix)]
+            {
+                let sock_path = podman.ensure_running()?;
+                let stream = UnixStream::connect(sock_path).map_err(|err| {
+                    format!(
+                        "failed to connect podman unix socket '{}': {err}",
+                        sock_path.display()
+                    )
+                })?;
+                Ok(TunnelSocket::Unix(stream))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = podman;
+                Err("Podman Unix socket tunnels require a Unix guest environment".to_owned())
+            }
+        }
+    }
+}
+
+fn pump_tunnel_writer(
+    stdin_rx: mpsc::Receiver<TunnelInput>,
+    writer: &mut TunnelSocket,
+    handle: &ActiveTunnel,
+) {
+    while let Ok(TunnelInput::Data { data, eof }) = stdin_rx.recv() {
+        if handle.is_closed() {
+            break;
+        }
+        if !data.is_empty() && writer.write_all(&data).is_err() {
+            let _ = writer.shutdown(Shutdown::Write);
+            break;
+        }
+        if eof {
+            let _ = writer.shutdown(Shutdown::Write);
+            break;
+        }
+    }
+}
+
+fn pump_tunnel_reader(
+    stream_id: StreamId,
+    reader: &mut TunnelSocket,
+    handle: &ActiveTunnel,
+    outbound: &OutboundQueue,
+) -> Result<(), ProtocolError> {
+    let mut buf = vec![0u8; TUNNEL_READ_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                if handle.is_closed() {
+                    outbound.clear_stream(stream_id);
+                    return Ok(());
+                }
+                outbound.send_stream_eof(stream_id, StreamChannel::Stdout)?;
+                outbound.clear_stream(stream_id);
+                return Ok(());
+            }
+            Ok(n) => {
+                if handle.is_closed() {
+                    outbound.clear_stream(stream_id);
+                    return Ok(());
+                }
+                outbound.send_stream_data(stream_id, StreamChannel::Stdout, &buf[..n])?;
+            }
+            Err(_) => {
+                if handle.is_closed() {
+                    outbound.clear_stream(stream_id);
+                    return Ok(());
+                }
+                handle.close(outbound);
+                return outbound.enqueue_control_after_data(stream_id, &Message::StreamClose);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn validate_connect_request_rejects_port_zero_stream_zero_and_duplicates() {
+        assert!(validate_connect_request(
+            StreamId(0),
+            StreamTargetWire::GuestLoopbackTcp { port: 80 },
+            false
+        )
+        .is_err());
+
+        assert!(validate_connect_request(
+            StreamId(1),
+            StreamTargetWire::GuestLoopbackTcp { port: 80 },
+            true
+        )
+        .is_err());
+
+        assert!(validate_connect_request(
+            StreamId(1),
+            StreamTargetWire::GuestLoopbackTcp { port: 0 },
+            false
+        )
+        .is_err());
+
+        assert!(validate_connect_request(
+            StreamId(2),
+            StreamTargetWire::GuestLoopbackTcp { port: 8080 },
+            false
+        )
+        .is_ok());
+
+        assert!(validate_connect_request(
+            StreamId(3),
+            StreamTargetWire::PodmanUnixSocket,
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn tcp_loopback_tunnel_supports_full_duplex_and_independent_half_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            // Blocks until client calls `shutdown(Shutdown::Write)` on `Stdin { eof: true }`.
+            conn.read_to_end(&mut req).unwrap();
+            assert_eq!(req, b"PING /health\n");
+
+            // Send > 64 KiB response to exercise chunked `Stdout` streaming.
+            let mut resp = vec![b'A'; 70_000];
+            resp.extend_from_slice(b"-TAIL");
+            conn.write_all(&resp).unwrap();
+            let _ = conn.shutdown(Shutdown::Write);
+        });
+
+        let outbound = Arc::new(OutboundQueue::new());
+        let active_tunnels = Arc::new(Mutex::new(HashMap::new()));
+        let podman = Arc::new(PodmanServiceManager::new());
+
+        let stream_id = StreamId(11);
+        let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
+        active_tunnels
+            .lock()
+            .unwrap()
+            .insert(stream_id, Arc::clone(&handle));
+
+        let tunnel_outbound = Arc::clone(&outbound);
+        let tunnel_map = Arc::clone(&active_tunnels);
+        let tunnel_handle = Arc::clone(&handle);
+        let worker = thread::spawn(move || {
+            run_tunnel(
+                stream_id,
+                StreamTargetWire::GuestLoopbackTcp { port },
+                tunnel_handle,
+                stdin_rx,
+                tunnel_outbound,
+                tunnel_map,
+                podman,
+            );
+        });
+
+        // Push request then half-close Stdin while server response hasn't finished yet.
+        handle.push_stdin(b"PING ".to_vec(), false);
+        handle.push_stdin(b"/health\n".to_vec(), true);
+
+        worker.join().unwrap();
+        server.join().unwrap();
+        outbound.finish_and_drain();
+
+        let mut ack_seen = false;
+        let mut received = Vec::new();
+        let mut eof_seen = false;
+        while let Some(frame) = outbound.pop_for_writer() {
+            assert_eq!(frame.header.stream_id, stream_id);
+            match frame.decode_message().unwrap() {
+                Message::ConnectAck => ack_seen = true,
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    eof,
+                    data,
+                } => {
+                    received.extend_from_slice(&data);
+                    if eof {
+                        eof_seen = true;
+                    }
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+
+        assert!(ack_seen);
+        assert!(eof_seen);
+        assert_eq!(received.len(), 70_005);
+        assert!(received[..70_000].iter().all(|&b| b == b'A'));
+        assert_eq!(&received[70_000..], b"-TAIL");
+        assert!(!active_tunnels.lock().unwrap().contains_key(&stream_id));
+    }
+
+    #[test]
+    fn tcp_loopback_tunnel_stream_close_unblocks_active_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.recv();
+            drop(conn);
+        });
+
+        let outbound = Arc::new(OutboundQueue::new());
+        let active_tunnels = Arc::new(Mutex::new(HashMap::new()));
+        let podman = Arc::new(PodmanServiceManager::new());
+
+        let stream_id = StreamId(12);
+        let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
+        active_tunnels
+            .lock()
+            .unwrap()
+            .insert(stream_id, Arc::clone(&handle));
+
+        let tunnel_outbound = Arc::clone(&outbound);
+        let tunnel_map = Arc::clone(&active_tunnels);
+        let tunnel_handle = Arc::clone(&handle);
+        let worker = thread::spawn(move || {
+            run_tunnel(
+                stream_id,
+                StreamTargetWire::GuestLoopbackTcp { port },
+                tunnel_handle,
+                stdin_rx,
+                tunnel_outbound,
+                tunnel_map,
+                podman,
+            );
+        });
+
+        accepted_rx.recv().unwrap();
+        // Wait until `ConnectAck` has been queued so abort_socket is guaranteed installed.
+        loop {
+            if let Some(frame) = outbound.pop_for_writer() {
+                assert_eq!(frame.decode_message().unwrap(), Message::ConnectAck);
+                break;
+            }
+        }
+
+        handle.close(&outbound);
+        worker.join().unwrap();
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert!(!active_tunnels.lock().unwrap().contains_key(&stream_id));
+    }
+
+    #[test]
+    fn tcp_loopback_tunnel_emits_connect_error_on_refused_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let outbound = Arc::new(OutboundQueue::new());
+        let active_tunnels = Arc::new(Mutex::new(HashMap::new()));
+        let podman = Arc::new(PodmanServiceManager::new());
+
+        let stream_id = StreamId(13);
+        let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
+        active_tunnels
+            .lock()
+            .unwrap()
+            .insert(stream_id, Arc::clone(&handle));
+
+        run_tunnel(
+            stream_id,
+            StreamTargetWire::GuestLoopbackTcp { port: unused_port },
+            handle,
+            stdin_rx,
+            Arc::clone(&outbound),
+            Arc::clone(&active_tunnels),
+            podman,
+        );
+        outbound.finish_and_drain();
+
+        let frame = outbound.pop_for_writer().expect("expected ConnectError frame");
+        assert_eq!(frame.header.stream_id, stream_id);
+        match frame.decode_message().unwrap() {
+            Message::ConnectError { message } => {
+                assert!(message.contains(&unused_port.to_string()), "msg={message}");
+            }
+            other => panic!("expected ConnectError, got {other:?}"),
+        }
+        assert!(outbound.pop_for_writer().is_none());
+        assert!(!active_tunnels.lock().unwrap().contains_key(&stream_id));
+    }
+}

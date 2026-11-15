@@ -69,9 +69,9 @@ pub(crate) fn configure_command(cmd: &mut Command, user: Option<UnixUser>) {
     }
 }
 
-/// Immediately sends `SIGKILL` to every process in the dedicated process group `pgid`.
+/// Sends `sig` to every process in the dedicated process group `pgid`.
 #[allow(unsafe_code)]
-pub(crate) fn kill_process_group(pgid: u32) {
+pub(crate) fn signal_process_group(pgid: u32, sig: libc::c_int) {
     let Ok(raw_pid) = libc::pid_t::try_from(pgid) else {
         return;
     };
@@ -81,6 +81,11 @@ pub(crate) fn kill_process_group(pgid: u32) {
     // SAFETY: `raw_pid` is strictly positive and names the child's dedicated process group
     // established in `pre_exec` via `setpgid(0, 0)`, so `-raw_pid` targets only that tree.
     unsafe {
-        let _ = libc::kill(-raw_pid, libc::SIGKILL);
+        let _ = libc::kill(-raw_pid, sig);
     }
+}
+
+/// Immediately sends `SIGKILL` to every process in the dedicated process group `pgid`.
+pub(crate) fn kill_process_group(pgid: u32) {
+    signal_process_group(pgid, libc::SIGKILL);
 }

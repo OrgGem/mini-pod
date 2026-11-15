@@ -23,6 +23,7 @@ const RW_SUBDIRS: &[(&str, u32)] = &[
     ("/mnt/disk/rw/etc-upper", 0o755),
     ("/mnt/disk/rw/etc-work", 0o755),
     ("/mnt/disk/rw/containers", 0o755),
+    ("/mnt/disk/rw/cni", 0o755),
     ("/mnt/disk/rw/workspace", 0o755),
     ("/mnt/disk/rw/tmp", 0o1777),
     ("/mnt/disk/rw/var-tmp", 0o1777),
@@ -69,6 +70,8 @@ fn run_init() -> io::Result<i32> {
 
     if let Some(root_dev) = config.root_device.as_deref() {
         switch_to_ro_root_with_overlay(root_dev)?;
+    } else {
+        bring_up_loopback();
     }
 
     install_signal_handlers()?;
@@ -121,6 +124,7 @@ fn early_initramfs_setup() -> io::Result<()> {
 
 fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
     wait_for_device(Path::new(root_dev), DEVICE_WAIT_TIMEOUT, DEVICE_POLL_INTERVAL)?;
+    maybe_grow_root_ext4(root_dev);
 
     fs::create_dir_all("/mnt/disk")?;
     mount_raw(
@@ -180,15 +184,40 @@ fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
         mount_raw(Some(src), target, Some(fstype), 0, None, false)?;
     }
 
+    mount_raw(
+        Some("cgroup2"),
+        "/newroot/sys/fs/cgroup",
+        Some("cgroup2"),
+        0,
+        None,
+        true,
+    )?;
+
+    fs::create_dir_all("/newroot/dev/shm")?;
+    mount_raw(
+        Some("tmpfs"),
+        "/newroot/dev/shm",
+        Some("tmpfs"),
+        0,
+        Some("mode=1777,size=64m"),
+        false,
+    )?;
+
     fs::create_dir_all("/newroot/dev/pts")?;
     mount_raw(
         Some("devpts"),
         "/newroot/dev/pts",
         Some("devpts"),
         0,
-        None,
+        Some("newinstance,ptmxmode=0666,mode=0620"),
         false,
     )?;
+    match fs::remove_file("/newroot/dev/ptmx") {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    std::os::unix::fs::symlink("pts/ptmx", "/newroot/dev/ptmx")?;
 
     populate_virtio_ports(Path::new("/newroot/sys"), Path::new("/newroot/dev"))?;
 
@@ -199,7 +228,128 @@ fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
     std::env::set_current_dir("/newroot")?;
     chroot_dot()?;
     std::env::set_current_dir("/")?;
+    mount_raw(
+        None,
+        "/",
+        None,
+        libc::MS_REC | libc::MS_SHARED,
+        None,
+        false,
+    )?;
+    bring_up_loopback();
     Ok(())
+}
+
+fn maybe_grow_root_ext4(root_dev: &str) {
+    if !Path::new("/sbin/resize2fs").exists() {
+        return;
+    }
+
+    if Path::new("/sbin/e2fsck").exists() {
+        match Command::new("/sbin/e2fsck").args(["-fy", root_dev]).output() {
+            Ok(out) if matches!(out.status.code(), Some(0 | 1)) => {}
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[tiny-init] warning: e2fsck -fy {root_dev} exited {:?}: {} {}",
+                    out.status.code(),
+                    stdout.trim(),
+                    stderr.trim()
+                );
+            }
+            Err(err) => {
+                eprintln!("[tiny-init] warning: failed to run e2fsck on {root_dev}: {err}");
+            }
+        }
+    }
+
+    match Command::new("/sbin/resize2fs").args(["-f", root_dev]).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "[tiny-init] warning: resize2fs -f {root_dev} exited {:?}: {} {}",
+                out.status.code(),
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        Err(err) => {
+            eprintln!("[tiny-init] warning: failed to run resize2fs on {root_dev}: {err}");
+        }
+    }
+}
+
+fn bring_up_loopback() {
+    if Path::new("/bin/busybox").exists() {
+        match Command::new("/bin/busybox")
+            .args(["ip", "link", "set", "lo", "up"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                match Command::new("/bin/busybox")
+                    .args(["ip", "addr", "add", "127.0.0.1/8", "dev", "lo"])
+                    .output()
+                {
+                    Ok(addr_out) if addr_out.status.success() => return,
+                    Ok(addr_out) => {
+                        let stderr = String::from_utf8_lossy(&addr_out.stderr);
+                        if stderr.contains("File exists") || stderr.contains("EEXIST") {
+                            return;
+                        }
+                        eprintln!(
+                            "[tiny-init] warning: ip addr add 127.0.0.1/8 dev lo failed ({:?}): {}",
+                            addr_out.status.code(),
+                            stderr.trim()
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("[tiny-init] warning: failed to run busybox ip addr: {err}");
+                    }
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[tiny-init] warning: ip link set lo up failed ({:?}): {}",
+                    out.status.code(),
+                    stderr.trim()
+                );
+            }
+            Err(err) => {
+                eprintln!("[tiny-init] warning: failed to run busybox ip link: {err}");
+            }
+        }
+    }
+
+    let ifconfig_cmd: Option<(&str, &[&str])> = if Path::new("/sbin/ifconfig").exists() {
+        Some(("/sbin/ifconfig", &["lo", "127.0.0.1", "up"]))
+    } else if Path::new("/bin/busybox").exists() {
+        Some(("/bin/busybox", &["ifconfig", "lo", "127.0.0.1", "up"]))
+    } else {
+        None
+    };
+
+    if let Some((bin, args)) = ifconfig_cmd {
+        match Command::new(bin).args(args).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.contains("File exists") && !stderr.contains("EEXIST") {
+                    eprintln!(
+                        "[tiny-init] warning: ifconfig lo 127.0.0.1 up failed ({:?}): {}",
+                        out.status.code(),
+                        stderr.trim()
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("[tiny-init] warning: failed to run ifconfig: {err}");
+            }
+        }
+    }
 }
 
 fn wait_for_device(dev_path: &Path, timeout: Duration, interval: Duration) -> io::Result<()> {

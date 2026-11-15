@@ -203,8 +203,8 @@ fn default_spec(lease_ttl: Duration) -> SandboxSpec {
             host_cpu_quota_Millicores: None,
             guest_ram_mb: 256,
             host_rss_budget_mb: Some(512),
-            virtual_disk_mb: 64,
-            host_storage_budget_mb: 256,
+            virtual_disk_mb: 256,
+            host_storage_budget_mb: 512,
         },
         lease_ttl,
     }
@@ -477,8 +477,8 @@ async fn e2e_stdout_budget_deadline_priority_cancel_and_disk_cap() {
 
     // Verify oversized virtual_disk_mb against host_storage_budget_mb fails admission.
     let mut bad_disk = default_spec(Duration::from_secs(60));
-    bad_disk.budget.virtual_disk_mb = 128;
-    bad_disk.budget.host_storage_budget_mb = 96;
+    bad_disk.budget.virtual_disk_mb = 320;
+    bad_disk.budget.host_storage_budget_mb = 192;
     let disk_err = mgr
         .spawn(bad_disk)
         .await
@@ -489,8 +489,8 @@ async fn e2e_stdout_budget_deadline_priority_cancel_and_disk_cap() {
     );
 
     let mut bounded_spec = default_spec(Duration::from_secs(90));
-    bounded_spec.budget.virtual_disk_mb = 64;
-    bounded_spec.budget.host_storage_budget_mb = 96;
+    bounded_spec.budget.virtual_disk_mb = 256;
+    bounded_spec.budget.host_storage_budget_mb = 320;
     let lease = mgr.spawn(bounded_spec).await.expect("spawn bounded VM");
 
     // 1. stdout_budget_bytes truncation + verification that runaway flood process group was killed.
@@ -592,11 +592,11 @@ async fn e2e_stdout_budget_deadline_priority_cancel_and_disk_cap() {
         "sleep child survived deadline kill: {ps_timeout_txt}"
     );
 
-    // 4. Bounded disk containment on the 64 MiB overlay and clean reclamation on destroy.
+    // 4. Bounded disk containment on the 256 MiB overlay and clean reclamation on destroy.
     let disk_fill = run_shell(
         mgr,
         &lease.id,
-        "dd if=/dev/zero of=/tmp/fill.bin bs=1M count=128",
+        "dd if=/dev/zero of=/tmp/fill.bin bs=1M count=320",
         Duration::from_secs(20),
     )
     .await
@@ -604,7 +604,7 @@ async fn e2e_stdout_budget_deadline_priority_cancel_and_disk_cap() {
     assert_ne!(
         disk_fill.exit.code,
         Some(0),
-        "writing 128 MiB into 64 MiB ext4 rootfs must fail with ENOSPC"
+        "writing 320 MiB into 256 MiB ext4 rootfs must fail with ENOSPC"
     );
 
     let work_dir = sandbox_work_dir(&harness.state_dir, &lease.id);
@@ -613,8 +613,8 @@ async fn e2e_stdout_budget_deadline_priority_cancel_and_disk_cap() {
         .expect("stat overlay.qcow2")
         .len();
     assert!(
-        overlay_bytes <= 96 * 1024 * 1024,
-        "overlay.qcow2 ({overlay_bytes} bytes) exceeded host_storage_budget_mb (96 MiB)"
+        overlay_bytes <= 320 * 1024 * 1024,
+        "overlay.qcow2 ({overlay_bytes} bytes) exceeded host_storage_budget_mb (320 MiB)"
     );
 
     assert_eq!(

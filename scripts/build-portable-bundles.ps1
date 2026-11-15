@@ -224,12 +224,44 @@ cp /bin/busybox.static "$INITRAMFS/bin/busybox"
 chmod 0755 "$INITRAMFS/bin/busybox"
 chroot "$INITRAMFS" /bin/busybox --install -s
 
+for fs_tool_name in e2fsck resize2fs; do
+    fs_tool=""
+    for candidate in "/sbin/$fs_tool_name" "/usr/sbin/$fs_tool_name"; do
+        if [ -x "$candidate" ]; then
+            fs_tool="$candidate"
+            break
+        fi
+    done
+    if [ -z "$fs_tool" ]; then
+        echo "ERROR: required initramfs tool '$fs_tool_name' missing" >&2
+        exit 1
+    fi
+    rm -f "$INITRAMFS/sbin/$fs_tool_name"
+    cp -L "$fs_tool" "$INITRAMFS/sbin/$fs_tool_name"
+    chmod 0755 "$INITRAMFS/sbin/$fs_tool_name"
+    ldd "$fs_tool" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }' | sort -u | while IFS= read -r lib_path; do
+        if [ -f "$lib_path" ]; then
+            mkdir -p "$INITRAMFS$(dirname "$lib_path")"
+            if [ ! -e "$INITRAMFS$lib_path" ]; then
+                cp -L "$lib_path" "$INITRAMFS$lib_path"
+                chmod 0755 "$INITRAMFS$lib_path"
+            fi
+        fi
+    done
+done
+chroot "$INITRAMFS" /sbin/e2fsck -V >/dev/null 2>&1
+if ! chroot "$INITRAMFS" /sbin/resize2fs 2>&1 | grep -qi "usage"; then
+    echo "ERROR: /sbin/resize2fs failed runtime check inside initramfs chroot" >&2
+    exit 1
+fi
+
 cp /out/bin/tiny-init "$INITRAMFS/init"
 chmod 0755 "$INITRAMFS/init"
 chmod 1777 "$INITRAMFS/tmp"
 
 cp /lib/modules/"$KVER"/modules.* "$INITRAMFS/lib/modules/$KVER/"
-for mod in virtio virtio_ring virtio_pci virtio_mmio virtio_console virtio_blk ext4 overlay; do
+for mod in virtio virtio_ring virtio_pci virtio_mmio virtio_console virtio_blk ext4 overlay \
+    tun veth bridge br_netfilter nf_conntrack ip_tables iptable_nat iptable_filter nf_tables nft_nat nft_chain_nat; do
     modprobe -d / -S "$KVER" -D "$mod" 2>/dev/null | awk '$1=="insmod"{print $2}' | while IFS= read -r modpath; do
         rel="${modpath#*/lib/modules/$KVER/}"
         if [ "$rel" != "$modpath" ] && [ -f "/lib/modules/$KVER/$rel" ]; then
@@ -240,11 +272,17 @@ for mod in virtio virtio_ring virtio_pci virtio_mmio virtio_console virtio_blk e
 done
 depmod -b "$INITRAMFS" "$KVER"
 
-for req_mod in virtio_blk ext4 overlay; do
+for req_mod in virtio_blk ext4 overlay tun veth bridge; do
     if ! grep -Eq "(^|/)${req_mod}\.ko" "$INITRAMFS/lib/modules/$KVER/modules.dep" && \
        ! grep -Eq "(^|/)${req_mod}\.ko" "$INITRAMFS/lib/modules/$KVER/modules.builtin"; then
         echo "ERROR: required kernel module '$req_mod' missing from initramfs modules.dep/builtin" >&2
         exit 1
+    fi
+done
+for opt_mod in br_netfilter nf_conntrack ip_tables iptable_nat iptable_filter nf_tables nft_nat nft_chain_nat; do
+    if ! grep -Eq "(^|/)${opt_mod}\.ko" "$INITRAMFS/lib/modules/$KVER/modules.dep" && \
+       ! grep -Eq "(^|/)${opt_mod}\.ko" "$INITRAMFS/lib/modules/$KVER/modules.builtin"; then
+        echo "WARN: netfilter kernel module '$opt_mod' not present in modules.dep/builtin" >&2
     fi
 done
 
@@ -258,11 +296,46 @@ chmod 0644 /out/boot/initramfs.cpio.gz
 DISKTREE="/tmp/disktree"
 rm -rf "$DISKTREE" /tmp/base.raw
 mkdir -p \
+    "$DISKTREE/rootfs/etc/apk" \
+    "$DISKTREE/rw/etc-upper" \
+    "$DISKTREE/rw/etc-work" \
+    "$DISKTREE/rw/containers" \
+    "$DISKTREE/rw/cni" \
+    "$DISKTREE/rw/workspace" \
+    "$DISKTREE/rw/tmp" \
+    "$DISKTREE/rw/var-tmp" \
+    "$DISKTREE/rw/root"
+
+cp /etc/apk/repositories "$DISKTREE/rootfs/etc/apk/repositories"
+cp -a /etc/apk/keys "$DISKTREE/rootfs/etc/apk/keys"
+
+apk --root "$DISKTREE/rootfs" --initdb --no-cache --no-scripts add \
+    alpine-baselayout busybox podman crun conmon catatonit netavark aardvark-dns iptables ip6tables >/dev/null
+
+PODMAN_PKG=$(apk --root "$DISKTREE/rootfs" list -I podman | awk 'NR==1 {print $1}')
+CRUN_PKG=$(apk --root "$DISKTREE/rootfs" list -I crun | awk 'NR==1 {print $1}')
+if [ -z "$PODMAN_PKG" ] || [ -z "$CRUN_PKG" ]; then
+    echo "ERROR: failed to query rootfs Podman/crun package versions" >&2
+    exit 1
+fi
+echo "MINIPOD_PIN podman_pkg=$PODMAN_PKG"
+echo "MINIPOD_PIN crun_pkg=$CRUN_PKG"
+
+rm -rf \
+    "$DISKTREE/rootfs/lib/apk" \
+    "$DISKTREE/rootfs/var/cache/apk" \
+    "$DISKTREE/rootfs/etc/apk"
+
+chroot "$DISKTREE/rootfs" /bin/busybox --install -s || true
+if [ ! -x "$DISKTREE/rootfs/bin/sh" ] || [ ! -x "$DISKTREE/rootfs/usr/bin/podman" ] || [ ! -x "$DISKTREE/rootfs/usr/bin/crun" ]; then
+    echo "ERROR: rootfs missing busybox sh, podman, or crun after apk install" >&2
+    exit 1
+fi
+
+mkdir -p \
     "$DISKTREE/rootfs/bin" \
     "$DISKTREE/rootfs/sbin" \
-    "$DISKTREE/rootfs/usr/bin" \
-    "$DISKTREE/rootfs/usr/sbin" \
-    "$DISKTREE/rootfs/etc" \
+    "$DISKTREE/rootfs/etc/containers" \
     "$DISKTREE/rootfs/proc" \
     "$DISKTREE/rootfs/sys" \
     "$DISKTREE/rootfs/dev" \
@@ -270,31 +343,30 @@ mkdir -p \
     "$DISKTREE/rootfs/tmp" \
     "$DISKTREE/rootfs/var/tmp" \
     "$DISKTREE/rootfs/var/lib/containers" \
+    "$DISKTREE/rootfs/var/lib/cni" \
     "$DISKTREE/rootfs/workspace" \
-    "$DISKTREE/rootfs/root" \
-    "$DISKTREE/rw/etc-upper" \
-    "$DISKTREE/rw/etc-work" \
-    "$DISKTREE/rw/containers" \
-    "$DISKTREE/rw/workspace" \
-    "$DISKTREE/rw/tmp" \
-    "$DISKTREE/rw/var-tmp" \
-    "$DISKTREE/rw/root"
+    "$DISKTREE/rootfs/root"
 
-cp /bin/busybox.static "$DISKTREE/rootfs/bin/busybox"
-chmod 0755 "$DISKTREE/rootfs/bin/busybox"
-chroot "$DISKTREE/rootfs" /bin/busybox --install -s
+if [ -d "$DISKTREE/rootfs/var/run" ] && [ ! -L "$DISKTREE/rootfs/var/run" ]; then
+    rm -rf "$DISKTREE/rootfs/var/run"
+fi
+ln -sfn /run "$DISKTREE/rootfs/var/run"
 
 cp /out/bin/tiny-init "$DISKTREE/rootfs/sbin/tiny-init"
 chmod 0755 "$DISKTREE/rootfs/sbin/tiny-init"
 cp /out/bin/sandbox-agent "$DISKTREE/rootfs/bin/sandbox-agent"
 chmod 0755 "$DISKTREE/rootfs/bin/sandbox-agent"
 
-cat <<'EOF' > "$DISKTREE/rootfs/etc/passwd"
+if [ ! -f "$DISKTREE/rootfs/etc/passwd" ]; then
+    cat <<'EOF' > "$DISKTREE/rootfs/etc/passwd"
 root:x:0:0:root:/root:/bin/sh
 EOF
-cat <<'EOF' > "$DISKTREE/rootfs/etc/group"
+fi
+if [ ! -f "$DISKTREE/rootfs/etc/group" ]; then
+    cat <<'EOF' > "$DISKTREE/rootfs/etc/group"
 root:x:0:
 EOF
+fi
 cat <<'EOF' > "$DISKTREE/rootfs/etc/hosts"
 127.0.0.1 localhost
 ::1 localhost
@@ -309,12 +381,45 @@ VERSION_ID=1
 PRETTY_NAME="mini-pod Alpine Linux Guest"
 EOF
 
+cat <<'EOF' > "$DISKTREE/rootfs/etc/containers/containers.conf"
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+runtime = "crun"
+
+[network]
+network_backend = "netavark"
+firewall_driver = "iptables"
+EOF
+cat <<'EOF' > "$DISKTREE/rootfs/etc/containers/storage.conf"
+[storage]
+driver = "overlay"
+runroot = "/run/containers/storage"
+graphroot = "/var/lib/containers/storage"
+EOF
+cat <<'EOF' > "$DISKTREE/rootfs/etc/containers/policy.json"
+{
+  "default": [
+    {
+      "type": "insecureAcceptAnything"
+    }
+  ]
+}
+EOF
+cat <<'EOF' > "$DISKTREE/rootfs/etc/containers/registries.conf"
+unqualified-search-registries = ["docker.io"]
+EOF
+
 chmod 0644 \
     "$DISKTREE/rootfs/etc/passwd" \
     "$DISKTREE/rootfs/etc/group" \
     "$DISKTREE/rootfs/etc/hosts" \
     "$DISKTREE/rootfs/etc/resolv.conf" \
-    "$DISKTREE/rootfs/etc/os-release"
+    "$DISKTREE/rootfs/etc/os-release" \
+    "$DISKTREE/rootfs/etc/containers/containers.conf" \
+    "$DISKTREE/rootfs/etc/containers/storage.conf" \
+    "$DISKTREE/rootfs/etc/containers/policy.json" \
+    "$DISKTREE/rootfs/etc/containers/registries.conf"
 
 chmod 1777 \
     "$DISKTREE/rootfs/tmp" \
@@ -330,7 +435,7 @@ find "$DISKTREE" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 mkfs.ext4 -q -F -b 4096 -L minipod-root \
     -U "$EXT4_UUID" \
     -E "root_owner=0:0,hash_seed=${EXT4_HASH_SEED},lazy_itable_init=0,lazy_journal_init=0" \
-    -d "$DISKTREE" /tmp/base.raw 64M
+    -d "$DISKTREE" /tmp/base.raw 256M
 
 # `mke2fs -d` honors `E2FSPROGS_FAKE_TIME` for root/atime/mtime/crtime, but copies host `st_ctime`
 # for tree-populated inodes. Normalize every inode `ctime` deterministically with `debugfs`.
@@ -353,7 +458,7 @@ fi
 rm -f /tmp/debugfs-cmds /tmp/debugfs.out
 e2fsck -fn /tmp/base.raw >/dev/null
 
-qemu-img convert -f raw -O qcow2 -o compat=1.1,cluster_size=65536,lazy_refcounts=off \
+qemu-img convert -c -m 1 -f raw -O qcow2 -o compat=1.1,cluster_size=65536,lazy_refcounts=off \
     /tmp/base.raw /out/rootfs/base.qcow2
 chmod 0644 /out/rootfs/base.qcow2
 rm -f /tmp/base.raw
@@ -402,14 +507,23 @@ foreach ($Target in $Targets) {
 
     $LinuxVirtPkg = $null
     $BusyboxStaticPkg = $null
+    $PodmanPkg = $null
+    $CrunPkg = $null
     foreach ($Line in $AssembleLines) {
         if ($Line -match '^MINIPOD_PIN linux_virt_pkg=(.+)$') {
             $LinuxVirtPkg = $Matches[1].Trim()
         } elseif ($Line -match '^MINIPOD_PIN busybox_static_pkg=(.+)$') {
             $BusyboxStaticPkg = $Matches[1].Trim()
+        } elseif ($Line -match '^MINIPOD_PIN podman_pkg=(.+)$') {
+            $PodmanPkg = $Matches[1].Trim()
+        } elseif ($Line -match '^MINIPOD_PIN crun_pkg=(.+)$') {
+            $CrunPkg = $Matches[1].Trim()
         }
     }
-    if ([string]::IsNullOrWhiteSpace($LinuxVirtPkg) -or [string]::IsNullOrWhiteSpace($BusyboxStaticPkg)) {
+    if ([string]::IsNullOrWhiteSpace($LinuxVirtPkg) -or
+        [string]::IsNullOrWhiteSpace($BusyboxStaticPkg) -or
+        [string]::IsNullOrWhiteSpace($PodmanPkg) -or
+        [string]::IsNullOrWhiteSpace($CrunPkg)) {
         throw "Failed to capture package pins from $AlpineImage ($Platform)."
     }
 
@@ -424,6 +538,8 @@ foreach ($Target in $Targets) {
         --pin "alpine_digest=$AlpineDigest" `
         --pin "linux_virt_pkg=$LinuxVirtPkg" `
         --pin "busybox_static_pkg=$BusyboxStaticPkg" `
+        --pin "podman_pkg=$PodmanPkg" `
+        --pin "crun_pkg=$CrunPkg" `
         --pin "source_date_epoch=$SourceDateEpoch" `
         --entry "kernel=kernel/vmlinuz-virt" `
         --entry "initrd=boot/initramfs.cpio.gz" `

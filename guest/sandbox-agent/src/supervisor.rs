@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 
 use sandbox_protocol::{ExecTargetWire, Message, StreamChannel, StreamId};
 
+use crate::podman::{PodmanServiceManager, PODMAN_BIN, PODMAN_XDG_RUNTIME_DIR};
 use crate::OutboundQueue;
 #[cfg(unix)]
 use crate::supervisor_unix;
 
 const STREAM_READ_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_CONTAINER_TARGET_BYTES: usize = 128;
 #[cfg(not(unix))]
 const NON_UNIX_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -201,9 +203,10 @@ pub(crate) fn run_exec(
     stdin_rx: mpsc::Receiver<StdinItem>,
     outbound: Arc<OutboundQueue>,
     active_execs: Arc<Mutex<HashMap<StreamId, Arc<ActiveExec>>>>,
+    podman: Arc<PodmanServiceManager>,
 ) {
     let stream_id = spec.stream_id;
-    let res = run_exec_inner(spec, &handle, stdin_rx, &outbound);
+    let res = run_exec_inner(spec, &handle, stdin_rx, &outbound, &podman);
 
     // Ensure registry entry and stdin channel are cleared even if an error occurred.
     active_execs
@@ -217,20 +220,75 @@ pub(crate) fn run_exec(
     }
 }
 
+/// Validates a container name or ID passed to `podman exec` without shell/flag ambiguity.
+pub(crate) fn validate_container_target(id_or_name: &str) -> Result<(), String> {
+    if id_or_name.is_empty() {
+        return Err("container target must not be empty".to_owned());
+    }
+    if id_or_name.len() > MAX_CONTAINER_TARGET_BYTES {
+        return Err(format!(
+            "container target exceeds {MAX_CONTAINER_TARGET_BYTES} bytes"
+        ));
+    }
+    if id_or_name.starts_with('-') {
+        return Err("container target must not start with '-'".to_owned());
+    }
+    if !id_or_name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err("container target must contain only ASCII [a-zA-Z0-9_.-]".to_owned());
+    }
+    Ok(())
+}
+
+fn build_container_exec_args(id_or_name: &str, spec: &ExecSpec) -> Result<Vec<String>, String> {
+    validate_container_target(id_or_name)?;
+    if spec.argv.is_empty() {
+        return Err("ExecStart argv must not be empty".to_owned());
+    }
+
+    let mut args = vec!["exec".to_owned(), "-i".to_owned()];
+    if let Some(ref cwd) = spec.cwd {
+        if cwd.contains('\0') {
+            return Err("container exec workdir must not contain NUL bytes".to_owned());
+        }
+        args.push("--workdir".to_owned());
+        args.push(cwd.clone());
+    }
+    if let Some(ref user) = spec.user {
+        if user.contains('\0') {
+            return Err("container exec user must not contain NUL bytes".to_owned());
+        }
+        args.push("--user".to_owned());
+        args.push(user.clone());
+    }
+    for (key, val) in &spec.env {
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(format!("invalid container exec env key '{key}'"));
+        }
+        if val.contains('\0') {
+            return Err(format!(
+                "container exec env value for '{key}' contains NUL byte"
+            ));
+        }
+        args.push("--env".to_owned());
+        args.push(format!("{key}={val}"));
+    }
+    args.push("--".to_owned());
+    args.push(id_or_name.to_owned());
+    args.extend(spec.argv.iter().cloned());
+    Ok(args)
+}
+
 fn run_exec_inner(
     spec: ExecSpec,
     handle: &Arc<ActiveExec>,
     stdin_rx: mpsc::Receiver<StdinItem>,
     outbound: &Arc<OutboundQueue>,
+    podman: &PodmanServiceManager,
 ) -> Result<(), sandbox_protocol::ProtocolError> {
     let stream_id = spec.stream_id;
-
-    if let ExecTargetWire::Container { ref id_or_name } = spec.target {
-        let msg = format!(
-            "container exec target '{id_or_name}' is not supported until Phase 4\n"
-        );
-        return emit_pre_spawn_failure(outbound, stream_id, 125, msg.as_bytes(), spec.stderr_budget_bytes);
-    }
 
     let Some((program, args)) = spec.argv.split_first() else {
         return emit_pre_spawn_failure(
@@ -242,12 +300,42 @@ fn run_exec_inner(
         );
     };
 
-    #[cfg(unix)]
-    let resolved_user = match spec.user.as_deref() {
-        Some(user_spec) => match supervisor_unix::resolve_user(user_spec) {
-            Ok(ids) => Some(ids),
-            Err(reason) => {
-                let msg = format!("failed to resolve ExecStart user '{user_spec}': {reason}\n");
+    enum PreparedCommand {
+        Guest {
+            #[cfg(unix)]
+            user: Option<supervisor_unix::UnixUser>,
+        },
+        Container {
+            args: Vec<String>,
+        },
+    }
+
+    let prepared = match &spec.target {
+        ExecTargetWire::Guest => {
+            #[cfg(unix)]
+            let resolved_user = match spec.user.as_deref() {
+                Some(user_spec) => match supervisor_unix::resolve_user(user_spec) {
+                    Ok(ids) => Some(ids),
+                    Err(reason) => {
+                        let msg =
+                            format!("failed to resolve ExecStart user '{user_spec}': {reason}\n");
+                        return emit_pre_spawn_failure(
+                            outbound,
+                            stream_id,
+                            126,
+                            msg.as_bytes(),
+                            spec.stderr_budget_bytes,
+                        );
+                    }
+                },
+                None => None,
+            };
+
+            #[cfg(not(unix))]
+            if let Some(user_spec) = spec.user.as_deref() {
+                let msg = format!(
+                    "ExecStart user switching ('{user_spec}') is not supported on non-Unix hosts\n"
+                );
                 return emit_pre_spawn_failure(
                     outbound,
                     stream_id,
@@ -256,23 +344,31 @@ fn run_exec_inner(
                     spec.stderr_budget_bytes,
                 );
             }
-        },
-        None => None,
-    };
 
-    #[cfg(not(unix))]
-    if let Some(user_spec) = spec.user.as_deref() {
-        let msg = format!(
-            "ExecStart user switching ('{user_spec}') is not supported on non-Unix hosts\n"
-        );
-        return emit_pre_spawn_failure(
-            outbound,
-            stream_id,
-            126,
-            msg.as_bytes(),
-            spec.stderr_budget_bytes,
-        );
-    }
+            PreparedCommand::Guest {
+                #[cfg(unix)]
+                user: resolved_user,
+            }
+        }
+        ExecTargetWire::Container { id_or_name } => {
+            let container_args = match build_container_exec_args(id_or_name, &spec) {
+                Ok(args) => args,
+                Err(reason) => {
+                    let msg = format!("{reason}\n");
+                    return emit_pre_spawn_failure(
+                        outbound,
+                        stream_id,
+                        125,
+                        msg.as_bytes(),
+                        spec.stderr_budget_bytes,
+                    );
+                }
+            };
+            PreparedCommand::Container {
+                args: container_args,
+            }
+        }
+    };
 
     if handle.control.state.lock().unwrap_or_else(|e| e.into_inner()).cancelled {
         outbound.send_stream_eof(stream_id, StreamChannel::Stdout)?;
@@ -288,17 +384,47 @@ fn run_exec_inner(
         );
     }
 
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .envs(&spec.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(ref dir) = spec.cwd {
-        cmd.current_dir(dir);
-    }
-    #[cfg(unix)]
-    supervisor_unix::configure_command(&mut cmd, resolved_user);
+    let (program_label, mut cmd) = match prepared {
+        PreparedCommand::Guest {
+            #[cfg(unix)]
+            user,
+        } => {
+            let mut c = Command::new(program);
+            c.args(args)
+                .envs(&spec.env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(ref dir) = spec.cwd {
+                c.current_dir(dir);
+            }
+            #[cfg(unix)]
+            supervisor_unix::configure_command(&mut c, user);
+            (program.as_str(), c)
+        }
+        PreparedCommand::Container { args: podman_args } => {
+            if let Err(err) = podman.ensure_running() {
+                let msg = format!("failed to start podman service for container exec: {err}\n");
+                return emit_pre_spawn_failure(
+                    outbound,
+                    stream_id,
+                    125,
+                    msg.as_bytes(),
+                    spec.stderr_budget_bytes,
+                );
+            }
+
+            let mut c = Command::new(PODMAN_BIN);
+            c.args(&podman_args)
+                .env("XDG_RUNTIME_DIR", PODMAN_XDG_RUNTIME_DIR)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            supervisor_unix::configure_command(&mut c, None);
+            (PODMAN_BIN, c)
+        }
+    };
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -308,7 +434,7 @@ fn run_exec_inner(
             } else {
                 127
             };
-            let msg = format!("failed to execute '{program}': {err}\n");
+            let msg = format!("failed to execute '{program_label}': {err}\n");
             return emit_pre_spawn_failure(
                 outbound,
                 stream_id,
@@ -808,4 +934,99 @@ fn lookup_group_by_name(table: &str, name: &str) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_container_spec() -> ExecSpec {
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_owned(), "bar=baz".to_owned());
+        env.insert("Z_KEY".to_owned(), "val".to_owned());
+        ExecSpec {
+            stream_id: StreamId(1),
+            target: ExecTargetWire::Container {
+                id_or_name: "web_1.app-0".to_owned(),
+            },
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+            env,
+            cwd: Some("/workspace".to_owned()),
+            user: Some("1000:1000".to_owned()),
+            deadline_ms: 5_000,
+            stdout_budget_bytes: 4096,
+            stderr_budget_bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn validate_container_target_accepts_safe_names_and_rejects_unsafe_ones() {
+        assert!(validate_container_target("c1").is_ok());
+        assert!(validate_container_target("my-container_01.prod").is_ok());
+        let max_id = "a".repeat(MAX_CONTAINER_TARGET_BYTES);
+        assert!(validate_container_target(&max_id).is_ok());
+
+        for bad in [
+            "",
+            "-leading",
+            "--privileged",
+            "foo/bar",
+            "foo:bar",
+            "foo bar",
+            "foo\0bar",
+            "café",
+        ] {
+            assert!(
+                validate_container_target(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+        let too_long = "a".repeat(MAX_CONTAINER_TARGET_BYTES + 1);
+        assert!(validate_container_target(&too_long).is_err());
+    }
+
+    #[test]
+    fn build_container_exec_args_maps_workdir_user_env_and_double_dash() {
+        let spec = sample_container_spec();
+        let args = build_container_exec_args("web_1.app-0", &spec).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "-i",
+                "--workdir",
+                "/workspace",
+                "--user",
+                "1000:1000",
+                "--env",
+                "FOO=bar=baz",
+                "--env",
+                "Z_KEY=val",
+                "--",
+                "web_1.app-0",
+                "/bin/sh",
+                "-c",
+                "echo hi",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_container_exec_args_rejects_nul_bytes_and_invalid_env_keys() {
+        let mut bad_cwd = sample_container_spec();
+        bad_cwd.cwd = Some("/app\0bad".to_owned());
+        assert!(build_container_exec_args("c1", &bad_cwd).is_err());
+
+        let mut bad_user = sample_container_spec();
+        bad_user.user = Some("root\0".to_owned());
+        assert!(build_container_exec_args("c1", &bad_user).is_err());
+
+        let mut bad_env_key = sample_container_spec();
+        bad_env_key.env.insert("BAD=KEY".to_owned(), "1".to_owned());
+        assert!(build_container_exec_args("c1", &bad_env_key).is_err());
+
+        let mut bad_env_val = sample_container_spec();
+        bad_env_val.env.insert("OK".to_owned(), "a\0b".to_owned());
+        assert!(build_container_exec_args("c1", &bad_env_val).is_err());
+    }
 }
