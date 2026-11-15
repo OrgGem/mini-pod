@@ -185,12 +185,13 @@ fn bind_agent_endpoint(
     work_dir: &Path,
 ) -> Result<(AgentIpcEndpoint, Vec<PathBuf>), SandboxError> {
     if driver_cfg.runtime_parent_dir.is_none() {
-        let candidate = work_dir.join("a.sock");
+        let ipc_dir = work_dir.join("ipc");
+        let candidate = ipc_dir.join("a.sock");
         if validate_socket_path(&candidate).is_ok() {
             if let Some(s) = candidate.to_str() {
                 if !s.contains(',') {
                     let endpoint = AgentIpcEndpoint::bind(&candidate)?;
-                    return Ok((endpoint, vec![candidate]));
+                    return Ok((endpoint, vec![candidate, ipc_dir]));
                 }
             }
         }
@@ -1419,5 +1420,30 @@ mod tests {
             .await
             .unwrap();
         assert!(!killed);
+    }
+
+    #[test]
+    fn bind_agent_endpoint_creates_owner_only_ipc_subdir_inside_standard_work_dir() {
+        struct CleanDir(PathBuf);
+        impl Drop for CleanDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let work_dir = std::env::temp_dir().join(format!("mpb-{}", std::process::id()));
+        let _clean = CleanDir(work_dir.clone());
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let cfg = QemuDriverConfig::default();
+        let (endpoint, artifacts) = bind_agent_endpoint(&cfg, &work_dir).unwrap();
+        let sock = endpoint.socket_path().to_path_buf();
+        if validate_socket_path(&work_dir.join("ipc").join("a.sock")).is_ok() {
+            assert_eq!(sock, work_dir.join("ipc").join("a.sock"));
+            assert!(artifacts.contains(&work_dir.join("ipc")));
+        }
+        assert!(sock.exists());
+        drop(endpoint);
+        assert!(!sock.exists());
     }
 }

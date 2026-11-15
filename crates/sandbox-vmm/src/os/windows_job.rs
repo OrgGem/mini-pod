@@ -468,21 +468,40 @@ pub fn kill_verified_orphan_process(
         return match err.raw_os_error() {
             Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Ok(false),
             Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
-                // Distinguish PID reuse by a protected/system process from true same-process denial.
-                // SAFETY: Probes read-only limited query access on `pid`.
-                let probe_raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-                if probe_raw.is_null() {
-                    return Ok(false);
-                }
-                let probe = OwnedHandle::from_raw(probe_raw)?;
+                // Distinguish PID reuse by a protected/system process from a terminating/exited
+                // orphan (where `OpenProcess(PROCESS_TERMINATE)` returns `ERROR_ACCESS_DENIED`
+                // during Windows kernel rundown) vs genuine privilege denial on a live orphan.
+                // SAFETY: Probes limited query + wait access on `pid` without `PROCESS_TERMINATE`.
+                let sync_probe = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        0,
+                        pid,
+                    )
+                };
+                let (probe, can_wait) = if !sync_probe.is_null() {
+                    (OwnedHandle::from_raw(sync_probe)?, true)
+                } else {
+                    // SAFETY: Fall back to read-only query access when `SYNCHRONIZE` is denied.
+                    let query_raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                    if query_raw.is_null() {
+                        return Ok(false);
+                    }
+                    (OwnedHandle::from_raw(query_raw)?, false)
+                };
+
                 let actual = query_process_creation_time(probe.as_raw())?;
                 if actual != expected_start_token {
-                    Ok(false)
-                } else {
-                    Err(SandboxError::Internal(format!(
-                        "OpenProcess({pid}) denied PROCESS_TERMINATE on matching start token: {err}"
-                    )))
+                    return Ok(false);
                 }
+
+                if confirm_process_exited(&probe, can_wait) {
+                    return Ok(false);
+                }
+
+                Err(SandboxError::Internal(format!(
+                    "OpenProcess({pid}) denied PROCESS_TERMINATE on matching start token: {err}"
+                )))
             }
             _ => Err(SandboxError::Internal(format!(
                 "OpenProcess({pid}) failed: {err}"
@@ -505,9 +524,11 @@ pub fn kill_verified_orphan_process(
     let terminated = unsafe { TerminateProcess(handle.as_raw(), 1) };
     if terminated == 0 {
         let err = io::Error::last_os_error();
-        // SAFETY: On Windows, `TerminateProcess` returns `ERROR_ACCESS_DENIED` if the target just exited.
+        // On Windows, `TerminateProcess` returns `ERROR_ACCESS_DENIED` when the target is already
+        // exiting/terminated (for example via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`); wait for
+        // kernel rundown to finish before treating it as an active orphan.
         if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
-            && unsafe { WaitForSingleObject(handle.as_raw(), 0) } == WAIT_OBJECT_0
+            && confirm_process_exited(&handle, true)
         {
             return Ok(false);
         }
@@ -525,6 +546,21 @@ pub fn kill_verified_orphan_process(
     }
 
     Ok(true)
+}
+
+fn confirm_process_exited(handle: &OwnedHandle, can_wait: bool) -> bool {
+    if can_wait {
+        // SAFETY: `handle` has `PROCESS_SYNCHRONIZE`; returns immediately if already signaled
+        // or waits for asynchronous job-object / kernel teardown to finish.
+        return unsafe { WaitForSingleObject(handle.as_raw(), ORPHAN_TERMINATE_WAIT_MS) }
+            == WAIT_OBJECT_0;
+    }
+
+    const WIN32_STILL_ACTIVE: u32 = 259;
+    let mut exit_code: u32 = WIN32_STILL_ACTIVE;
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION` and `exit_code` is writable.
+    let ok = unsafe { GetExitCodeProcess(handle.as_raw(), &mut exit_code) };
+    ok != 0 && exit_code != WIN32_STILL_ACTIVE
 }
 
 fn collect_whitelisted_handles(spec: &WindowsSpawnSpec<'_>) -> Result<Vec<HANDLE>, SandboxError> {
@@ -1006,6 +1042,27 @@ mod tests {
 
         // Calling again after process exited and was reaped returns Ok(false).
         assert_eq!(kill_verified_orphan_process(pid, real_token), Ok(false));
+
+        // Terminating a child abruptly without waiting beforehand must also return Ok(false)
+        // cleanly (never fail with ERROR_ACCESS_DENIED during Windows kernel rundown).
+        let mut child2 = Command::new(&exe)
+            .args(["--exact", HELPER_TEST_NAME, "--nocapture"])
+            .env(ROLE_ENV, "sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn second sleeper for teardown test");
+        let pid2 = child2.id();
+        // SAFETY: Query-only open to capture `GetProcessTimes` creation token before killing.
+        let raw2 = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid2) };
+        let h2 = OwnedHandle::from_raw(raw2).expect("open second sleeper");
+        let token2 = query_process_creation_time(h2.as_raw()).expect("read second creation time");
+        drop(h2);
+
+        child2.kill().expect("kill second sleeper without waiting");
+        assert_eq!(kill_verified_orphan_process(pid2, token2), Ok(false));
+        let _ = child2.wait();
     }
 
     #[test]
