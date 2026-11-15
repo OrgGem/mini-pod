@@ -387,6 +387,7 @@ dependencies = [
 name = "tiny-init"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sandbox-protocol",
 ]
 
