@@ -167,7 +167,7 @@ impl OwnedNamedPipe {
 
     /// Returns the live DACL SDDL string currently enforced on this Named Pipe handle.
     pub fn inspect_pipe_sddl(&self) -> Result<String, SandboxError> {
-        inspect_object_sddl(self.handle.as_raw())
+        inspect_object_sddl(&self.handle)
     }
 }
 
@@ -258,7 +258,7 @@ impl WindowsUnixListener {
         remove_stale_socket_if_safe(socket_path)?;
 
         // SAFETY: `WSAStartup` succeeded above; creates an unbound `AF_UNIX` stream socket.
-        let raw = unsafe { socket(AF_UNIX as i32, SOCK_STREAM as i32, 0) };
+        let raw = unsafe { socket(AF_UNIX as i32, SOCK_STREAM, 0) };
         if raw == INVALID_SOCKET {
             return Err(wsa_error("socket(AF_UNIX)"));
         }
@@ -348,7 +348,7 @@ impl WindowsUnixStream {
         validate_socket_path(socket_path)?;
 
         // SAFETY: `WSAStartup` succeeded above.
-        let raw = unsafe { socket(AF_UNIX as i32, SOCK_STREAM as i32, 0) };
+        let raw = unsafe { socket(AF_UNIX as i32, SOCK_STREAM, 0) };
         if raw == INVALID_SOCKET {
             return Err(wsa_error("socket(AF_UNIX)"));
         }
@@ -375,7 +375,7 @@ impl WindowsUnixStream {
     /// Configures the socket receive timeout via `SO_RCVTIMEO` (`None` clears the timeout).
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
         self.set_socket_timeout(
-            SO_RCVTIMEO as i32,
+            SO_RCVTIMEO,
             timeout,
             "SO_RCVTIMEO",
             &self.fallback_read_timeout_ms,
@@ -385,7 +385,7 @@ impl WindowsUnixStream {
     /// Configures the socket send timeout via `SO_SNDTIMEO` (`None` clears the timeout).
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), SandboxError> {
         self.set_socket_timeout(
-            SO_SNDTIMEO as i32,
+            SO_SNDTIMEO,
             timeout,
             "SO_SNDTIMEO",
             &self.fallback_write_timeout_ms,
@@ -404,7 +404,7 @@ impl WindowsUnixStream {
         let rc = unsafe {
             setsockopt(
                 self.socket.0,
-                SOL_SOCKET as i32,
+                SOL_SOCKET,
                 optname,
                 (&ms as *const u32).cast::<u8>(),
                 size_of::<u32>() as i32,
@@ -710,13 +710,12 @@ pub fn create_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Inspects the DACL SDDL string for an open Win32 kernel/pipe handle.
-pub fn inspect_object_sddl(handle: HANDLE) -> Result<String, SandboxError> {
+fn inspect_object_sddl(handle: &OwnedHandle) -> Result<String, SandboxError> {
     let mut raw_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `handle` is an open Win32 handle; `GetSecurityInfo` allocates `raw_sd` via `LocalAlloc`.
     let status = unsafe {
         GetSecurityInfo(
-            handle,
+            handle.as_raw(),
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -980,7 +979,7 @@ fn build_sockaddr_un(socket_path: &Path) -> Result<SockAddrUn, SandboxError> {
     })?;
     let bytes = path_str.as_bytes();
     let mut addr = SockAddrUn {
-        sun_family: AF_UNIX as u16,
+        sun_family: AF_UNIX,
         sun_path: [0u8; 108],
     };
     addr.sun_path[..bytes.len()].copy_from_slice(bytes);

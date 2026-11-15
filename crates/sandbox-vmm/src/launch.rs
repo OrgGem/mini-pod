@@ -145,7 +145,6 @@ mod tests {
         let cfg = sample_config();
         let args = as_strings(&cfg.build_args().expect("valid isolated config"));
 
-        assert!(args.windows(2).any(|w| w == ["-nodefaults", "-display"] || w == ["-display", "none"]));
         assert!(args.contains(&"-nodefaults".to_owned()));
         assert!(args.windows(2).any(|w| w == ["-display", "none"]));
         assert!(args.windows(2).any(|w| w == ["-monitor", "none"]));

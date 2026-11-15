@@ -100,18 +100,22 @@ impl UnixIpcListener {
                 socket_path.display()
             ))
         })?;
-        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            SandboxError::Transport(format!(
+        if let Err(err) = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)) {
+            drop(listener);
+            let _ = fs::remove_file(socket_path);
+            return Err(SandboxError::Transport(format!(
                 "failed to set mode 0600 on Unix socket '{}': {err}",
                 socket_path.display()
-            ))
-        })?;
-        listener.set_nonblocking(true).map_err(|err| {
-            SandboxError::Transport(format!(
+            )));
+        }
+        if let Err(err) = listener.set_nonblocking(true) {
+            drop(listener);
+            let _ = fs::remove_file(socket_path);
+            return Err(SandboxError::Transport(format!(
                 "failed to set non-blocking mode on Unix listener '{}': {err}",
                 socket_path.display()
-            ))
-        })?;
+            )));
+        }
 
         Ok(Self {
             listener,

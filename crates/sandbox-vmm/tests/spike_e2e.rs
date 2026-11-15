@@ -138,6 +138,10 @@ fn qemu_boot_handshake_exec_ping_and_clean_teardown() {
     };
 
     let mut session = SpikeSession::boot(&config).expect("boot QEMU spike guest");
+    eprintln!(
+        "[spike_e2e] booted Linux guest with QEMU accel: {}",
+        session.accelerator_used().as_qemu_arg()
+    );
     let runtime_dir = session.runtime_dir().to_path_buf();
     assert!(
         runtime_dir.is_dir(),
