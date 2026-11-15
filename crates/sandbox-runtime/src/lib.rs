@@ -1,17 +1,29 @@
 #![forbid(unsafe_code)]
 //! Layer 2 runtime manager contract: lifecycle orchestration, lease management,
-//! execution streaming, safe workspace copy I/O, and idempotent teardown.
+//! execution streaming, driven adapter ports, safe workspace tar copy I/O, and crash journaling.
 
-use std::path::PathBuf;
+pub mod exec_stream;
+pub mod journal;
+pub mod ports;
+pub mod safe_tar;
+
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sandbox_core::{DestroyStatus, ExecRequest, SandboxError, SandboxId, SandboxLease, SandboxSpec};
-use sandbox_protocol::StreamId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExecStream {
-    pub stream_id: StreamId,
-}
+pub use exec_stream::{
+    CollectedExecOutput, ExecOutputChunk, ExecStream, ExecStreamHandle, OutputStreamKind,
+};
+pub use journal::{
+    cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
+};
+pub use ports::{
+    DiskOverlayPort, PreparedOverlay, VmBootConfig, VmBootOutcome, VmRuntimePort, VmSessionPort,
+};
+pub use safe_tar::{extract_tar_safely, pack_host_path_to_tar};
 
 #[async_trait::async_trait]
 pub trait RuntimeManager: Send + Sync {
@@ -22,4 +34,73 @@ pub trait RuntimeManager: Send + Sync {
     async fn copy_out(&self, id: &SandboxId, src_guest: String, dst_host: PathBuf) -> Result<(), SandboxError>;
     /// Idempotent destroy operation, safe for repeated invocation by startup reconciler.
     async fn destroy(&self, id: &SandboxId) -> Result<DestroyStatus, SandboxError>;
+}
+
+pub(crate) const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+/// Returns `true` when `meta` represents a symlink or Windows reparse point/junction.
+pub(crate) fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if (meta.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT;
+    false
+}
+
+pub(crate) fn map_fs_error(path: &Path, action: &str, err: io::Error) -> SandboxError {
+    match err.kind() {
+        ErrorKind::NotFound => SandboxError::NotFound(format!(
+            "cannot {action} '{}': {err}",
+            path.display()
+        )),
+        ErrorKind::PermissionDenied => SandboxError::PolicyViolation(format!(
+            "permission denied while attempting to {action} '{}': {err}",
+            path.display()
+        )),
+        _ => SandboxError::Internal(format!(
+            "failed to {action} '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        pub(crate) fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "minipod-rt-test-{label}-{}-{}",
+                std::process::id(),
+                TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).expect("create test temp dir");
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 }

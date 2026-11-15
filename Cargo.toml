@@ -34,6 +34,7 @@ getrandom = "0.2"
 libc = "0.2"
 sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time", "fs", "net", "macros"] }
 windows-sys = "0.59"
 
 [profile.guest-release]

@@ -9,3 +9,5 @@ license.workspace = true
 sandbox-core = { workspace = true }
 sandbox-protocol = { workspace = true }
 async-trait = { workspace = true }
+tar = { workspace = true }
+tokio = { workspace = true }
