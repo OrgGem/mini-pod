@@ -2,6 +2,7 @@
 //! and Windows, delegating process isolation and host IPC setup to thin OS modules.
 
 pub mod accel;
+pub mod driver;
 pub mod ipc;
 pub mod launch;
 pub mod os;
@@ -14,9 +15,10 @@ pub use accel::{
     parse_accel_help, probe_available_accelerators, probe_available_accelerators_for_arch,
     qemu_binary_name, qemu_img_binary_name, select_accelerator, Accelerator,
 };
+pub use driver::{QemuDriverConfig, QemuVmDriver, QemuVmSession};
 pub use ipc::{
-    validate_pipe_name, validate_socket_path, AgentIpcEndpoint, IpcListener, IpcStream,
-    MAX_UNIX_SOCKET_PATH_BYTES,
+    validate_pipe_name, validate_socket_path, AgentIpcEndpoint, IpcListener, IpcReadHalf,
+    IpcStream, IpcWriteHalf, MAX_UNIX_SOCKET_PATH_BYTES,
 };
 pub use launch::{QemuLaunchConfig, AGENT_VIRTIO_PORT_NAME};
 pub use process::{

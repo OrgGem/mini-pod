@@ -20,7 +20,7 @@ use crate::ipc::{AgentIpcEndpoint, IpcStream};
 use crate::launch::{validate_isolated_network, QemuLaunchConfig};
 use crate::process::{ConfinedProcess, ProcessLaunchSpec, ProcessStartIdentity, ProcessStdio};
 
-const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(150);
+pub(crate) const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(150);
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const POWEROFF_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_TAIL_BYTES: usize = 4096;
@@ -491,7 +491,7 @@ fn boot_attempt(
     Ok(session)
 }
 
-fn perform_handshake(stream: &mut IpcStream) -> Result<(), SandboxError> {
+pub(crate) fn perform_handshake(stream: &mut IpcStream) -> Result<(), SandboxError> {
     let hello_frame =
         read_frame(stream).map_err(|err| protocol_err("waiting for guest Hello", err))?;
     if hello_frame.header.stream_id != StreamId(0) {
@@ -528,7 +528,7 @@ fn perform_handshake(stream: &mut IpcStream) -> Result<(), SandboxError> {
     )
 }
 
-fn build_candidate_attempts(
+pub(crate) fn build_candidate_attempts(
     policy: AccelerationPolicy,
     available: &[Accelerator],
 ) -> Result<Vec<Accelerator>, SandboxError> {
@@ -543,7 +543,7 @@ fn build_candidate_attempts(
     Ok(attempts)
 }
 
-fn is_retryable_boot_error(err: &SandboxError) -> bool {
+pub(crate) fn is_retryable_boot_error(err: &SandboxError) -> bool {
     !matches!(
         err,
         SandboxError::BinaryExecutionBlocked(_)
@@ -553,7 +553,7 @@ fn is_retryable_boot_error(err: &SandboxError) -> bool {
     )
 }
 
-fn combine_fallback_error(
+pub(crate) fn combine_fallback_error(
     primary_accel: Accelerator,
     primary_err: SandboxError,
     fallback_accel: Accelerator,
@@ -571,7 +571,7 @@ fn combine_fallback_error(
     }
 }
 
-fn send_protocol_message(
+pub(crate) fn send_protocol_message(
     stream: &mut IpcStream,
     stream_id: StreamId,
     msg: &Message,
@@ -581,7 +581,7 @@ fn send_protocol_message(
     write_frame(stream, &frame).map_err(|err| protocol_err("writing protocol frame", err))
 }
 
-fn protocol_err(context: &str, err: ProtocolError) -> SandboxError {
+pub(crate) fn protocol_err(context: &str, err: ProtocolError) -> SandboxError {
     SandboxError::Transport(format!("{context}: {err}"))
 }
 
@@ -621,7 +621,7 @@ fn remove_dir_all_with_retry(dir: &Path) -> Result<(), SandboxError> {
     )))
 }
 
-fn read_attempt_diagnostics(serial_log_path: &Path, stderr_log_path: &Path) -> String {
+pub(crate) fn read_attempt_diagnostics(serial_log_path: &Path, stderr_log_path: &Path) -> String {
     let mut parts = Vec::new();
     if let Some(stderr_tail) = read_tail(stderr_log_path, DIAGNOSTIC_TAIL_BYTES) {
         parts.push(format!("qemu stderr tail:\n{stderr_tail}"));

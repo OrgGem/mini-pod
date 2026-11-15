@@ -6,8 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 sandbox-core = { workspace = true }
 sandbox-protocol = { workspace = true }
+sandbox-runtime = { workspace = true }
+tokio = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

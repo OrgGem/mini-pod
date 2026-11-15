@@ -1,0 +1,1423 @@
+//! Layer 3 VMM driver adapter implementing [`VmRuntimePort`] and [`VmSessionPort`]
+//! over confined QEMU processes and multiplexed `virtio-serial` protocol frames.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use sandbox_core::{
+    CapabilityReport, EnforcementLevel, ExecExitStatus, ExecRequest, ExecTarget, GuestArch,
+    SandboxError,
+};
+use sandbox_protocol::{
+    read_frame, write_frame, ExecTargetWire, Frame, Message, PriorityFrameQueue, StreamChannel,
+    StreamId,
+};
+use sandbox_runtime::{
+    validate_guest_path, ExecOutputChunk, ExecStream, OutputStreamKind, VmBootConfig,
+    VmBootOutcome, VmRuntimePort, VmSessionPort,
+};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::accel::{
+    discover_qemu_binary_for_arch, probe_available_accelerators_for_arch, Accelerator,
+};
+use crate::ipc::{
+    validate_socket_path, AgentIpcEndpoint, IpcReadHalf, IpcStream, IpcWriteHalf,
+};
+use crate::launch::{validate_isolated_network, QemuLaunchConfig};
+use crate::process::{
+    kill_verified_orphan_process, ConfinedProcess, ProcessLaunchSpec, ProcessStdio,
+};
+use crate::spike::{
+    build_candidate_attempts, combine_fallback_error, is_retryable_boot_error, perform_handshake,
+    protocol_err, read_attempt_diagnostics, ACCEPT_POLL_SLICE,
+};
+
+const MAX_HOST_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Configuration for [`QemuVmDriver`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QemuDriverConfig {
+    pub arch: GuestArch,
+    pub qemu_bin: Option<PathBuf>,
+    pub boot_timeout: Duration,
+    pub io_timeout: Duration,
+    pub runtime_parent_dir: Option<PathBuf>,
+}
+
+impl Default for QemuDriverConfig {
+    fn default() -> Self {
+        Self {
+            arch: GuestArch::host_native().unwrap_or(GuestArch::X86_64),
+            qemu_bin: None,
+            boot_timeout: Duration::from_secs(45),
+            io_timeout: Duration::from_secs(30),
+            runtime_parent_dir: None,
+        }
+    }
+}
+
+impl QemuDriverConfig {
+    /// Validates nonzero timeout invariants and explicit QEMU override paths.
+    pub fn validate(&self) -> Result<(), SandboxError> {
+        if self.boot_timeout.is_zero() {
+            return Err(SandboxError::InvalidSpec(
+                "QEMU boot_timeout must be greater than zero".to_owned(),
+            ));
+        }
+        if self.io_timeout.is_zero() {
+            return Err(SandboxError::InvalidSpec(
+                "QEMU io_timeout must be greater than zero".to_owned(),
+            ));
+        }
+        if let Some(bin) = &self.qemu_bin {
+            if bin.as_os_str().is_empty() {
+                return Err(SandboxError::InvalidSpec(
+                    "qemu_bin override path cannot be empty".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Layer 3 [`VmRuntimePort`] driving headless QEMU instances with `virtio-serial` multiplexing.
+#[derive(Clone, Debug)]
+pub struct QemuVmDriver {
+    config: QemuDriverConfig,
+}
+
+impl QemuVmDriver {
+    /// Creates a [`QemuVmDriver`] after validating driver timeouts and overrides.
+    pub fn new(config: QemuDriverConfig) -> Result<Self, SandboxError> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+
+    pub fn config(&self) -> &QemuDriverConfig {
+        &self.config
+    }
+}
+
+#[async_trait::async_trait]
+impl VmRuntimePort for QemuVmDriver {
+    async fn boot_vm(&self, config: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+        validate_boot_config(&config)?;
+
+        let driver_cfg = self.config.clone();
+        tokio::task::spawn_blocking(move || boot_vm_blocking(&driver_cfg, &config))
+            .await
+            .map_err(|err| SandboxError::Internal(format!("QEMU boot task failed: {err}")))?
+    }
+
+    async fn kill_orphan_process(
+        &self,
+        pid: u32,
+        expected_start_token: u64,
+    ) -> Result<bool, SandboxError> {
+        tokio::task::spawn_blocking(move || {
+            kill_verified_orphan_process(pid, expected_start_token)
+        })
+        .await
+        .map_err(|err| SandboxError::Internal(format!("kill_orphan_process task failed: {err}")))?
+    }
+}
+
+fn validate_boot_config(config: &VmBootConfig) -> Result<(), SandboxError> {
+    validate_isolated_network(&config.spec.network)?;
+    config.spec.validate_for_host_os(std::env::consts::OS)?;
+
+    for (label, path) in [
+        ("guest kernel", &config.overlay.kernel_path),
+        ("guest initramfs", &config.overlay.initramfs_path),
+        ("QCOW2 root overlay", &config.overlay.overlay_path),
+    ] {
+        if !path.is_file() {
+            return Err(SandboxError::NotFound(format!(
+                "{label} '{}' does not exist or is not a file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn boot_vm_blocking(
+    driver_cfg: &QemuDriverConfig,
+    boot_cfg: &VmBootConfig,
+) -> Result<VmBootOutcome, SandboxError> {
+    let qemu_bin =
+        discover_qemu_binary_for_arch(driver_cfg.arch, driver_cfg.qemu_bin.as_deref())?;
+    let available = probe_available_accelerators_for_arch(&qemu_bin, driver_cfg.arch)?;
+    let attempts = build_candidate_attempts(boot_cfg.spec.acceleration, &available)?;
+
+    let mut primary_failure: Option<(Accelerator, SandboxError)> = None;
+    for (idx, &accel) in attempts.iter().enumerate() {
+        match boot_single_attempt(driver_cfg, boot_cfg, &qemu_bin, accel) {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => {
+                let has_fallback = idx + 1 < attempts.len();
+                if !has_fallback || !is_retryable_boot_error(&err) {
+                    return Err(match primary_failure {
+                        Some((prev_accel, prev_err)) => {
+                            combine_fallback_error(prev_accel, prev_err, accel, err)
+                        }
+                        None => err,
+                    });
+                }
+                primary_failure = Some((accel, err));
+            }
+        }
+    }
+
+    Err(SandboxError::AccelerationUnavailable(
+        "no QEMU accelerator attempts were available".to_owned(),
+    ))
+}
+
+fn bind_agent_endpoint(
+    driver_cfg: &QemuDriverConfig,
+    work_dir: &Path,
+) -> Result<(AgentIpcEndpoint, Vec<PathBuf>), SandboxError> {
+    if driver_cfg.runtime_parent_dir.is_none() {
+        let candidate = work_dir.join("a.sock");
+        if validate_socket_path(&candidate).is_ok() {
+            if let Some(s) = candidate.to_str() {
+                if !s.contains(',') {
+                    let endpoint = AgentIpcEndpoint::bind(&candidate)?;
+                    return Ok((endpoint, vec![candidate]));
+                }
+            }
+        }
+    }
+
+    let endpoint = AgentIpcEndpoint::bind_temp_in(driver_cfg.runtime_parent_dir.as_deref(), "mp")?;
+    let sock_path = endpoint.socket_path().to_path_buf();
+    let mut paths = vec![sock_path.clone()];
+    if let Some(parent) = sock_path.parent() {
+        if parent != work_dir {
+            paths.push(parent.to_path_buf());
+        }
+    }
+    Ok((endpoint, paths))
+}
+
+fn boot_single_attempt(
+    driver_cfg: &QemuDriverConfig,
+    boot_cfg: &VmBootConfig,
+    qemu_bin: &Path,
+    accel: Accelerator,
+) -> Result<VmBootOutcome, SandboxError> {
+    let (endpoint, mut artifact_paths) = bind_agent_endpoint(driver_cfg, &boot_cfg.work_dir)?;
+    let socket_path = endpoint.socket_path().to_path_buf();
+
+    let serial_log_path = boot_cfg.work_dir.join("serial.log");
+    let stderr_log_path = boot_cfg.work_dir.join("qemu-stderr.log");
+    artifact_paths.push(serial_log_path.clone());
+    artifact_paths.push(stderr_log_path.clone());
+
+    let launch_cfg = QemuLaunchConfig {
+        qemu_bin: qemu_bin.to_path_buf(),
+        arch: driver_cfg.arch,
+        accelerator: accel,
+        kernel_path: boot_cfg.overlay.kernel_path.clone(),
+        initrd_path: Some(boot_cfg.overlay.initramfs_path.clone()),
+        kernel_cmdline: boot_cfg.overlay.kernel_cmdline.clone(),
+        root_disk_qcow2: Some(boot_cfg.overlay.overlay_path.clone()),
+        vcpus: boot_cfg.spec.budget.guest_vcpus,
+        ram_mb: boot_cfg.spec.budget.guest_ram_mb,
+        agent_socket_path: socket_path,
+        serial_log_path: Some(serial_log_path.clone()),
+        network: boot_cfg.spec.network.clone(),
+    };
+    let args = launch_cfg.build_args()?;
+
+    let stderr_file = File::create(&stderr_log_path).map_err(|err| {
+        SandboxError::Transport(format!(
+            "failed to create QEMU stderr log '{}': {err}",
+            stderr_log_path.display()
+        ))
+    })?;
+
+    let mut launch_spec = ProcessLaunchSpec::new(qemu_bin, args);
+    launch_spec.stderr = ProcessStdio::File(stderr_file);
+    let mut process = ConfinedProcess::spawn(launch_spec)?;
+
+    let boot_deadline = Instant::now() + driver_cfg.boot_timeout;
+    let mut stream = loop {
+        if let Some(status) = process.try_wait()? {
+            let diag = read_attempt_diagnostics(&serial_log_path, &stderr_log_path);
+            let msg = format!(
+                "QEMU ({}) exited with {status} before virtio-serial IPC connected{diag}",
+                accel.as_qemu_arg()
+            );
+            return Err(if accel.is_hardware() {
+                SandboxError::AccelerationUnavailable(msg)
+            } else {
+                SandboxError::Transport(msg)
+            });
+        }
+
+        let now = Instant::now();
+        if now >= boot_deadline {
+            let _ = process.kill_and_wait();
+            let diag = read_attempt_diagnostics(&serial_log_path, &stderr_log_path);
+            return Err(SandboxError::Transport(format!(
+                "timed out after {}ms waiting for QEMU ({}) to connect virtio-serial IPC{diag}",
+                driver_cfg.boot_timeout.as_millis(),
+                accel.as_qemu_arg()
+            )));
+        }
+
+        let slice = boot_deadline
+            .saturating_duration_since(now)
+            .min(ACCEPT_POLL_SLICE);
+        let attempt_start = Instant::now();
+        match endpoint.accept_timeout(slice) {
+            Ok(connected) => break connected,
+            Err(SandboxError::Transport(_)) => {
+                if attempt_start.elapsed() < slice / 2 {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Err(err) => {
+                let _ = process.kill_and_wait();
+                return Err(err);
+            }
+        }
+    };
+
+    stream.set_io_timeout(Some(driver_cfg.boot_timeout))?;
+    if let Err(err) = perform_handshake(&mut stream) {
+        let exited_early = process.try_wait().ok().flatten().is_some();
+        let _ = process.kill_and_wait();
+        let diag = read_attempt_diagnostics(&serial_log_path, &stderr_log_path);
+        return Err(match err {
+            SandboxError::Transport(msg) => {
+                let full = format!("{msg} ({}){diag}", accel.as_qemu_arg());
+                if accel.is_hardware() && exited_early {
+                    SandboxError::AccelerationUnavailable(full)
+                } else {
+                    SandboxError::Transport(full)
+                }
+            }
+            other => other,
+        });
+    }
+
+    let identity = process.start_identity();
+    let session = QemuVmSession::start(
+        Some(process),
+        Some(endpoint),
+        stream,
+        artifact_paths.clone(),
+        driver_cfg.io_timeout,
+        identity.pid,
+        identity.start_token,
+    )?;
+
+    Ok(VmBootOutcome {
+        session: Box::new(session),
+        pid: identity.pid,
+        start_token: identity.start_token,
+        artifact_paths,
+        hardware_accelerated: accel.is_hardware(),
+        capabilities: CapabilityReport {
+            cpu_quota: EnforcementLevel::Unsupported,
+            host_rss: EnforcementLevel::Unsupported,
+            host_storage: EnforcementLevel::Unsupported,
+            egress_filter: EnforcementLevel::HardLimit,
+        },
+    })
+}
+
+struct OutboundQueueState {
+    queue: PriorityFrameQueue,
+    closed: bool,
+    error: Option<String>,
+}
+
+struct OutboundQueue {
+    state: Mutex<OutboundQueueState>,
+    cv: Condvar,
+}
+
+impl OutboundQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OutboundQueueState {
+                queue: PriorityFrameQueue::new(),
+                closed: false,
+                error: None,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, frame: Frame) -> Result<(), SandboxError> {
+        let mut guard = lock_unpoisoned(&self.state);
+        if guard.closed {
+            return Err(SandboxError::Transport(
+                guard
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "QEMU IPC transport is closed".to_owned()),
+            ));
+        }
+        guard.queue.push(frame);
+        self.cv.notify_one();
+        Ok(())
+    }
+
+    fn close(&self, reason: Option<String>) {
+        let mut guard = lock_unpoisoned(&self.state);
+        guard.closed = true;
+        if guard.error.is_none() {
+            guard.error = reason;
+        }
+        self.cv.notify_all();
+    }
+
+    fn pop_blocking(&self) -> Option<Frame> {
+        let mut guard = lock_unpoisoned(&self.state);
+        loop {
+            if let Some(frame) = guard.queue.pop() {
+                return Some(frame);
+            }
+            if guard.closed {
+                return None;
+            }
+            guard = self
+                .cv
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+enum StreamHandler {
+    Exec {
+        output_tx: mpsc::Sender<ExecOutputChunk>,
+        exit_tx: Option<oneshot::Sender<Result<ExecExitStatus, SandboxError>>>,
+        done_tx: Option<oneshot::Sender<()>>,
+    },
+    CopyIn {
+        reply_tx: Option<oneshot::Sender<Result<u64, SandboxError>>>,
+    },
+    CopyOut {
+        max_bytes: u64,
+        buffer: Vec<u8>,
+        reply_tx: Option<oneshot::Sender<Result<Vec<u8>, SandboxError>>>,
+    },
+}
+
+/// Active multiplexed QEMU `virtio-serial` session implementing [`VmSessionPort`].
+pub struct QemuVmSession {
+    pid: u32,
+    start_token: u64,
+    artifact_paths: Vec<PathBuf>,
+    process: Mutex<Option<ConfinedProcess>>,
+    endpoint: Mutex<Option<AgentIpcEndpoint>>,
+    stream_shutdown: Mutex<Option<IpcReadHalf>>,
+    reader_thread: Mutex<Option<JoinHandle<()>>>,
+    writer_thread: Mutex<Option<JoinHandle<()>>>,
+    outbound: Arc<OutboundQueue>,
+    ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    transport_closed: Arc<AtomicBool>,
+    alive: AtomicBool,
+    next_stream_id: AtomicU32,
+}
+
+impl Drop for QemuVmSession {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        self.outbound.close(Some("session dropped".to_owned()));
+        if let Some(shutdown_half) = lock_unpoisoned(&self.stream_shutdown).as_ref() {
+            let _ = shutdown_half.shutdown();
+        }
+        if let Some(mut process) = lock_unpoisoned(&self.process).take() {
+            let _ = process.kill_and_wait();
+        }
+        self.teardown_ipc_and_threads();
+    }
+}
+
+impl QemuVmSession {
+    fn start(
+        process: Option<ConfinedProcess>,
+        endpoint: Option<AgentIpcEndpoint>,
+        stream: IpcStream,
+        artifact_paths: Vec<PathBuf>,
+        io_timeout: Duration,
+        pid: u32,
+        start_token: u64,
+    ) -> Result<Self, SandboxError> {
+        // Blocking reader waits indefinitely for async guest output; bounded writes guard against stalls.
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(Some(io_timeout))?;
+
+        let (read_half, write_half) = stream.into_split();
+        let stream_shutdown = read_half.clone();
+        let outbound = Arc::new(OutboundQueue::new());
+        let ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let transport_closed = Arc::new(AtomicBool::new(false));
+
+        let writer_outbound = Arc::clone(&outbound);
+        let writer_ops = Arc::clone(&ops);
+        let writer_closed = Arc::clone(&transport_closed);
+        let writer_thread = thread::Builder::new()
+            .name(format!("minipod-vmm-tx-{pid}"))
+            .spawn(move || {
+                run_writer_loop(write_half, writer_outbound, writer_ops, writer_closed);
+            })
+            .map_err(|err| SandboxError::Internal(format!("spawn VMM writer thread: {err}")))?;
+
+        let reader_outbound = Arc::clone(&outbound);
+        let reader_ops = Arc::clone(&ops);
+        let reader_closed = Arc::clone(&transport_closed);
+        let reader_thread = thread::Builder::new()
+            .name(format!("minipod-vmm-rx-{pid}"))
+            .spawn(move || {
+                run_reader_loop(read_half, reader_outbound, reader_ops, reader_closed);
+            })
+            .map_err(|err| SandboxError::Internal(format!("spawn VMM reader thread: {err}")))?;
+
+        Ok(Self {
+            pid,
+            start_token,
+            artifact_paths,
+            process: Mutex::new(process),
+            endpoint: Mutex::new(endpoint),
+            stream_shutdown: Mutex::new(Some(stream_shutdown)),
+            reader_thread: Mutex::new(Some(reader_thread)),
+            writer_thread: Mutex::new(Some(writer_thread)),
+            outbound,
+            ops,
+            transport_closed,
+            alive: AtomicBool::new(true),
+            next_stream_id: AtomicU32::new(1),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_stream(
+        stream: IpcStream,
+        io_timeout: Duration,
+    ) -> Result<Self, SandboxError> {
+        Self::start(None, None, stream, Vec::new(), io_timeout, 0, 0)
+    }
+
+    fn allocate_stream_id(&self) -> Result<StreamId, SandboxError> {
+        loop {
+            let current = self.next_stream_id.load(Ordering::Acquire);
+            if current == u32::MAX {
+                return Err(SandboxError::Internal(
+                    "QEMU session stream IDs exhausted".to_owned(),
+                ));
+            }
+            if self
+                .next_stream_id
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(StreamId(current));
+            }
+        }
+    }
+
+    fn enqueue_message(&self, stream_id: StreamId, msg: &Message) -> Result<(), SandboxError> {
+        let frame = Frame::from_message(stream_id, msg)
+            .map_err(|err| protocol_err("encoding protocol frame", err))?;
+        self.outbound.enqueue(frame)
+    }
+
+    fn ensure_transport_ready(&self) -> Result<(), SandboxError> {
+        if self.transport_closed.load(Ordering::Acquire) || !self.is_alive() {
+            return Err(SandboxError::Transport(
+                "QEMU VM session is closed or exited".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn teardown_ipc_and_threads(&self) {
+        self.outbound.close(None);
+        if let Some(shutdown_half) = lock_unpoisoned(&self.stream_shutdown).take() {
+            let _ = shutdown_half.shutdown();
+            drop(shutdown_half);
+        }
+        if let Some(handle) = lock_unpoisoned(&self.writer_thread).take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = lock_unpoisoned(&self.reader_thread).take() {
+            let _ = handle.join();
+        }
+        drop(lock_unpoisoned(&self.endpoint).take());
+        fail_all_pending_ops(&self.ops, "QEMU VM session terminated");
+    }
+}
+
+#[async_trait::async_trait]
+impl VmSessionPort for QemuVmSession {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn start_token(&self) -> u64 {
+        self.start_token
+    }
+
+    fn artifact_paths(&self) -> &[PathBuf] {
+        &self.artifact_paths
+    }
+
+    fn is_alive(&self) -> bool {
+        if !self.alive.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut proc_guard = lock_unpoisoned(&self.process);
+        if let Some(proc_ref) = proc_guard.as_mut() {
+            match proc_ref.try_wait() {
+                Ok(Some(_)) => {
+                    self.alive.store(false, Ordering::Release);
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            }
+        } else {
+            !self.transport_closed.load(Ordering::Acquire)
+        }
+    }
+
+    async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError> {
+        if req.argv.is_empty() {
+            return Err(SandboxError::InvalidSpec(
+                "exec argv cannot be empty".to_owned(),
+            ));
+        }
+        if req.deadline.is_zero() {
+            return Err(SandboxError::InvalidSpec(
+                "exec deadline must be greater than zero".to_owned(),
+            ));
+        }
+        self.ensure_transport_ready()?;
+
+        let wire_target = match req.target {
+            ExecTarget::Guest => ExecTargetWire::Guest,
+            ExecTarget::Container { id_or_name } => ExecTargetWire::Container { id_or_name },
+        };
+        let deadline_ms = u64::try_from(req.deadline.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+
+        let stream_id = self.allocate_stream_id()?;
+        let (exec_stream, handle) = ExecStream::channel(stream_id);
+        let (done_tx, done_rx) = oneshot::channel();
+
+        {
+            let mut ops = lock_unpoisoned(&self.ops);
+            ops.insert(
+                stream_id,
+                StreamHandler::Exec {
+                    output_tx: handle.output_tx,
+                    exit_tx: handle.exit_tx,
+                    done_tx: Some(done_tx),
+                },
+            );
+        }
+
+        let start_msg = Message::ExecStart {
+            target: wire_target,
+            argv: req.argv,
+            env: req.env,
+            cwd: req.cwd,
+            user: req.user,
+            deadline_ms,
+            stdout_budget_bytes: req.stdout_budget_bytes,
+            stderr_budget_bytes: req.stderr_budget_bytes,
+        };
+        if let Err(err) = self.enqueue_message(stream_id, &start_msg) {
+            lock_unpoisoned(&self.ops).remove(&stream_id);
+            return Err(err);
+        }
+
+        let outbound = Arc::clone(&self.outbound);
+        let mut stdin_rx = handle.stdin_rx;
+        let mut cancel_rx = handle.cancel_rx;
+        tokio::spawn(async move {
+            pump_exec_stdin_and_cancel(stream_id, outbound, &mut stdin_rx, &mut cancel_rx, done_rx)
+                .await;
+        });
+
+        Ok(exec_stream)
+    }
+
+    async fn copy_in_tar(
+        &self,
+        dst_guest: &str,
+        tar_bytes: Vec<u8>,
+        max_bytes: u64,
+    ) -> Result<u64, SandboxError> {
+        validate_guest_path(dst_guest, "dst_guest")?;
+        if (tar_bytes.len() as u64) > max_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "tar payload size ({} bytes) exceeds max_bytes ({max_bytes})",
+                tar_bytes.len()
+            )));
+        }
+        self.ensure_transport_ready()?;
+
+        let stream_id = self.allocate_stream_id()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut ops = lock_unpoisoned(&self.ops);
+            ops.insert(
+                stream_id,
+                StreamHandler::CopyIn {
+                    reply_tx: Some(reply_tx),
+                },
+            );
+        }
+
+        if let Err(err) = self.enqueue_message(
+            stream_id,
+            &Message::CopyInStart {
+                dst_guest: dst_guest.to_owned(),
+                max_bytes,
+            },
+        ) {
+            lock_unpoisoned(&self.ops).remove(&stream_id);
+            return Err(err);
+        }
+
+        if tar_bytes.is_empty() {
+            if let Err(err) = self.enqueue_message(
+                stream_id,
+                &Message::StreamData {
+                    channel: StreamChannel::Stdin,
+                    eof: true,
+                    data: Vec::new(),
+                },
+            ) {
+                lock_unpoisoned(&self.ops).remove(&stream_id);
+                return Err(err);
+            }
+        } else {
+            let total_chunks = tar_bytes.chunks(MAX_HOST_STREAM_CHUNK_BYTES).len();
+            for (idx, chunk) in tar_bytes.chunks(MAX_HOST_STREAM_CHUNK_BYTES).enumerate() {
+                let eof = idx + 1 == total_chunks;
+                if let Err(err) = self.enqueue_message(
+                    stream_id,
+                    &Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof,
+                        data: chunk.to_vec(),
+                    },
+                ) {
+                    lock_unpoisoned(&self.ops).remove(&stream_id);
+                    return Err(err);
+                }
+            }
+        }
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(SandboxError::Transport(
+                "copy_in interrupted before guest CopyDone".to_owned(),
+            ))
+        })
+    }
+
+    async fn copy_out_tar(
+        &self,
+        src_guest: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, SandboxError> {
+        validate_guest_path(src_guest, "src_guest")?;
+        if max_bytes == 0 {
+            return Err(SandboxError::InvalidSpec(
+                "copy_out max_bytes must be greater than zero".to_owned(),
+            ));
+        }
+        self.ensure_transport_ready()?;
+
+        let stream_id = self.allocate_stream_id()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut ops = lock_unpoisoned(&self.ops);
+            ops.insert(
+                stream_id,
+                StreamHandler::CopyOut {
+                    max_bytes,
+                    buffer: Vec::new(),
+                    reply_tx: Some(reply_tx),
+                },
+            );
+        }
+
+        if let Err(err) = self.enqueue_message(
+            stream_id,
+            &Message::CopyOutStart {
+                src_guest: src_guest.to_owned(),
+                max_bytes,
+            },
+        ) {
+            lock_unpoisoned(&self.ops).remove(&stream_id);
+            return Err(err);
+        }
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(SandboxError::Transport(
+                "copy_out interrupted before guest CopyDone".to_owned(),
+            ))
+        })
+    }
+
+    async fn graceful_shutdown(&self, timeout: Duration) -> Result<bool, SandboxError> {
+        if !self.alive.load(Ordering::Acquire) {
+            self.teardown_ipc_and_threads();
+            return Ok(true);
+        }
+
+        let _ = self.enqueue_message(StreamId(0), &Message::Shutdown);
+
+        let maybe_process = lock_unpoisoned(&self.process).take();
+        let Some(mut process) = maybe_process else {
+            self.alive.store(false, Ordering::Release);
+            self.teardown_ipc_and_threads();
+            return Ok(true);
+        };
+
+        let wait_result = tokio::task::spawn_blocking(move || {
+            let status = process.wait_timeout(timeout);
+            (process, status)
+        })
+        .await
+        .map_err(|err| SandboxError::Internal(format!("graceful_shutdown wait failed: {err}")))?;
+
+        let (process, exit_res) = wait_result;
+        match exit_res {
+            Ok(Some(_)) => {
+                self.alive.store(false, Ordering::Release);
+                drop(process);
+                self.teardown_ipc_and_threads();
+                Ok(true)
+            }
+            Ok(None) => {
+                *lock_unpoisoned(&self.process) = Some(process);
+                Ok(false)
+            }
+            Err(err) => {
+                *lock_unpoisoned(&self.process) = Some(process);
+                Err(err)
+            }
+        }
+    }
+
+    async fn force_kill(&self) -> Result<(), SandboxError> {
+        self.alive.store(false, Ordering::Release);
+        self.outbound.close(Some("force_kill invoked".to_owned()));
+        if let Some(shutdown_half) = lock_unpoisoned(&self.stream_shutdown).as_ref() {
+            let _ = shutdown_half.shutdown();
+        }
+
+        let maybe_process = lock_unpoisoned(&self.process).take();
+        let kill_res = if let Some(mut process) = maybe_process {
+            tokio::task::spawn_blocking(move || process.kill_and_wait())
+                .await
+                .map_err(|err| SandboxError::Internal(format!("force_kill task failed: {err}")))?
+        } else {
+            Ok(())
+        };
+
+        let shutdown_half = lock_unpoisoned(&self.stream_shutdown).take();
+        let writer = lock_unpoisoned(&self.writer_thread).take();
+        let reader = lock_unpoisoned(&self.reader_thread).take();
+        let endpoint = lock_unpoisoned(&self.endpoint).take();
+        let ops = Arc::clone(&self.ops);
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(half) = shutdown_half {
+                let _ = half.shutdown();
+                drop(half);
+            }
+            if let Some(handle) = writer {
+                let _ = handle.join();
+            }
+            if let Some(handle) = reader {
+                let _ = handle.join();
+            }
+            drop(endpoint);
+            fail_all_pending_ops(&ops, "QEMU process killed");
+        })
+        .await
+        .map_err(|err| SandboxError::Internal(format!("force_kill cleanup failed: {err}")))?;
+
+        kill_res
+    }
+}
+
+async fn pump_exec_stdin_and_cancel(
+    stream_id: StreamId,
+    outbound: Arc<OutboundQueue>,
+    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
+    cancel_rx: &mut mpsc::Receiver<()>,
+    mut done_rx: oneshot::Receiver<()>,
+) {
+    let mut stdin_open = true;
+    let mut cancel_open = true;
+    loop {
+        tokio::select! {
+            _ = &mut done_rx => break,
+            maybe_stdin = stdin_rx.recv(), if stdin_open => {
+                match maybe_stdin {
+                    Some(data) => {
+                        for chunk in data.chunks(MAX_HOST_STREAM_CHUNK_BYTES) {
+                            let Ok(frame) = Frame::from_message(
+                                stream_id,
+                                &Message::StreamData {
+                                    channel: StreamChannel::Stdin,
+                                    eof: false,
+                                    data: chunk.to_vec(),
+                                },
+                            ) else {
+                                return;
+                            };
+                            if outbound.enqueue(frame).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        stdin_open = false;
+                        if let Ok(frame) = Frame::from_message(
+                            stream_id,
+                            &Message::StreamData {
+                                channel: StreamChannel::Stdin,
+                                eof: true,
+                                data: Vec::new(),
+                            },
+                        ) {
+                            let _ = outbound.enqueue(frame);
+                        }
+                        if !cancel_open {
+                            break;
+                        }
+                    }
+                }
+            }
+            maybe_cancel = cancel_rx.recv(), if cancel_open => {
+                match maybe_cancel {
+                    Some(()) => {
+                        if let Ok(frame) = Frame::from_message(stream_id, &Message::ExecCancel) {
+                            if outbound.enqueue(frame).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        cancel_open = false;
+                        if !stdin_open {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_writer_loop(
+    mut write_half: IpcWriteHalf,
+    outbound: Arc<OutboundQueue>,
+    ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    transport_closed: Arc<AtomicBool>,
+) {
+    while let Some(frame) = outbound.pop_blocking() {
+        if let Err(err) = write_frame(&mut write_half, &frame) {
+            let msg = format!("writing protocol frame failed: {err}");
+            transport_closed.store(true, Ordering::Release);
+            outbound.close(Some(msg.clone()));
+            let _ = write_half.shutdown();
+            fail_all_pending_ops(&ops, &msg);
+            return;
+        }
+    }
+}
+
+fn run_reader_loop(
+    mut read_half: IpcReadHalf,
+    outbound: Arc<OutboundQueue>,
+    ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    transport_closed: Arc<AtomicBool>,
+) {
+    loop {
+        let frame = match read_frame(&mut read_half) {
+            Ok(frame) => frame,
+            Err(err) => {
+                let msg = format!("reading protocol frame failed: {err}");
+                transport_closed.store(true, Ordering::Release);
+                outbound.close(Some(msg.clone()));
+                fail_all_pending_ops(&ops, &msg);
+                return;
+            }
+        };
+
+        let stream_id = frame.header.stream_id;
+        let msg = match frame.decode_message() {
+            Ok(msg) => msg,
+            Err(err) => {
+                let reason = format!("decoding protocol frame failed: {err}");
+                transport_closed.store(true, Ordering::Release);
+                outbound.close(Some(reason.clone()));
+                fail_all_pending_ops(&ops, &reason);
+                return;
+            }
+        };
+
+        match msg {
+            Message::StreamData { channel, data, .. } => {
+                let maybe_exec_tx = {
+                    let mut map = lock_unpoisoned(&ops);
+                    match map.get_mut(&stream_id) {
+                        Some(StreamHandler::Exec { output_tx, .. }) => {
+                            let kind = match channel {
+                                StreamChannel::Stdout => Some(OutputStreamKind::Stdout),
+                                StreamChannel::Stderr => Some(OutputStreamKind::Stderr),
+                                StreamChannel::Stdin => None,
+                            };
+                            kind.filter(|_| !data.is_empty())
+                                .map(|stream_kind| (output_tx.clone(), stream_kind))
+                        }
+                        Some(StreamHandler::CopyOut {
+                            max_bytes,
+                            buffer,
+                            ..
+                        }) if channel == StreamChannel::Stdout => {
+                            let limit = *max_bytes;
+                            let new_len = (buffer.len() as u64).saturating_add(data.len() as u64);
+                            if new_len > limit {
+                                if let Some(StreamHandler::CopyOut { mut reply_tx, .. }) =
+                                    map.remove(&stream_id)
+                                {
+                                    if let Some(tx) = reply_tx.take() {
+                                        let _ = tx.send(Err(SandboxError::BudgetExceeded(
+                                            format!(
+                                                "copy_out payload exceeded max_bytes ({limit})"
+                                            ),
+                                        )));
+                                    }
+                                }
+                            } else {
+                                buffer.extend_from_slice(&data);
+                            }
+                            None
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((tx, stream_kind)) = maybe_exec_tx {
+                    let _ = tx.blocking_send(ExecOutputChunk {
+                        stream: stream_kind,
+                        data,
+                    });
+                }
+            }
+            Message::ExecExit {
+                code,
+                timed_out,
+                stdout_truncated,
+                stderr_truncated,
+            } => {
+                let removed = lock_unpoisoned(&ops).remove(&stream_id);
+                if let Some(StreamHandler::Exec {
+                    output_tx,
+                    mut exit_tx,
+                    mut done_tx,
+                }) = removed
+                {
+                    if let Some(tx) = exit_tx.take() {
+                        let _ = tx.send(Ok(ExecExitStatus {
+                            code,
+                            timed_out,
+                            stdout_truncated,
+                            stderr_truncated,
+                        }));
+                    }
+                    if let Some(tx) = done_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    drop(output_tx);
+                }
+            }
+            Message::CopyDone { bytes_transferred } => {
+                let removed = lock_unpoisoned(&ops).remove(&stream_id);
+                match removed {
+                    Some(StreamHandler::CopyIn { mut reply_tx }) => {
+                        if let Some(tx) = reply_tx.take() {
+                            let _ = tx.send(Ok(bytes_transferred));
+                        }
+                    }
+                    Some(StreamHandler::CopyOut {
+                        max_bytes,
+                        buffer,
+                        mut reply_tx,
+                    }) => {
+                        if let Some(tx) = reply_tx.take() {
+                            if bytes_transferred != buffer.len() as u64
+                                || bytes_transferred > max_bytes
+                            {
+                                let _ = tx.send(Err(SandboxError::Transport(format!(
+                                    "copy_out byte count mismatch (reported {bytes_transferred}, received {})",
+                                    buffer.len()
+                                ))));
+                            } else {
+                                let _ = tx.send(Ok(buffer));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Message::CopyError { message } => {
+                let removed = lock_unpoisoned(&ops).remove(&stream_id);
+                let err = map_guest_copy_error(&message);
+                match removed {
+                    Some(StreamHandler::CopyIn { mut reply_tx }) => {
+                        if let Some(tx) = reply_tx.take() {
+                            let _ = tx.send(Err(err));
+                        }
+                    }
+                    Some(StreamHandler::CopyOut { mut reply_tx, .. }) => {
+                        if let Some(tx) = reply_tx.take() {
+                            let _ = tx.send(Err(err));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Message::Ping { seq } => {
+                if let Ok(frame) = Frame::from_message(stream_id, &Message::Pong { seq }) {
+                    let _ = outbound.enqueue(frame);
+                }
+            }
+            Message::Shutdown => {
+                transport_closed.store(true, Ordering::Release);
+                outbound.close(Some("guest VM shut down".to_owned()));
+                fail_all_pending_ops(&ops, "guest VM shut down");
+                return;
+            }
+            Message::StreamCredit { .. } | Message::Pong { .. } => {}
+            other => {
+                let reason = format!(
+                    "unexpected guest message {:?} on stream {stream_id}",
+                    other.kind()
+                );
+                transport_closed.store(true, Ordering::Release);
+                outbound.close(Some(reason.clone()));
+                fail_all_pending_ops(&ops, &reason);
+                return;
+            }
+        }
+    }
+}
+
+fn fail_all_pending_ops(ops: &Mutex<HashMap<StreamId, StreamHandler>>, reason: &str) {
+    let drained: Vec<StreamHandler> = {
+        let mut map = lock_unpoisoned(ops);
+        map.drain().map(|(_, handler)| handler).collect()
+    };
+
+    for handler in drained {
+        match handler {
+            StreamHandler::Exec {
+                output_tx,
+                mut exit_tx,
+                mut done_tx,
+            } => {
+                if let Some(tx) = exit_tx.take() {
+                    let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
+                }
+                if let Some(tx) = done_tx.take() {
+                    let _ = tx.send(());
+                }
+                drop(output_tx);
+            }
+            StreamHandler::CopyIn { mut reply_tx } => {
+                if let Some(tx) = reply_tx.take() {
+                    let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
+                }
+            }
+            StreamHandler::CopyOut { mut reply_tx, .. } => {
+                if let Some(tx) = reply_tx.take() {
+                    let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
+                }
+            }
+        }
+    }
+}
+
+fn map_guest_copy_error(message: &str) -> SandboxError {
+    if message.contains("exceeds") || message.contains("budget") {
+        SandboxError::BudgetExceeded(message.to_owned())
+    } else {
+        SandboxError::PolicyViolation(message.to_owned())
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn driver_config_validates_timeouts_and_override_paths() {
+        let valid = QemuDriverConfig::default();
+        assert!(QemuVmDriver::new(valid).is_ok());
+
+        let mut zero_boot = QemuDriverConfig::default();
+        zero_boot.boot_timeout = Duration::ZERO;
+        assert!(matches!(
+            QemuVmDriver::new(zero_boot),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        let mut zero_io = QemuDriverConfig::default();
+        zero_io.io_timeout = Duration::ZERO;
+        assert!(matches!(
+            QemuVmDriver::new(zero_io),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        let mut empty_bin = QemuDriverConfig::default();
+        empty_bin.qemu_bin = Some(PathBuf::new());
+        assert!(matches!(
+            QemuVmDriver::new(empty_bin),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn multiplexed_session_handles_exec_cancel_copy_in_copy_out_and_shutdown() {
+        let listener = AgentIpcEndpoint::bind_temp("drv-mux").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            let mut copy_in_buf: HashMap<StreamId, Vec<u8>> = HashMap::new();
+
+            loop {
+                let frame = match read_frame(&mut client) {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                };
+                let sid = frame.header.stream_id;
+                match frame.decode_message().unwrap() {
+                    Message::ExecStart { argv, .. } => {
+                        if argv.first().map(String::as_str) == Some("echo") {
+                            let out = format!("out:{}", argv[1..].join(" ")).into_bytes();
+                            write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::StreamData {
+                                        channel: StreamChannel::Stdout,
+                                        eof: true,
+                                        data: out,
+                                    },
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::ExecExit {
+                                        code: Some(0),
+                                        timed_out: false,
+                                        stdout_truncated: false,
+                                        stderr_truncated: false,
+                                    },
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    Message::ExecCancel => {
+                        write_frame(
+                            &mut client,
+                            &Frame::from_message(
+                                sid,
+                                &Message::ExecExit {
+                                    code: Some(130),
+                                    timed_out: false,
+                                    stdout_truncated: false,
+                                    stderr_truncated: false,
+                                },
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    Message::CopyInStart { .. } => {
+                        copy_in_buf.insert(sid, Vec::new());
+                    }
+                    Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof,
+                        data,
+                    } => {
+                        if let Some(buf) = copy_in_buf.get_mut(&sid) {
+                            buf.extend_from_slice(&data);
+                            if eof {
+                                let total = buf.len() as u64;
+                                write_frame(
+                                    &mut client,
+                                    &Frame::from_message(
+                                        sid,
+                                        &Message::CopyDone {
+                                            bytes_transferred: total,
+                                        },
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                                copy_in_buf.remove(&sid);
+                            }
+                        }
+                    }
+                    Message::CopyOutStart { src_guest, .. } => {
+                        if src_guest == "/bad" {
+                            write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::CopyError {
+                                        message: "symlink traversal rejected".to_owned(),
+                                    },
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        } else {
+                            let tar_payload = b"mock-tar-bytes".to_vec();
+                            write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::StreamData {
+                                        channel: StreamChannel::Stdout,
+                                        eof: true,
+                                        data: tar_payload.clone(),
+                                    },
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::CopyDone {
+                                        bytes_transferred: tar_payload.len() as u64,
+                                    },
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    Message::Shutdown => {
+                        write_frame(
+                            &mut client,
+                            &Frame::from_message(StreamId(0), &Message::Shutdown).unwrap(),
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::from_test_stream(host_stream, Duration::from_secs(2)).unwrap();
+
+        let stream_a = session
+            .exec_stream(ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec!["echo".into(), "hello".into()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(5),
+                stdout_budget_bytes: 1024,
+                stderr_budget_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        let out_a = stream_a.collect().await.unwrap();
+        assert_eq!(out_a.stdout, b"out:hello");
+        assert_eq!(out_a.exit.code, Some(0));
+
+        // Concurrent cancelable exec + copy_in + copy_out + policy CopyError.
+        let mut cancel_stream = session
+            .exec_stream(ExecRequest {
+                target: ExecTarget::Container {
+                    id_or_name: "app".into(),
+                },
+                argv: vec!["sleep".into(), "60".into()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(5),
+                stdout_budget_bytes: 1024,
+                stderr_budget_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        cancel_stream.cancel().unwrap();
+
+        let (copy_in_res, copy_out_ok, copy_out_err, canceled_exit) = tokio::join!(
+            session.copy_in_tar("/workspace", vec![7u8; 70_000], 128 * 1024),
+            session.copy_out_tar("/workspace/out", 4096),
+            session.copy_out_tar("/bad", 4096),
+            cancel_stream.wait_exit(),
+        );
+        assert_eq!(copy_in_res.unwrap(), 70_000);
+        assert_eq!(copy_out_ok.unwrap(), b"mock-tar-bytes");
+        assert!(matches!(copy_out_err, Err(SandboxError::PolicyViolation(_))));
+        assert_eq!(canceled_exit.unwrap().code, Some(130));
+
+        assert!(session
+            .graceful_shutdown(Duration::from_millis(500))
+            .await
+            .unwrap());
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn kill_orphan_process_returns_false_for_missing_or_mismatched_pid() {
+        let driver = QemuVmDriver::new(QemuDriverConfig::default()).unwrap();
+        let killed = driver
+            .kill_orphan_process(std::process::id(), u64::MAX - 1)
+            .await
+            .unwrap();
+        assert!(!killed);
+    }
+}

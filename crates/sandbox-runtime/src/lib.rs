@@ -4,6 +4,7 @@
 
 pub mod exec_stream;
 pub mod journal;
+pub mod manager;
 pub mod ports;
 pub mod safe_tar;
 
@@ -19,6 +20,9 @@ pub use exec_stream::{
 };
 pub use journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
+};
+pub use manager::{
+    validate_guest_path, LocalRuntimeManager, ReconciliationReport, RuntimeManagerConfig,
 };
 pub use ports::{
     DiskOverlayPort, PreparedOverlay, VmBootConfig, VmBootOutcome, VmRuntimePort, VmSessionPort,

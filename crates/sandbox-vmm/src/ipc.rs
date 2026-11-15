@@ -18,6 +18,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sandbox_core::SandboxError;
@@ -168,17 +169,74 @@ impl IpcStream {
         self.set_read_timeout(timeout)?;
         self.set_write_timeout(timeout)
     }
+
+    /// Shuts down both read and write directions, unblocking any concurrent blocking `read`/`write`.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.inner.shutdown_both()
+    }
+
+    /// Splits this bidirectional stream into concurrent `Read` and `Write` halves sharing the same
+    /// underlying socket.
+    pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
+        let shared = Arc::new(self);
+        (
+            IpcReadHalf {
+                stream: Arc::clone(&shared),
+            },
+            IpcWriteHalf { stream: shared },
+        )
+    }
+}
+
+/// Shared read half produced by [`IpcStream::into_split`].
+#[derive(Clone)]
+pub struct IpcReadHalf {
+    stream: Arc<IpcStream>,
+}
+
+impl IpcReadHalf {
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown()
+    }
+}
+
+impl Read for IpcReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.inner.read_shared(buf)
+    }
+}
+
+/// Shared write half produced by [`IpcStream::into_split`].
+#[derive(Clone)]
+pub struct IpcWriteHalf {
+    stream: Arc<IpcStream>,
+}
+
+impl IpcWriteHalf {
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown()
+    }
+}
+
+impl Write for IpcWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.inner.write_shared(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Read for IpcStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+        self.inner.read_shared(buf)
     }
 }
 
 impl Write for IpcStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        self.inner.write_shared(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {

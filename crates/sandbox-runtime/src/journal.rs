@@ -134,18 +134,8 @@ impl JournalStore {
 
     /// Loads all committed `.journal` records for startup reconciliation, skipping `*.tmp` files.
     pub fn load_records(&self) -> Result<Vec<JournalRecord>, SandboxError> {
-        match fs::symlink_metadata(&self.root_dir) {
-            Ok(meta) => {
-                reject_symlink_or_reparse(&self.root_dir, &meta)?;
-                if !meta.file_type().is_dir() {
-                    return Err(SandboxError::PolicyViolation(format!(
-                        "journal root '{}' is not a directory",
-                        self.root_dir.display()
-                    )));
-                }
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(map_fs_error(&self.root_dir, "inspect journal root", err)),
+        if !self.check_root_exists_and_safe()? {
+            return Ok(Vec::new());
         }
 
         let entries = fs::read_dir(&self.root_dir)
@@ -166,62 +156,101 @@ impl JournalStore {
                 continue;
             };
 
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path)
-                .map_err(|err| map_fs_error(&path, "inspect journal file", err))?;
-            reject_symlink_or_reparse(&path, &meta)?;
-            if !meta.file_type().is_file() {
-                return Err(SandboxError::PolicyViolation(format!(
-                    "journal entry '{}' is not a regular file",
-                    path.display()
-                )));
-            }
-            if meta.len() > MAX_JOURNAL_FILE_BYTES as u64 {
-                return Err(SandboxError::InvalidSpec(format!(
-                    "journal file '{}' exceeds max size ({} bytes)",
-                    path.display(),
-                    MAX_JOURNAL_FILE_BYTES
-                )));
-            }
-
-            let file =
-                File::open(&path).map_err(|err| map_fs_error(&path, "open journal file", err))?;
-            let open_meta = file
-                .metadata()
-                .map_err(|err| map_fs_error(&path, "inspect opened journal file", err))?;
-            reject_symlink_or_reparse(&path, &open_meta)?;
-
-            let mut raw = Vec::new();
-            file.take((MAX_JOURNAL_FILE_BYTES as u64).saturating_add(1))
-                .read_to_end(&mut raw)
-                .map_err(|err| map_fs_error(&path, "read journal file", err))?;
-            if raw.len() > MAX_JOURNAL_FILE_BYTES {
-                return Err(SandboxError::InvalidSpec(format!(
-                    "journal file '{}' exceeds max size ({} bytes)",
-                    path.display(),
-                    MAX_JOURNAL_FILE_BYTES
-                )));
-            }
-
-            let text = String::from_utf8(raw).map_err(|_| {
-                SandboxError::InvalidSpec(format!(
-                    "journal file '{}' contains invalid UTF-8",
-                    path.display()
-                ))
-            })?;
-            let record = decode_record(&text)?;
-            if record.sandbox_id.as_str() != stem {
-                return Err(SandboxError::InvalidSpec(format!(
-                    "journal file '{}' sandbox_id mismatch ('{}')",
-                    path.display(),
-                    record.sandbox_id
-                )));
-            }
+            let record = self.read_and_decode_record(&entry.path(), stem)?;
             records.push(record);
         }
 
         records.sort_by(|a, b| a.sandbox_id.cmp(&b.sandbox_id));
         Ok(records)
+    }
+
+    /// Loads a single committed `.journal` record by sandbox ID, if present.
+    pub fn load_record(&self, id: &SandboxId) -> Result<Option<JournalRecord>, SandboxError> {
+        validate_sandbox_id_filename(id)?;
+        if !self.check_root_exists_and_safe()? {
+            return Ok(None);
+        }
+        let stem = id.as_str();
+        let path = self.root_dir.join(format!("{stem}{JOURNAL_EXT}"));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => self.read_and_decode_record(&path, stem).map(Some),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(map_fs_error(&path, "inspect journal file", err)),
+        }
+    }
+
+    fn check_root_exists_and_safe(&self) -> Result<bool, SandboxError> {
+        match fs::symlink_metadata(&self.root_dir) {
+            Ok(meta) => {
+                reject_symlink_or_reparse(&self.root_dir, &meta)?;
+                if !meta.file_type().is_dir() {
+                    return Err(SandboxError::PolicyViolation(format!(
+                        "journal root '{}' is not a directory",
+                        self.root_dir.display()
+                    )));
+                }
+                Ok(true)
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(map_fs_error(&self.root_dir, "inspect journal root", err)),
+        }
+    }
+
+    fn read_and_decode_record(
+        &self,
+        path: &Path,
+        expected_stem: &str,
+    ) -> Result<JournalRecord, SandboxError> {
+        let meta = fs::symlink_metadata(path)
+            .map_err(|err| map_fs_error(path, "inspect journal file", err))?;
+        reject_symlink_or_reparse(path, &meta)?;
+        if !meta.file_type().is_file() {
+            return Err(SandboxError::PolicyViolation(format!(
+                "journal entry '{}' is not a regular file",
+                path.display()
+            )));
+        }
+        if meta.len() > MAX_JOURNAL_FILE_BYTES as u64 {
+            return Err(SandboxError::InvalidSpec(format!(
+                "journal file '{}' exceeds max size ({} bytes)",
+                path.display(),
+                MAX_JOURNAL_FILE_BYTES
+            )));
+        }
+
+        let file = File::open(path).map_err(|err| map_fs_error(path, "open journal file", err))?;
+        let open_meta = file
+            .metadata()
+            .map_err(|err| map_fs_error(path, "inspect opened journal file", err))?;
+        reject_symlink_or_reparse(path, &open_meta)?;
+
+        let mut raw = Vec::new();
+        file.take((MAX_JOURNAL_FILE_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut raw)
+            .map_err(|err| map_fs_error(path, "read journal file", err))?;
+        if raw.len() > MAX_JOURNAL_FILE_BYTES {
+            return Err(SandboxError::InvalidSpec(format!(
+                "journal file '{}' exceeds max size ({} bytes)",
+                path.display(),
+                MAX_JOURNAL_FILE_BYTES
+            )));
+        }
+
+        let text = String::from_utf8(raw).map_err(|_| {
+            SandboxError::InvalidSpec(format!(
+                "journal file '{}' contains invalid UTF-8",
+                path.display()
+            ))
+        })?;
+        let record = decode_record(&text)?;
+        if record.sandbox_id.as_str() != expected_stem {
+            return Err(SandboxError::InvalidSpec(format!(
+                "journal file '{}' sandbox_id mismatch ('{}')",
+                path.display(),
+                record.sandbox_id
+            )));
+        }
+        Ok(record)
     }
 
     /// Idempotently removes a sandbox's committed journal (and any leftover `.tmp` file).

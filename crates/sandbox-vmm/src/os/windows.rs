@@ -20,10 +20,10 @@ use windows_sys::Win32::Foundation::{
     HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    accept, bind, closesocket, connect, listen, recv, select, send, setsockopt, socket,
-    WSAGetLastError, WSAStartup, AF_UNIX, FD_SET, INVALID_SOCKET, SOCKADDR, SOCKET, SOCKET_ERROR,
-    SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO, SO_SNDTIMEO, TIMEVAL, WSADATA, WSAENOPROTOOPT,
-    WSAEOPNOTSUPP,
+    accept, bind, closesocket, connect, listen, recv, select, send, setsockopt, shutdown, socket,
+    WSAGetLastError, WSAStartup, AF_UNIX, FD_SET, INVALID_SOCKET, SD_BOTH, SOCKADDR, SOCKET,
+    SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_RCVTIMEO, SO_SNDTIMEO, TIMEVAL, WSADATA,
+    WSAENOPROTOOPT, WSAEOPNOTSUPP,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -425,10 +425,9 @@ impl WindowsUnixStream {
         fallback_ms.store(0, Ordering::Release);
         Ok(())
     }
-}
 
-impl Read for WindowsUnixStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    /// Reads bytes concurrently from a shared `&WindowsUnixStream` reference.
+    pub fn read_shared(&self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -452,10 +451,9 @@ impl Read for WindowsUnixStream {
         }
         Ok(rc as usize)
     }
-}
 
-impl Write for WindowsUnixStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    /// Writes bytes concurrently to a shared `&WindowsUnixStream` reference.
+    pub fn write_shared(&self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -478,6 +476,30 @@ impl Write for WindowsUnixStream {
             return Err(io::Error::from_raw_os_error(code));
         }
         Ok(rc as usize)
+    }
+
+    /// Shuts down both read and write halves of the WinSock `AF_UNIX` stream.
+    pub fn shutdown_both(&self) -> io::Result<()> {
+        // SAFETY: `self.socket.0` is a valid socket owned by `self.socket` (`OwnedSocket`).
+        let rc = unsafe { shutdown(self.socket.0, SD_BOTH) };
+        if rc == SOCKET_ERROR {
+            // SAFETY: Thread-local WinSock error code after `shutdown` failure.
+            let code = unsafe { WSAGetLastError() };
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        Ok(())
+    }
+}
+
+impl Read for WindowsUnixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_shared(buf)
+    }
+}
+
+impl Write for WindowsUnixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_shared(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {

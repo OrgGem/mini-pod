@@ -213,21 +213,36 @@ impl UnixIpcStream {
             SandboxError::Transport(format!("failed to set Unix stream write timeout: {err}"))
         })
     }
+
+    /// Reads bytes concurrently from a shared `&UnixIpcStream` reference.
+    pub fn read_shared(&self, buf: &mut [u8]) -> io::Result<usize> {
+        (&self.stream).read(buf)
+    }
+
+    /// Writes bytes concurrently to a shared `&UnixIpcStream` reference.
+    pub fn write_shared(&self, buf: &[u8]) -> io::Result<usize> {
+        (&self.stream).write(buf)
+    }
+
+    /// Shuts down both read and write halves of the underlying Unix domain stream.
+    pub fn shutdown_both(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
 }
 
 impl Read for UnixIpcStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
+        self.read_shared(buf)
     }
 }
 
 impl Write for UnixIpcStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
+        self.write_shared(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        (&self.stream).flush()
     }
 }
 

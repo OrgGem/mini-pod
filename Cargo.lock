@@ -278,10 +278,13 @@ dependencies = [
 name = "sandbox-image"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ed25519-dalek",
  "getrandom",
  "sandbox-core",
+ "sandbox-runtime",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -303,10 +306,13 @@ dependencies = [
 name = "sandbox-vmm"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
  "sandbox-core",
  "sandbox-image",
  "sandbox-protocol",
+ "sandbox-runtime",
+ "tokio",
  "windows-sys 0.59.0",
 ]
 
