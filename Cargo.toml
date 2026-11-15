@@ -29,6 +29,7 @@ sandbox-image = { path = "crates/sandbox-image" }
 sandbox-docker-compat = { path = "crates/sandbox-docker-compat" }
 sandbox-client = { path = "crates/sandbox-client" }
 async-trait = "0.1"
+windows-sys = "0.59"
 
 [profile.guest-release]
 inherits = "release"
