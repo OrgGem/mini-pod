@@ -476,7 +476,7 @@ impl RuntimeManager for LocalRuntimeManager {
             }
         };
 
-        let spawn_artifacts = merge_artifact_paths(&[], &[prepared.overlay_path.clone()], &work_dir);
+        let spawn_artifacts = merge_artifact_paths(&[], std::slice::from_ref(&prepared.overlay_path), &work_dir);
         if let Err(err) = self
             .write_journal_async(JournalRecord {
                 sandbox_id: sandbox_id.clone(),
@@ -521,7 +521,7 @@ impl RuntimeManager for LocalRuntimeManager {
         let session: Arc<dyn VmSessionPort> = Arc::from(boot.session);
         let all_artifacts = merge_artifact_paths(
             &boot.artifact_paths,
-            &[prepared.overlay_path.clone()],
+            std::slice::from_ref(&prepared.overlay_path),
             &work_dir,
         );
         let expires_at = Instant::now() + spec.lease_ttl;

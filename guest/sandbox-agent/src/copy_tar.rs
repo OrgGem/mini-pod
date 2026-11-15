@@ -118,12 +118,12 @@ fn execute_copy_in(
 
     {
         let mut archive = tar::Archive::new(&mut reader);
-        let mut entries = archive
+        let entries = archive
             .entries()
             .map_err(|err| format!("invalid tar stream header: {err}"))?;
         let mut copy_buf = vec![0u8; MAX_COPY_IO_BUF];
 
-        while let Some(entry_res) = entries.next() {
+        for entry_res in entries {
             let mut entry = entry_res.map_err(|err| format!("invalid tar entry: {err}"))?;
             let entry_type = entry.header().entry_type();
             let raw_path_bytes = entry.path_bytes();
@@ -783,6 +783,23 @@ fn open_extract_file_no_symlink(path: &Path) -> Result<File, String> {
                     path.display()
                 ));
             }
+            if !meta.file_type().is_file() {
+                return Err(format!(
+                    "destination target '{}' is a non-regular filesystem node",
+                    path.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(format!(
+                        "refusing to overwrite hardlinked file (nlink={}) at '{}'",
+                        meta.nlink(),
+                        path.display()
+                    ));
+                }
+            }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(format!("failed to inspect '{}': {err}", path.display())),
@@ -795,8 +812,19 @@ fn open_extract_file_no_symlink(path: &Path) -> Result<File, String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    opts.open(path)
-        .map_err(|err| format!("failed to open '{}' for write: {err}", path.display()))
+    let file = opts
+        .open(path)
+        .map_err(|err| format!("failed to open '{}' for write: {err}", path.display()))?;
+    let open_meta = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect opened '{}': {err}", path.display()))?;
+    if is_symlink_or_reparse(&open_meta) || !open_meta.file_type().is_file() {
+        return Err(format!(
+            "opened destination '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(file)
 }
 
 fn open_source_file_no_symlink(path: &Path) -> Result<File, String> {
@@ -853,9 +881,6 @@ fn mtime_secs(meta: &fs::Metadata) -> u64 {
 }
 
 fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -864,5 +889,5 @@ fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
             return true;
         }
     }
-    false
+    meta.file_type().is_symlink()
 }

@@ -382,7 +382,7 @@ impl UnixConfinedProcess {
         timeout: Duration,
     ) -> Result<Option<ProcessExitStatus>, SandboxError> {
         let deadline = Instant::now() + timeout;
-        // shortcut: polls child.try_wait() every 25ms on Unix until deadline; Task 3.5/3.6 uses async process/signal waiter
+        // shortcut: polls child.try_wait() every 25ms on Unix until deadline; replace with waitid/pidfd/SIGCHLD wakeup if shutdown wait latency or idle polling becomes a bottleneck
         loop {
             if let Some(status) = self.try_wait()? {
                 return Ok(Some(status));
@@ -717,6 +717,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let grandchild_pid = grandchild_pid.expect("shell should print grandchild PID");
+        let grandchild_start_token = read_process_start_token(grandchild_pid);
+        #[cfg(target_os = "linux")]
+        assert_ne!(grandchild_start_token, 0);
 
         // SAFETY: Signal 0 checks liveness of grandchild PID.
         let alive_rc = unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) };
@@ -730,14 +733,45 @@ mod tests {
 
         let mut grandchild_gone = false;
         for _ in 0..40 {
-            // SAFETY: Probing whether grandchild terminated.
-            if unsafe { libc::kill(grandchild_pid as libc::pid_t, 0) } == -1 {
+            if is_process_terminated(grandchild_pid, grandchild_start_token) {
                 grandchild_gone = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(15));
         }
         assert!(grandchild_gone, "grandchild PID {grandchild_pid} must be terminated on Drop");
+    }
+
+    fn is_process_terminated(pid: u32, expected_start_token: u64) -> bool {
+        // SAFETY: Signal `0` probes process existence without delivering a signal.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Inside containers without an active PID 1 zombie reaper (e.g. Docker without --init),
+            // a SIGKILLed reparented grandchild briefly stays in state `'Z'` (zombie) where
+            // `kill(pid, 0)` still returns `0` until PID 1 exits or reaps it.
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => match parse_proc_stat_state_and_starttime(&stat) {
+                    Some((state, actual_start_token)) => {
+                        state == 'Z'
+                            || (expected_start_token != 0
+                                && actual_start_token != expected_start_token)
+                    }
+                    None => false,
+                },
+                Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_start_token;
+            false
+        }
     }
 
     #[test]

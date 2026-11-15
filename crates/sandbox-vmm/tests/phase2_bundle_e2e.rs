@@ -13,7 +13,9 @@ use sandbox_image::{
     create_qcow2_overlay_atomic, decode_hex_exact, install_bundle_atomic, sha256_reader,
     verify_installed_bundle, BundleVerifier,
 };
-use sandbox_vmm::{discover_qemu_img_binary, SpikeBootConfig, SpikeSession};
+use sandbox_vmm::{
+    discover_qemu_binary_for_arch, discover_qemu_img_binary, SpikeBootConfig, SpikeSession,
+};
 
 static NEXT_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -150,7 +152,28 @@ fn bundle_tamper_and_rogue_dll_are_rejected_before_install() {
 #[test]
 fn signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64() {
     let (x86_64_src, aarch64_src, verifier) = require_phase2_artifacts();
-    let qemu_img = discover_qemu_img_binary(None).expect("discover qemu-img binary");
+    let require_qemu = std::env::var_os("MINIPOD_REQUIRE_QEMU_TESTS").is_some();
+    let qemu_img = match discover_qemu_img_binary(None) {
+        Ok(path) => path,
+        Err(SandboxError::NotFound(msg)) if !require_qemu => {
+            eprintln!(
+                "[phase2_bundle_e2e::signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64] SKIPPED: {msg}"
+            );
+            return;
+        }
+        Err(err) => panic!("discover qemu-img binary: {err}"),
+    };
+    for arch in [GuestArch::X86_64, GuestArch::Aarch64] {
+        if let Err(err) = discover_qemu_binary_for_arch(arch, None) {
+            if matches!(err, SandboxError::NotFound(_)) && !require_qemu {
+                eprintln!(
+                    "[phase2_bundle_e2e::signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64] SKIPPED: {err}"
+                );
+                return;
+            }
+            panic!("discover QEMU binary for {}: {err}", arch.as_str());
+        }
+    }
 
     for (arch, src_dir, expected_uname) in [
         (GuestArch::X86_64, &x86_64_src, b"x86_64\n".as_slice()),

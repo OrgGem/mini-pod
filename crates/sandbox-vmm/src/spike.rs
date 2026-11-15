@@ -447,7 +447,7 @@ fn boot_attempt(
             .min(ACCEPT_POLL_SLICE);
         let attempt_start = Instant::now();
         let endpoint = session.endpoint.as_ref().expect("endpoint is active");
-        // shortcut: polls process.try_wait() every 150ms around accept_timeout for spike boot; Task 3.5/3.6 uses async process waiter
+        // shortcut: polls process.try_wait() every 150ms around accept_timeout during boot (also shared with driver via ACCEPT_POLL_SLICE) until async exit/socket multiplexing is added
         match endpoint.accept_timeout(slice) {
             Ok(stream) => break stream,
             Err(SandboxError::Transport(_)) => {

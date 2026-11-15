@@ -629,11 +629,11 @@ fn pump_stdin(
             StdinItem::Data { data, eof } => {
                 let len = data.len();
                 if let Some(ref mut stdin) = pipe {
-                    if !data.is_empty() {
-                        if stdin.write_all(&data).is_err() || stdin.flush().is_err() {
-                            pipe = None;
-                            break;
-                        }
+                    if !data.is_empty()
+                        && (stdin.write_all(&data).is_err() || stdin.flush().is_err())
+                    {
+                        pipe = None;
+                        break;
                     }
                 } else {
                     break;

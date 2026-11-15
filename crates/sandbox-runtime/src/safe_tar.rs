@@ -16,13 +16,24 @@ const COPY_IO_BUFFER_BYTES: usize = 64 * 1024;
     target_os = "linux",
     any(
         target_arch = "x86_64",
-        target_arch = "aarch64",
         target_arch = "x86",
-        target_arch = "arm",
-        target_arch = "riscv64"
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
     )
 ))]
 const UNIX_O_NOFOLLOW: Option<i32> = Some(0o400000);
+// <asm-generic/fcntl.h> vs ARM/PowerPC Linux ABI: `O_NOFOLLOW` is 0x8000 (0o100000), while 0o400000 is `O_LARGEFILE`.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )
+))]
+const UNIX_O_NOFOLLOW: Option<i32> = Some(0o100000);
 #[cfg(target_os = "macos")]
 const UNIX_O_NOFOLLOW: Option<i32> = Some(0x0100);
 #[cfg(all(
@@ -32,10 +43,14 @@ const UNIX_O_NOFOLLOW: Option<i32> = Some(0x0100);
         target_os = "linux",
         any(
             target_arch = "x86_64",
-            target_arch = "aarch64",
             target_arch = "x86",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x",
+            target_arch = "aarch64",
             target_arch = "arm",
-            target_arch = "riscv64"
+            target_arch = "powerpc",
+            target_arch = "powerpc64"
         )
     ))
 ))]
@@ -203,21 +218,19 @@ pub fn extract_tar_safely(
     ensure_safe_dir_path(dst_host, true)?;
 
     let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
-    let mut entries = archive
+    let entries = archive
         .entries()
         .map_err(|err| SandboxError::InvalidSpec(format!("invalid tar archive header: {err}")))?;
 
     let mut total_extracted: u64 = 0;
-    let mut entry_count: usize = 0;
     let mut copy_buf = vec![0u8; COPY_IO_BUFFER_BYTES];
 
-    while let Some(entry_res) = entries.next() {
+    for (entry_count, entry_res) in entries.enumerate() {
         if entry_count >= max_entries {
             return Err(SandboxError::BudgetExceeded(format!(
                 "tar entry count exceeds max_entries ({max_entries})"
             )));
         }
-        entry_count += 1;
 
         let mut entry = entry_res
             .map_err(|err| SandboxError::InvalidSpec(format!("invalid tar entry: {err}")))?;
@@ -911,7 +924,9 @@ mod tests {
     use super::*;
     use crate::test_util::TestTempDir;
 
-    fn make_raw_tar(entries: &[(&[u8], tar::EntryType, &[u8], Option<&[u8]>)]) -> Vec<u8> {
+    type RawTarEntry<'a> = (&'a [u8], tar::EntryType, &'a [u8], Option<&'a [u8]>);
+
+    fn make_raw_tar(entries: &[RawTarEntry<'_>]) -> Vec<u8> {
         let mut archive = Vec::new();
         for (raw_path, entry_type, payload, link_target) in entries {
             let mut header = tar::Header::new_gnu();

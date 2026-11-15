@@ -758,7 +758,7 @@ async fn e2e_crash_recovery_orphan_kill_and_cleanup() {
         }
         drop(reader);
 
-        let parts: Vec<&str> = ready_line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = ready_line.split_whitespace().collect();
         assert_eq!(parts.len(), 4, "malformed READY line: {ready_line:?}");
         let spawned_id = SandboxId::new(parts[1]);
         let qemu_pid: u32 = parts[2].parse().expect("parse QEMU pid");

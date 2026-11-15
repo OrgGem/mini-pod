@@ -565,8 +565,15 @@ mod tests {
 
     #[test]
     fn create_qcow2_overlay_atomic_creates_cow_overlay_and_rejects_chained_backing() {
-        let qemu_img = find_qemu_img_binary()
-            .expect("qemu-img binary must be available on PATH or standard QEMU install dir");
+        let Some(qemu_img) = find_qemu_img_binary() else {
+            if std::env::var_os("MINIPOD_REQUIRE_QEMU_TESTS").is_some() {
+                panic!("qemu-img binary must be available on PATH or standard QEMU install dir");
+            }
+            eprintln!(
+                "[sandbox_image::qcow2::create_qcow2_overlay_atomic] SKIPPED: qemu-img binary unavailable"
+            );
+            return;
+        };
         let tmp = TestTempDir::new("overlay-e2e");
         let base_path = clean_qemu_host_path(&tmp.path().join("base.qcow2")).unwrap();
 

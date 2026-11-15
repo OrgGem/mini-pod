@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
-use sandbox_core::{AccelerationPolicy, NetworkPolicy};
-use sandbox_vmm::{AgentIpcEndpoint, SpikeBootConfig, SpikeSession};
+use sandbox_core::{AccelerationPolicy, NetworkPolicy, SandboxError};
+use sandbox_vmm::{discover_qemu_binary, AgentIpcEndpoint, SpikeBootConfig, SpikeSession};
 
 #[test]
 fn ipc_endpoint_enforces_owner_only_permissions() {
@@ -128,6 +128,17 @@ fn qemu_boot_handshake_exec_ping_and_clean_teardown() {
         "Missing Phase 1 Linux spike guest images in '{}'. Run `powershell -ExecutionPolicy Bypass -File scripts/build-spike-guest.ps1` first.",
         guest_dir.display()
     );
+
+    let require_qemu = std::env::var_os("MINIPOD_REQUIRE_QEMU_TESTS").is_some();
+    if let Err(err) = discover_qemu_binary(None) {
+        if matches!(err, SandboxError::NotFound(_)) && !require_qemu {
+            eprintln!(
+                "[spike_e2e::qemu_boot_handshake_exec_ping_and_clean_teardown] SKIPPED: {err}"
+            );
+            return;
+        }
+        panic!("discover x86_64 QEMU binary: {err}");
+    }
 
     let config = SpikeBootConfig {
         kernel_path,

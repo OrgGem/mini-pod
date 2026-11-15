@@ -356,28 +356,24 @@ fn remove_single_artifact(path: &Path) -> bool {
 
 fn remove_link_entry_only(path: &Path, meta: &fs::Metadata) -> bool {
     #[cfg(windows)]
-    {
+    let res = {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-        let res = if (meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        if (meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0 {
             fs::remove_dir(path)
         } else {
             fs::remove_file(path)
-        };
-        return match res {
-            Ok(()) => true,
-            Err(err) if err.kind() == ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-        match fs::remove_file(path) {
-            Ok(()) => true,
-            Err(err) if err.kind() == ErrorKind::NotFound => true,
-            Err(_) => false,
         }
+    };
+    #[cfg(not(windows))]
+    let res = {
+        let _ = meta;
+        fs::remove_file(path)
+    };
+    match res {
+        Ok(()) => true,
+        Err(err) if err.kind() == ErrorKind::NotFound => true,
+        Err(_) => false,
     }
 }
 

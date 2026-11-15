@@ -1189,22 +1189,28 @@ mod tests {
         let valid = QemuDriverConfig::default();
         assert!(QemuVmDriver::new(valid).is_ok());
 
-        let mut zero_boot = QemuDriverConfig::default();
-        zero_boot.boot_timeout = Duration::ZERO;
+        let zero_boot = QemuDriverConfig {
+            boot_timeout: Duration::ZERO,
+            ..Default::default()
+        };
         assert!(matches!(
             QemuVmDriver::new(zero_boot),
             Err(SandboxError::InvalidSpec(_))
         ));
 
-        let mut zero_io = QemuDriverConfig::default();
-        zero_io.io_timeout = Duration::ZERO;
+        let zero_io = QemuDriverConfig {
+            io_timeout: Duration::ZERO,
+            ..Default::default()
+        };
         assert!(matches!(
             QemuVmDriver::new(zero_io),
             Err(SandboxError::InvalidSpec(_))
         ));
 
-        let mut empty_bin = QemuDriverConfig::default();
-        empty_bin.qemu_bin = Some(PathBuf::new());
+        let empty_bin = QemuDriverConfig {
+            qemu_bin: Some(PathBuf::new()),
+            ..Default::default()
+        };
         assert!(matches!(
             QemuVmDriver::new(empty_bin),
             Err(SandboxError::InvalidSpec(_))
@@ -1220,11 +1226,7 @@ mod tests {
             let mut client = IpcStream::connect(&sock_path).unwrap();
             let mut copy_in_buf: HashMap<StreamId, Vec<u8>> = HashMap::new();
 
-            loop {
-                let frame = match read_frame(&mut client) {
-                    Ok(frame) => frame,
-                    Err(_) => break,
-                };
+            while let Ok(frame) = read_frame(&mut client) {
                 let sid = frame.header.stream_id;
                 match frame.decode_message().unwrap() {
                     Message::ExecStart { argv, .. } => {

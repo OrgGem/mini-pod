@@ -565,11 +565,9 @@ fn confirm_process_exited(handle: &OwnedHandle, can_wait: bool) -> bool {
 
 fn collect_whitelisted_handles(spec: &WindowsSpawnSpec<'_>) -> Result<Vec<HANDLE>, SandboxError> {
     let mut list: Vec<HANDLE> = Vec::with_capacity(3 + spec.inherited_handles.len());
-    for maybe_h in [spec.stdin, spec.stdout, spec.stderr] {
-        if let Some(h) = maybe_h {
-            validate_inheritable_handle(h)?;
-            push_unique_handle(&mut list, h);
-        }
+    for h in [spec.stdin, spec.stdout, spec.stderr].into_iter().flatten() {
+        validate_inheritable_handle(h)?;
+        push_unique_handle(&mut list, h);
     }
     for &h in spec.inherited_handles {
         validate_inheritable_handle(h)?;
@@ -705,7 +703,7 @@ mod tests {
         for (k, v) in overrides {
             pairs.push((OsString::from(k), OsString::from(v)));
         }
-        pairs.sort_by(|(a, _), (b, _)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        pairs.sort_by_cached_key(|(a, _)| a.to_ascii_lowercase());
 
         let mut block = Vec::new();
         for (k, v) in pairs {
