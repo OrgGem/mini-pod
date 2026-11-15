@@ -60,10 +60,10 @@ struct SockAddrUn {
     sun_path: [u8; 108],
 }
 
-struct OwnedHandle(HANDLE);
+pub(crate) struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
-    fn from_raw(handle: HANDLE) -> Result<Self, SandboxError> {
+    pub(crate) fn from_raw(handle: HANDLE) -> Result<Self, SandboxError> {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Err(SandboxError::Transport(format!(
                 "Win32 returned invalid handle: {}",
@@ -73,7 +73,7 @@ impl OwnedHandle {
         Ok(Self(handle))
     }
 
-    fn as_raw(&self) -> HANDLE {
+    pub(crate) fn as_raw(&self) -> HANDLE {
         self.0
     }
 }
@@ -1011,7 +1011,7 @@ fn ensure_wsa_started() -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn to_wide_null(s: &OsStr) -> Result<Vec<u16>, SandboxError> {
+pub(crate) fn to_wide_null(s: &OsStr) -> Result<Vec<u16>, SandboxError> {
     let mut wide: Vec<u16> = s.encode_wide().collect();
     if wide.contains(&0) {
         return Err(SandboxError::InvalidSpec(
@@ -1039,7 +1039,7 @@ fn wide_ptr_to_string(ptr: *const u16) -> Result<String, SandboxError> {
     }
 }
 
-fn win32_error(context: &str) -> SandboxError {
+pub(crate) fn win32_error(context: &str) -> SandboxError {
     SandboxError::Internal(format!("{context} failed: {}", io::Error::last_os_error()))
 }
 

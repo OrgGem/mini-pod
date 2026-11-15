@@ -5,6 +5,7 @@ pub mod accel;
 pub mod ipc;
 pub mod launch;
 pub mod os;
+pub mod process;
 pub mod spike;
 
 pub use accel::{
@@ -18,5 +19,9 @@ pub use ipc::{
     MAX_UNIX_SOCKET_PATH_BYTES,
 };
 pub use launch::{QemuLaunchConfig, AGENT_VIRTIO_PORT_NAME};
+pub use process::{
+    kill_verified_orphan_process, parse_proc_stat_starttime, quote_windows_command_line,
+    ConfinedProcess, ProcessExitStatus, ProcessLaunchSpec, ProcessStartIdentity, ProcessStdio,
+};
 pub use sandbox_core::GuestArch;
 pub use spike::{SpikeBootConfig, SpikeExecOutput, SpikeSession};

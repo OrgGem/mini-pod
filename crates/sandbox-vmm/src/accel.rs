@@ -161,19 +161,19 @@ pub fn discover_qemu_img_binary(explicit: Option<&Path>) -> Result<PathBuf, Sand
     discover_binary(qemu_img_binary_name(), explicit)
 }
 
-/// Classifies an I/O error returned while probing or launching a QEMU binary into [`SandboxError`].
+/// Classifies an I/O error returned while probing or launching a binary into [`SandboxError`].
 ///
-/// Recognizes Windows AppLocker (`1260`), WDAC / Smart App Control (`4551`), access denied (`5`),
-/// and POSIX `EACCES` (`13`) / `EPERM` (`1`) as [`SandboxError::BinaryExecutionBlocked`] without
-/// ever relaxing the VM isolation boundary.
+/// Recognizes Windows AppLocker (`1260`, `786`), WDAC / Smart App Control (`4551`, reputation
+/// block codes), access denied (`5`), and POSIX `EACCES` (`13`) / `EPERM` (`1`) as
+/// [`SandboxError::BinaryExecutionBlocked`] without ever relaxing the VM isolation boundary.
 pub fn classify_launch_error(qemu_bin: &Path, err: &io::Error) -> SandboxError {
     let path = qemu_bin.display();
     match err.raw_os_error() {
-        Some(1260) => SandboxError::BinaryExecutionBlocked(format!(
-            "QEMU binary '{path}' was blocked by Windows AppLocker / software restriction policy (OS error 1260): {err}"
+        Some(code @ (1260 | 786)) => SandboxError::BinaryExecutionBlocked(format!(
+            "QEMU binary '{path}' was blocked by Windows AppLocker / software restriction policy (OS error {code}): {err}"
         )),
-        Some(4551) => SandboxError::BinaryExecutionBlocked(format!(
-            "QEMU binary '{path}' was blocked by Windows Defender Application Control / Smart App Control (OS error 4551): {err}"
+        Some(code @ (4551 | 4556..=4559 | 4580..=4582)) => SandboxError::BinaryExecutionBlocked(format!(
+            "QEMU binary '{path}' was blocked by Windows Defender Application Control / Smart App Control (OS error {code}): {err}"
         )),
         Some(code @ (5 | 13 | 1)) => SandboxError::BinaryExecutionBlocked(format!(
             "QEMU binary '{path}' execution was denied by OS security or permission policy (OS error {code}): {err}"
@@ -513,9 +513,19 @@ mod tests {
             matches!(&applocker, SandboxError::BinaryExecutionBlocked(msg) if msg.contains("1260") && msg.contains("AppLocker"))
         );
 
+        let applocker_no_ui = classify_launch_error(bin, &io::Error::from_raw_os_error(786));
+        assert!(
+            matches!(&applocker_no_ui, SandboxError::BinaryExecutionBlocked(msg) if msg.contains("786") && msg.contains("AppLocker"))
+        );
+
         let wdac = classify_launch_error(bin, &io::Error::from_raw_os_error(4551));
         assert!(
             matches!(&wdac, SandboxError::BinaryExecutionBlocked(msg) if msg.contains("4551") && msg.contains("Windows Defender Application Control"))
+        );
+
+        let sac = classify_launch_error(bin, &io::Error::from_raw_os_error(4556));
+        assert!(
+            matches!(&sac, SandboxError::BinaryExecutionBlocked(msg) if msg.contains("4556") && msg.contains("Smart App Control"))
         );
 
         for raw in [5, 13, 1] {

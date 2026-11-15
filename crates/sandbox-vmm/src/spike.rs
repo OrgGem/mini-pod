@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sandbox_core::{AccelerationPolicy, GuestArch, NetworkPolicy, SandboxError};
@@ -14,16 +13,16 @@ use sandbox_protocol::{
 };
 
 use crate::accel::{
-    classify_launch_error, discover_qemu_binary_for_arch, probe_available_accelerators_for_arch,
-    select_accelerator, Accelerator,
+    discover_qemu_binary_for_arch, probe_available_accelerators_for_arch, select_accelerator,
+    Accelerator,
 };
 use crate::ipc::{AgentIpcEndpoint, IpcStream};
 use crate::launch::{validate_isolated_network, QemuLaunchConfig};
+use crate::process::{ConfinedProcess, ProcessLaunchSpec, ProcessStartIdentity, ProcessStdio};
 
 const ACCEPT_POLL_SLICE: Duration = Duration::from_millis(150);
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const POWEROFF_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DIAGNOSTIC_TAIL_BYTES: usize = 4096;
 
 /// Configuration for launching and communicating with a Phase 1/2 QEMU spike guest.
@@ -85,7 +84,7 @@ pub struct SpikeExecOutput {
 
 /// Active QEMU VM session connected to `sandbox-agent` over a host-bound `AF_UNIX` `virtio-serial` socket.
 pub struct SpikeSession {
-    child: Option<Child>,
+    process: Option<ConfinedProcess>,
     stream: Option<IpcStream>,
     endpoint: Option<AgentIpcEndpoint>,
     runtime_dir: PathBuf,
@@ -166,6 +165,11 @@ impl SpikeSession {
     /// Returns the owner-only host runtime directory holding the IPC socket and QEMU logs.
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
+    }
+
+    /// Returns the confined QEMU process identity (`pid` and OS start-time token) if still held.
+    pub fn process_identity(&self) -> Option<ProcessStartIdentity> {
+        self.process.as_ref().map(ConfinedProcess::start_identity)
     }
 
     /// Sends a liveness `Ping` on `StreamId(0)` and validates the matching `Pong`.
@@ -313,14 +317,14 @@ impl SpikeSession {
     }
 
     fn kill_child_now(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = wait_or_kill_child(&mut child, None);
+        if let Some(mut process) = self.process.take() {
+            let _ = process.kill_and_wait();
         }
     }
 
     fn teardown(&mut self, graceful_wait: Option<Duration>) -> Result<(), SandboxError> {
-        let child_res = if let Some(mut child) = self.child.take() {
-            wait_or_kill_child(&mut child, graceful_wait)
+        let child_res = if let Some(mut process) = self.process.take() {
+            wait_or_kill_process(&mut process, graceful_wait)
         } else {
             Ok(())
         };
@@ -372,7 +376,7 @@ fn boot_attempt(
         .to_path_buf();
 
     let mut session = SpikeSession {
-        child: None,
+        process: None,
         stream: None,
         endpoint: Some(endpoint),
         runtime_dir: runtime_dir.clone(),
@@ -407,22 +411,14 @@ fn boot_attempt(
         ))
     })?;
 
-    // shortcut: uses std::process::Command for Phase 1 spike; Phase 3 wraps QEMU launch in Windows Job Object via CreateProcessW
-    let child = Command::new(qemu_bin)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .map_err(|err| classify_launch_error(qemu_bin, &err))?;
-    session.child = Some(child);
+    let mut launch_spec = ProcessLaunchSpec::new(qemu_bin, args);
+    launch_spec.stderr = ProcessStdio::File(stderr_file);
+    session.process = Some(ConfinedProcess::spawn(launch_spec)?);
 
     let boot_deadline = Instant::now() + config.boot_timeout;
     let stream = loop {
-        let child = session.child.as_mut().expect("child is spawned");
-        if let Some(status) = child.try_wait().map_err(|err| {
-            SandboxError::Internal(format!("failed to poll QEMU child status: {err}"))
-        })? {
+        let process = session.process.as_mut().expect("QEMU process is spawned");
+        if let Some(status) = process.try_wait()? {
             let diag = read_attempt_diagnostics(&serial_log_path, &stderr_log_path);
             let msg = format!(
                 "QEMU ({}) exited with {status} before virtio-serial IPC connected{diag}",
@@ -451,7 +447,7 @@ fn boot_attempt(
             .min(ACCEPT_POLL_SLICE);
         let attempt_start = Instant::now();
         let endpoint = session.endpoint.as_ref().expect("endpoint is active");
-        // shortcut: polls child.try_wait() every 150ms around accept_timeout for Phase 1 spike; Phase 3 uses async process waiter
+        // shortcut: polls process.try_wait() every 150ms around accept_timeout for spike boot; Task 3.5/3.6 uses async process waiter
         match endpoint.accept_timeout(slice) {
             Ok(stream) => break stream,
             Err(SandboxError::Transport(_)) => {
@@ -468,9 +464,9 @@ fn boot_attempt(
 
     if let Err(err) = perform_handshake(session.stream.as_mut().expect("stream is set")) {
         let exited_early = session
-            .child
+            .process
             .as_mut()
-            .and_then(|c| c.try_wait().ok().flatten())
+            .and_then(|p| p.try_wait().ok().flatten())
             .is_some();
         session.kill_child_now();
         let diag = read_attempt_diagnostics(&serial_log_path, &stderr_log_path);
@@ -589,42 +585,18 @@ fn protocol_err(context: &str, err: ProtocolError) -> SandboxError {
     SandboxError::Transport(format!("{context}: {err}"))
 }
 
-fn wait_or_kill_child(child: &mut Child, graceful_wait: Option<Duration>) -> Result<(), SandboxError> {
+fn wait_or_kill_process(
+    process: &mut ConfinedProcess,
+    graceful_wait: Option<Duration>,
+) -> Result<(), SandboxError> {
     if let Some(wait_dur) = graceful_wait {
-        let deadline = Instant::now() + wait_dur;
-        // shortcut: polls child.try_wait() every 25ms up to 5s for QEMU clean poweroff; Phase 3 integrates async process waiter
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(CHILD_EXIT_POLL_INTERVAL);
-                }
-                Err(err) => {
-                    return Err(SandboxError::Internal(format!(
-                        "failed waiting for QEMU child exit: {err}"
-                    )));
-                }
-            }
+        if process.wait_timeout(wait_dur)?.is_some() {
+            return Ok(());
         }
-    } else if matches!(child.try_wait(), Ok(Some(_))) {
+    } else if process.try_wait()?.is_some() {
         return Ok(());
     }
-
-    match child.kill() {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => {}
-        Err(err) => {
-            return Err(SandboxError::Internal(format!(
-                "failed to kill QEMU child process: {err}"
-            )));
-        }
-    }
-    child.wait().map(|_| ()).map_err(|err| {
-        SandboxError::Internal(format!("failed to reap QEMU child process: {err}"))
-    })
+    process.kill_and_wait()
 }
 
 fn remove_dir_all_with_retry(dir: &Path) -> Result<(), SandboxError> {

@@ -284,6 +284,7 @@ dependencies = [
 name = "sandbox-vmm"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sandbox-core",
  "sandbox-image",
  "sandbox-protocol",
