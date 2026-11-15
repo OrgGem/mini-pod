@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 sandbox-core = { workspace = true }
 sandbox-protocol = { workspace = true }
-sandbox-runtime = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

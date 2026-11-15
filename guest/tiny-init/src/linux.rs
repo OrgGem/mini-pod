@@ -39,6 +39,11 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 pub(crate) fn run() -> ExitCode {
     // SAFETY: `getpid` is always safe to call and requires no pointers or shared state.
     let is_pid1 = unsafe { libc::getpid() } == 1;
+    if is_pid1 {
+        if let Err(err) = set_process_name(b"tiny-init\0") {
+            eprintln!("[tiny-init] warning: prctl(PR_SET_NAME) failed: {err}");
+        }
+    }
 
     let code = match run_init() {
         Ok(status) => status,
@@ -498,6 +503,31 @@ fn to_cstring(value: &str) -> io::Result<CString> {
     })
 }
 
+fn set_process_name(name_with_nul: &[u8]) -> io::Result<()> {
+    if name_with_nul.last() != Some(&0) || name_with_nul.len() > 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process name must be NUL-terminated and at most 16 bytes",
+        ));
+    }
+
+    // SAFETY: `name_with_nul` is verified to end with NUL and fit within Linux's 16-byte `TASK_COMM_LEN`.
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_NAME,
+            name_with_nul.as_ptr() as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,7 +537,7 @@ mod tests {
         // SAFETY: Zero-initialized `timespec` handles optional time64 padding fields across musl/glibc.
         unsafe {
             let mut req: libc::timespec = std::mem::zeroed();
-            req.tv_sec = (ms / 1000) as libc::time_t;
+            req.tv_sec = (ms / 1000) as _;
             req.tv_nsec = ((ms % 1000) as libc::c_long) * 1_000_000;
             let mut rem: libc::timespec = std::mem::zeroed();
             while libc::nanosleep(&req, &mut rem) == -1 {
@@ -582,25 +612,29 @@ mod tests {
             unsafe { libc::_exit(0) };
         }
 
+        assert_forked_child_exits_zero(subreaper_pid, "subreaper test");
+    }
+
+    fn assert_forked_child_exits_zero(pid: libc::pid_t, label: &str) {
         let mut status: libc::c_int = 0;
         loop {
-            // SAFETY: Reaps the dedicated test subprocess created above.
-            let waited = unsafe { libc::waitpid(subreaper_pid, &mut status, 0) };
+            // SAFETY: Reaps the dedicated test subprocess created by the caller.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
             if waited == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            assert_eq!(waited, subreaper_pid, "waitpid on subreaper child failed");
+            assert_eq!(waited, pid, "waitpid on {label} child failed");
             break;
         }
 
         assert!(
             libc::WIFEXITED(status),
-            "subreaper test subprocess did not exit cleanly (raw status={status})"
+            "{label} subprocess did not exit cleanly (raw status={status})"
         );
         assert_eq!(
             libc::WEXITSTATUS(status),
             0,
-            "subreaper test failed with step code {}",
+            "{label} failed with step code {}",
             libc::WEXITSTATUS(status)
         );
     }
@@ -642,5 +676,39 @@ mod tests {
         assert!(!root.join("escape").exists());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_process_name_updates_proc_comm_and_validates_input() {
+        assert!(set_process_name(b"tiny-init").is_err());
+        assert!(set_process_name(b"0123456789abcdef\0").is_err());
+
+        // Isolate `PR_SET_NAME` in a forked child so the test runner thread name stays untouched.
+        // SAFETY: Child uses only `prctl`, `open`, `read`, `close`, and `_exit`.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for set_process_name test failed");
+        if pid == 0 {
+            if set_process_name(b"tiny-init\0").is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            let fd = unsafe {
+                libc::open(
+                    b"/proc/self/comm\0".as_ptr().cast::<libc::c_char>(),
+                    libc::O_RDONLY,
+                )
+            };
+            if fd < 0 {
+                unsafe { libc::_exit(3) };
+            }
+            let mut buf = [0u8; 32];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            unsafe { libc::close(fd) };
+            if n > 0 && &buf[..n as usize] == b"tiny-init\n" {
+                unsafe { libc::_exit(0) };
+            }
+            unsafe { libc::_exit(4) };
+        }
+
+        assert_forked_child_exits_zero(pid, "set_process_name test");
     }
 }

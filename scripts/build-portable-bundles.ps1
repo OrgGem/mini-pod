@@ -160,7 +160,7 @@ done
 $AssembleBundleScript = @'
 set -eu
 umask 022
-apk add --no-cache linux-virt busybox-static kmod cpio gzip file e2fsprogs qemu-img >/dev/null
+apk add --no-cache linux-virt busybox-static kmod cpio gzip file e2fsprogs e2fsprogs-extra qemu-img >/dev/null
 
 LINUX_VIRT_PKG=$(apk list -I linux-virt | awk 'NR==1 {print $1}')
 BUSYBOX_STATIC_PKG=$(apk list -I busybox-static | awk 'NR==1 {print $1}')
@@ -331,6 +331,27 @@ mkfs.ext4 -q -F -b 4096 -L minipod-root \
     -U "$EXT4_UUID" \
     -E "root_owner=0:0,hash_seed=${EXT4_HASH_SEED},lazy_itable_init=0,lazy_journal_init=0" \
     -d "$DISKTREE" /tmp/base.raw 64M
+
+# `mke2fs -d` honors `E2FSPROGS_FAKE_TIME` for root/atime/mtime/crtime, but copies host `st_ctime`
+# for tree-populated inodes. Normalize every inode `ctime` deterministically with `debugfs`.
+{
+    printf 'sif <2> ctime %s\nsif <2> ctime_extra 0\n' "$SOURCE_DATE_EPOCH"
+    printf 'sif <11> ctime %s\nsif <11> ctime_extra 0\n' "$SOURCE_DATE_EPOCH"
+    (
+        cd "$DISKTREE"
+        find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r rel; do
+            fs_path="/${rel#./}"
+            printf 'sif "%s" ctime %s\nsif "%s" ctime_extra 0\n' "$fs_path" "$SOURCE_DATE_EPOCH" "$fs_path"
+        done
+    )
+} > /tmp/debugfs-cmds
+debugfs -w -f /tmp/debugfs-cmds /tmp/base.raw >/tmp/debugfs.out 2>&1
+if grep -v '^debugfs: sif ' /tmp/debugfs.out | grep -qiE 'error|usage|not found|invalid|cannot'; then
+    cat /tmp/debugfs.out >&2
+    exit 1
+fi
+rm -f /tmp/debugfs-cmds /tmp/debugfs.out
+e2fsck -fn /tmp/base.raw >/dev/null
 
 qemu-img convert -f raw -O qcow2 -o compat=1.1,cluster_size=65536,lazy_refcounts=off \
     /tmp/base.raw /out/rootfs/base.qcow2
