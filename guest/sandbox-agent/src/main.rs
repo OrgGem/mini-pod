@@ -4,6 +4,7 @@
 //! Full Execution Supervisor (incremental streaming, process-group / sub-cgroup kill on deadline
 //! or stdout/stderr budget overflow) and Podman Unix socket relay are added in Phases 3–4.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode};
@@ -11,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sandbox_protocol::{
-    read_frame, write_frame, Frame, Message, ProtocolError, StreamChannel, StreamId,
-    MAX_FRAME_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    read_frame, write_frame, ExecTargetWire, Frame, Message, ProtocolError, StreamChannel,
+    StreamId, MAX_FRAME_PAYLOAD_BYTES, PROTOCOL_VERSION,
 };
 
 const VIRTIO_PORT_CANDIDATES: [&str; 2] =
@@ -77,8 +78,23 @@ pub fn serve_session<R: Read, W: Write>(
             Message::Ping { seq } => {
                 send_message(writer, stream_id, &Message::Pong { seq })?;
             }
-            Message::ExecStart { argv } => {
-                handle_exec(writer, stream_id, &argv)?;
+            Message::ExecStart {
+                target,
+                argv,
+                env,
+                cwd,
+                user,
+                ..
+            } => {
+                handle_exec(
+                    writer,
+                    stream_id,
+                    &target,
+                    &argv,
+                    &env,
+                    cwd.as_deref(),
+                    user.as_deref(),
+                )?;
             }
             Message::Shutdown => {
                 send_message(writer, StreamId(0), &Message::Shutdown)?;
@@ -97,8 +113,22 @@ pub fn serve_session<R: Read, W: Write>(
 fn handle_exec<W: Write>(
     writer: &mut W,
     stream_id: StreamId,
+    target: &ExecTargetWire,
     argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+    user: Option<&str>,
 ) -> Result<(), ProtocolError> {
+    if !matches!(target, ExecTargetWire::Guest) {
+        return Err(ProtocolError::InvalidPayload(
+            "Container exec target is not supported in Phase 1 spike session".to_owned(),
+        ));
+    }
+    if user.is_some() {
+        return Err(ProtocolError::InvalidPayload(
+            "ExecStart user switching is not supported in Phase 1 spike session".to_owned(),
+        ));
+    }
     let Some((program, args)) = argv.split_first() else {
         return Err(ProtocolError::InvalidPayload(
             "ExecStart argv must not be empty".to_owned(),
@@ -106,11 +136,13 @@ fn handle_exec<W: Write>(
     };
 
     // shortcut: buffers stdout/stderr in memory via Command::output for Phase 1 spike, Phase 3 supervisor streams incremental pipe chunks and kills process group on deadline
-    let (stdout, stderr, exit_code) = match Command::new(program).args(args).output() {
-        Ok(output) => {
-            let code = output.status.code().unwrap_or(-1);
-            (output.stdout, output.stderr, code)
-        }
+    let mut cmd = Command::new(program);
+    cmd.args(args).envs(env);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let (stdout, stderr, exit_code) = match cmd.output() {
+        Ok(output) => (output.stdout, output.stderr, output.status.code()),
         Err(err) => {
             let code = if err.kind() == io::ErrorKind::PermissionDenied {
                 126
@@ -118,13 +150,22 @@ fn handle_exec<W: Write>(
                 127
             };
             let msg = format!("failed to execute '{program}': {err}\n");
-            (Vec::new(), msg.into_bytes(), code)
+            (Vec::new(), msg.into_bytes(), Some(code))
         }
     };
 
     send_stream_bytes(writer, stream_id, StreamChannel::Stdout, &stdout)?;
     send_stream_bytes(writer, stream_id, StreamChannel::Stderr, &stderr)?;
-    send_message(writer, stream_id, &Message::ExecExit { code: exit_code })?;
+    send_message(
+        writer,
+        stream_id,
+        &Message::ExecExit {
+            code: exit_code,
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        },
+    )?;
     Ok(())
 }
 
@@ -306,6 +347,19 @@ mod tests {
         wire
     }
 
+    fn guest_exec_start(argv: Vec<String>) -> Message {
+        Message::ExecStart {
+            target: ExecTargetWire::Guest,
+            argv,
+            env: BTreeMap::new(),
+            cwd: None,
+            user: None,
+            deadline_ms: 15_000,
+            stdout_budget_bytes: 1_048_576,
+            stderr_budget_bytes: 1_048_576,
+        }
+    }
+
     #[test]
     fn interactive_session_handles_handshake_ping_exec_and_shutdown() {
         let ((mut host_rx, mut host_tx), (mut agent_rx, mut agent_tx)) = duplex_pair();
@@ -343,20 +397,13 @@ mod tests {
         #[cfg(unix)]
         let script = "printf 'hello-out\\n'; printf 'hello-err\\n' >&2; exit 7";
 
-        send_message(
-            &mut host_tx,
-            StreamId(11),
-            &Message::ExecStart {
-                argv: shell_cmd(script),
-            },
-        )
-        .unwrap();
+        send_message(&mut host_tx, StreamId(11), &guest_exec_start(shell_cmd(script))).unwrap();
 
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let mut stdout_eof = false;
         let mut stderr_eof = false;
-        let exit_code = loop {
+        let exit_msg = loop {
             let frame = read_frame(&mut host_rx).expect("exec response frame");
             assert_eq!(frame.header.stream_id, StreamId(11));
             match frame.decode_message().unwrap() {
@@ -380,12 +427,20 @@ mod tests {
                         stderr_eof = true;
                     }
                 }
-                Message::ExecExit { code } => break code,
+                msg @ Message::ExecExit { .. } => break msg,
                 other => panic!("unexpected frame during exec: {other:?}"),
             }
         };
         assert!(stdout_eof && stderr_eof);
-        assert_eq!(exit_code, 7);
+        assert_eq!(
+            exit_msg,
+            Message::ExecExit {
+                code: Some(7),
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+        );
         assert!(
             String::from_utf8_lossy(&stdout_bytes).contains("hello-out"),
             "stdout was {:?}",
@@ -401,9 +456,7 @@ mod tests {
         send_message(
             &mut host_tx,
             StreamId(12),
-            &Message::ExecStart {
-                argv: vec!["minipod_nonexistent_binary_99999".to_owned()],
-            },
+            &guest_exec_start(vec!["minipod_nonexistent_binary_99999".to_owned()]),
         )
         .unwrap();
 
@@ -435,7 +488,12 @@ mod tests {
         assert_eq!(f_exit.header.stream_id, StreamId(12));
         assert_eq!(
             f_exit.decode_message().unwrap(),
-            Message::ExecExit { code: 127 }
+            Message::ExecExit {
+                code: Some(127),
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
         );
 
         // 5. Shutdown acks on StreamId(0) and exits loop cleanly.
@@ -528,5 +586,34 @@ mod tests {
         );
 
         assert_eq!(read_frame(&mut cursor), Err(ProtocolError::Eof));
+    }
+
+    #[test]
+    fn spike_handle_exec_rejects_unsupported_container_and_user_switch() {
+        let mut wire = Vec::new();
+        let err_container = handle_exec(
+            &mut wire,
+            StreamId(1),
+            &ExecTargetWire::Container {
+                id_or_name: "c1".to_owned(),
+            },
+            &["/bin/true".to_owned()],
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert!(matches!(err_container, Err(ProtocolError::InvalidPayload(_))));
+
+        let err_user = handle_exec(
+            &mut wire,
+            StreamId(1),
+            &ExecTargetWire::Guest,
+            &["/bin/true".to_owned()],
+            &BTreeMap::new(),
+            None,
+            Some("nobody"),
+        );
+        assert!(matches!(err_user, Err(ProtocolError::InvalidPayload(_))));
+        assert!(wire.is_empty());
     }
 }

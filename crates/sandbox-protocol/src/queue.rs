@@ -5,6 +5,12 @@ use std::collections::VecDeque;
 use crate::{Frame, Lane};
 
 /// Two-lane FIFO frame queue that always drains `Lane::Control` ahead of `Lane::Data`.
+///
+/// Urgent control frames (`ExecCancel`, `ExecExit`, `CopyInStart`, `CopyOutStart`, `CopyError`,
+/// `StreamCredit`, `Ping`, `Pong`, `Shutdown`) preempt bulk `Lane::Data` traffic, while
+/// `CopyDone` shares `Lane::Data` with `StreamData` so copy-out completion never overtakes
+/// queued tar chunks. Senders must only enqueue `ExecExit` after all `StreamData` chunks for
+/// that `StreamId` have drained.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PriorityFrameQueue {
     control: VecDeque<Frame>,
@@ -103,5 +109,103 @@ mod tests {
         assert_eq!(queue.pop(), Some(d2));
         assert!(queue.is_empty());
         assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn copy_done_preserves_fifo_after_stream_data_while_control_frames_preempt() {
+        let mut queue = PriorityFrameQueue::new();
+
+        let copy_start = Frame::from_message(
+            StreamId(2),
+            &Message::CopyOutStart {
+                src_guest: "/workspace/out".to_owned(),
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let chunk1 = Frame::from_message(
+            StreamId(2),
+            &Message::StreamData {
+                channel: StreamChannel::Stdout,
+                eof: false,
+                data: b"tar-part-1".to_vec(),
+            },
+        )
+        .unwrap();
+        let chunk2 = Frame::from_message(
+            StreamId(2),
+            &Message::StreamData {
+                channel: StreamChannel::Stdout,
+                eof: true,
+                data: b"tar-part-2".to_vec(),
+            },
+        )
+        .unwrap();
+        let copy_done = Frame::from_message(
+            StreamId(2),
+            &Message::CopyDone {
+                bytes_transferred: 20,
+            },
+        )
+        .unwrap();
+        let credit = Frame::from_message(
+            StreamId(2),
+            &Message::StreamCredit {
+                channel: StreamChannel::Stdout,
+                bytes: 4096,
+            },
+        )
+        .unwrap();
+        let copy_err = Frame::from_message(
+            StreamId(3),
+            &Message::CopyError {
+                message: "permission denied".to_owned(),
+            },
+        )
+        .unwrap();
+        let copy_in = Frame::from_message(
+            StreamId(4),
+            &Message::CopyInStart {
+                dst_guest: "/workspace/in".to_owned(),
+                max_bytes: 8192,
+            },
+        )
+        .unwrap();
+        let exec_exit = Frame::from_message(
+            StreamId(5),
+            &Message::ExecExit {
+                code: Some(0),
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+        )
+        .unwrap();
+
+        // Simulate concurrent enqueue: data chunks + CopyDone first, then urgent control frames.
+        queue.push(copy_start.clone());
+        queue.push(chunk1.clone());
+        queue.push(chunk2.clone());
+        queue.push(copy_done.clone());
+        queue.push(credit.clone());
+        queue.push(copy_err.clone());
+        queue.push(copy_in.clone());
+        queue.push(exec_exit.clone());
+
+        assert_eq!(queue.control_len(), 5);
+        assert_eq!(queue.data_len(), 3);
+
+        // All control frames drain strictly FIFO ahead of Data lane.
+        assert_eq!(queue.pop(), Some(copy_start));
+        assert_eq!(queue.pop(), Some(credit));
+        assert_eq!(queue.pop(), Some(copy_err));
+        assert_eq!(queue.pop(), Some(copy_in));
+        assert_eq!(queue.pop(), Some(exec_exit));
+
+        // CopyDone stays strictly ordered behind both StreamData chunks on the Data lane.
+        assert_eq!(queue.pop(), Some(chunk1));
+        assert_eq!(queue.pop(), Some(chunk2));
+        assert_eq!(queue.pop(), Some(copy_done));
+        assert!(queue.is_empty());
     }
 }

@@ -1,5 +1,6 @@
 //! End-to-end Phase 1 QEMU `virtio-serial` boot, protocol handshake, exec, and teardown session.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -8,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use sandbox_core::{AccelerationPolicy, GuestArch, NetworkPolicy, SandboxError};
 use sandbox_protocol::{
-    read_frame, write_frame, Frame, Message, ProtocolError, StreamChannel, StreamId,
-    PROTOCOL_VERSION,
+    read_frame, write_frame, ExecTargetWire, Frame, Message, ProtocolError, StreamChannel,
+    StreamId, PROTOCOL_VERSION,
 };
 
 use crate::accel::{
@@ -89,6 +90,7 @@ pub struct SpikeSession {
     endpoint: Option<AgentIpcEndpoint>,
     runtime_dir: PathBuf,
     accelerator_used: Accelerator,
+    exec_timeout: Duration,
     next_stream_id: u32,
     cleaned: bool,
 }
@@ -207,8 +209,22 @@ impl SpikeSession {
             .checked_add(1)
             .ok_or_else(|| SandboxError::Internal("spike session stream IDs exhausted".to_owned()))?;
 
+        let deadline_ms = u64::try_from(self.exec_timeout.as_millis()).unwrap_or(u64::MAX);
         let stream = self.active_stream_mut()?;
-        send_protocol_message(stream, stream_id, &Message::ExecStart { argv })?;
+        send_protocol_message(
+            stream,
+            stream_id,
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv,
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms,
+                stdout_budget_bytes: 64 * 1024 * 1024,
+                stderr_budget_bytes: 64 * 1024 * 1024,
+            },
+        )?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -243,9 +259,24 @@ impl SpikeSession {
                         "unexpected Stdin StreamData frame from guest".to_owned(),
                     ));
                 }
-                Message::ExecExit { code } => {
+                Message::ExecExit {
+                    code,
+                    timed_out,
+                    stdout_truncated,
+                    stderr_truncated,
+                } => {
+                    if timed_out {
+                        return Err(SandboxError::BudgetExceeded(
+                            "guest execution timed out".to_owned(),
+                        ));
+                    }
+                    if stdout_truncated || stderr_truncated {
+                        return Err(SandboxError::BudgetExceeded(format!(
+                            "guest execution output truncated (stdout={stdout_truncated}, stderr={stderr_truncated})"
+                        )));
+                    }
                     return Ok(SpikeExecOutput {
-                        exit_code: code,
+                        exit_code: code.unwrap_or(-1),
                         stdout,
                         stderr,
                     });
@@ -346,6 +377,7 @@ fn boot_attempt(
         endpoint: Some(endpoint),
         runtime_dir: runtime_dir.clone(),
         accelerator_used: accel,
+        exec_timeout: config.exec_timeout,
         next_stream_id: 1,
         cleaned: false,
     };

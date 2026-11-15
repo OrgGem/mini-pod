@@ -5,7 +5,7 @@
 pub mod message;
 pub mod queue;
 
-pub use message::{Message, StreamChannel};
+pub use message::{ExecTargetWire, Message, StreamChannel};
 pub use queue::PriorityFrameQueue;
 
 use std::{fmt, io};
@@ -56,6 +56,36 @@ pub enum FrameKind {
     Ping = 8,
     Pong = 9,
     Shutdown = 10,
+    CopyInStart = 11,
+    CopyOutStart = 12,
+    CopyDone = 13,
+    CopyError = 14,
+}
+
+impl FrameKind {
+    /// Returns the priority lane (`Control` vs `Data`) assigned to this frame kind.
+    ///
+    /// [`FrameKind::CopyDone`] shares [`Lane::Data`] with [`FrameKind::StreamData`] so that
+    /// copy-out completions preserve strict FIFO ordering behind the tar chunks they terminate
+    /// inside [`PriorityFrameQueue`], while [`FrameKind::CopyError`], [`FrameKind::StreamCredit`],
+    /// and cancel/liveness frames stay on [`Lane::Control`].
+    pub const fn lane(self) -> Lane {
+        match self {
+            Self::StreamData | Self::CopyDone => Lane::Data,
+            Self::Hello
+            | Self::HelloAck
+            | Self::ExecStart
+            | Self::StreamCredit
+            | Self::ExecCancel
+            | Self::ExecExit
+            | Self::Ping
+            | Self::Pong
+            | Self::Shutdown
+            | Self::CopyInStart
+            | Self::CopyOutStart
+            | Self::CopyError => Lane::Control,
+        }
+    }
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -73,6 +103,10 @@ impl TryFrom<u8> for FrameKind {
             8 => Ok(Self::Ping),
             9 => Ok(Self::Pong),
             10 => Ok(Self::Shutdown),
+            11 => Ok(Self::CopyInStart),
+            12 => Ok(Self::CopyOutStart),
+            13 => Ok(Self::CopyDone),
+            14 => Ok(Self::CopyError),
             other => Err(ProtocolError::InvalidFrameKind(other)),
         }
     }
@@ -310,6 +344,7 @@ pub(crate) fn check_payload_len(len: usize) -> Result<u32, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
 
     #[test]
@@ -372,13 +407,54 @@ mod tests {
     }
 
     #[test]
+    fn frame_kind_discriminants_and_lanes_roundtrip() {
+        let expected = [
+            (1u8, FrameKind::Hello, Lane::Control),
+            (2, FrameKind::HelloAck, Lane::Control),
+            (3, FrameKind::ExecStart, Lane::Control),
+            (4, FrameKind::StreamData, Lane::Data),
+            (5, FrameKind::StreamCredit, Lane::Control),
+            (6, FrameKind::ExecCancel, Lane::Control),
+            (7, FrameKind::ExecExit, Lane::Control),
+            (8, FrameKind::Ping, Lane::Control),
+            (9, FrameKind::Pong, Lane::Control),
+            (10, FrameKind::Shutdown, Lane::Control),
+            (11, FrameKind::CopyInStart, Lane::Control),
+            (12, FrameKind::CopyOutStart, Lane::Control),
+            (13, FrameKind::CopyDone, Lane::Data),
+            (14, FrameKind::CopyError, Lane::Control),
+        ];
+
+        for (discriminant, kind, lane) in expected {
+            assert_eq!(kind as u8, discriminant);
+            assert_eq!(FrameKind::try_from(discriminant), Ok(kind));
+            assert_eq!(kind.lane(), lane);
+        }
+        assert_eq!(FrameKind::try_from(0), Err(ProtocolError::InvalidFrameKind(0)));
+        assert_eq!(
+            FrameKind::try_from(15),
+            Err(ProtocolError::InvalidFrameKind(15))
+        );
+    }
+
+    #[test]
     fn write_and_read_frame_stream_with_clean_eof() {
+        let mut env = BTreeMap::new();
+        env.insert("LANG".to_owned(), "C".to_owned());
+
         let frames = vec![
             Frame::from_message(StreamId(0), &Message::Hello { version: PROTOCOL_VERSION }).unwrap(),
             Frame::from_message(
                 StreamId(7),
                 &Message::ExecStart {
+                    target: ExecTargetWire::Guest,
                     argv: vec!["/bin/echo".to_owned(), "ok".to_owned()],
+                    env,
+                    cwd: Some("/workspace".to_owned()),
+                    user: None,
+                    deadline_ms: 5_000,
+                    stdout_budget_bytes: 1_048_576,
+                    stderr_budget_bytes: 262_144,
                 },
             )
             .unwrap(),
@@ -391,7 +467,31 @@ mod tests {
                 },
             )
             .unwrap(),
-            Frame::from_message(StreamId(7), &Message::ExecExit { code: 0 }).unwrap(),
+            Frame::from_message(
+                StreamId(7),
+                &Message::ExecExit {
+                    code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            )
+            .unwrap(),
+            Frame::from_message(
+                StreamId(8),
+                &Message::CopyInStart {
+                    dst_guest: "/workspace/app".to_owned(),
+                    max_bytes: 4096,
+                },
+            )
+            .unwrap(),
+            Frame::from_message(
+                StreamId(8),
+                &Message::CopyDone {
+                    bytes_transferred: 512,
+                },
+            )
+            .unwrap(),
         ];
 
         let mut wire = Vec::new();

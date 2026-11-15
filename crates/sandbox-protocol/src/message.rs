@@ -1,6 +1,15 @@
 //! Typed protocol messages and strict binary payload codecs.
 
+use std::collections::BTreeMap;
+
 use crate::{check_payload_len, FrameKind, Lane, ProtocolError, MAX_FRAME_PAYLOAD_BYTES};
+
+/// Execution target inside a sandboxed guest (`Guest` OS vs a named/ID'd `Container`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecTargetWire {
+    Guest,
+    Container { id_or_name: String },
+}
 
 /// Guest I/O stream multiplexed over `Message::StreamData` and `Message::StreamCredit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,9 +42,18 @@ pub enum Message {
     Hello { version: u8 },
     /// Confirms negotiated version and bitmask of enabled agent features.
     HelloAck { version: u8, features: u32 },
-    /// Starts an execution process inside the sandbox with non-empty `argv`.
-    ExecStart { argv: Vec<String> },
-    /// Carries raw bytes or EOF for stdin/stdout/stderr on a `StreamId`.
+    /// Starts an execution process inside the guest OS or guest container with non-empty `argv`.
+    ExecStart {
+        target: ExecTargetWire,
+        argv: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<String>,
+        user: Option<String>,
+        deadline_ms: u64,
+        stdout_budget_bytes: u64,
+        stderr_budget_bytes: u64,
+    },
+    /// Carries raw bytes or EOF for stdin/stdout/stderr (or tar copy chunks) on a `StreamId`.
     StreamData {
         channel: StreamChannel,
         eof: bool,
@@ -45,31 +63,61 @@ pub enum Message {
     StreamCredit { channel: StreamChannel, bytes: u32 },
     /// Requests immediate cancellation of an in-flight execution.
     ExecCancel,
-    /// Reports final process exit status after stream termination.
-    ExecExit { code: i32 },
+    /// Reports final process exit status and budget truncation flags after stream termination.
+    ///
+    /// Classified on [`Lane::Control`]: senders must only enqueue/transmit `ExecExit` after all
+    /// `StreamData` chunks (including `eof: true` on stdout/stderr) for that `StreamId` have
+    /// drained from outbound queues.
+    ExecExit {
+        code: Option<i32>,
+        timed_out: bool,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    },
     /// Liveness probe carrying caller sequence number.
     Ping { seq: u64 },
     /// Liveness response echoing the `Ping` sequence number.
     Pong { seq: u64 },
     /// Requests graceful guest agent shutdown.
     Shutdown,
+    /// Initiates a host-to-guest tar copy-in transfer to `dst_guest` bounded by `max_bytes`.
+    ///
+    /// Raw tar archive chunks travel on the same `StreamId` as `StreamData` frames on
+    /// [`StreamChannel::Stdin`] terminated by `eof: true` (flow-controlled via [`Message::StreamCredit`]).
+    /// Once all chunks up to `eof: true` are processed, the guest responds on the same `StreamId`
+    /// with [`Message::CopyDone`] or [`Message::CopyError`].
+    CopyInStart {
+        dst_guest: String,
+        max_bytes: u64,
+    },
+    /// Initiates a guest-to-host tar copy-out transfer from `src_guest` bounded by `max_bytes`.
+    ///
+    /// Guest streams raw tar archive chunks on the same `StreamId` via `StreamData` on
+    /// [`StreamChannel::Stdout`] terminated by `eof: true`, followed by [`Message::CopyDone`]
+    /// (on [`Lane::Data`] so it never overtakes tar chunks in [`crate::PriorityFrameQueue`]) or
+    /// [`Message::CopyError`] (on [`Lane::Control`]).
+    CopyOutStart {
+        src_guest: String,
+        max_bytes: u64,
+    },
+    /// Confirms completion of a tar copy transfer after all `StreamData` chunks have been emitted.
+    ///
+    /// Classified on [`Lane::Data`] so [`crate::PriorityFrameQueue`] preserves strict FIFO order
+    /// after `StreamData` tar chunks during `CopyOut`, while [`Message::CopyError`] and
+    /// [`Message::StreamCredit`] keep urgent [`Lane::Control`] priority.
+    CopyDone {
+        bytes_transferred: u64,
+    },
+    /// Reports failure of an in-flight tar copy-in or copy-out transfer on [`Lane::Control`].
+    CopyError {
+        message: String,
+    },
 }
 
 impl Message {
     /// Returns the priority lane required for this message (`Control` vs `Data`).
     pub fn lane(&self) -> Lane {
-        match self {
-            Self::StreamData { .. } => Lane::Data,
-            Self::Hello { .. }
-            | Self::HelloAck { .. }
-            | Self::ExecStart { .. }
-            | Self::StreamCredit { .. }
-            | Self::ExecCancel
-            | Self::ExecExit { .. }
-            | Self::Ping { .. }
-            | Self::Pong { .. }
-            | Self::Shutdown => Lane::Control,
-        }
+        self.kind().lane()
     }
 
     /// Returns the wire `FrameKind` discriminant corresponding to this message variant.
@@ -85,6 +133,10 @@ impl Message {
             Self::Ping { .. } => FrameKind::Ping,
             Self::Pong { .. } => FrameKind::Pong,
             Self::Shutdown => FrameKind::Shutdown,
+            Self::CopyInStart { .. } => FrameKind::CopyInStart,
+            Self::CopyOutStart { .. } => FrameKind::CopyOutStart,
+            Self::CopyDone { .. } => FrameKind::CopyDone,
+            Self::CopyError { .. } => FrameKind::CopyError,
         }
     }
 
@@ -93,12 +145,30 @@ impl Message {
         match self {
             Self::Hello { version } => Ok(vec![*version]),
             Self::HelloAck { version, features } => {
-                let mut buf = Vec::with_capacity(5);
-                buf.push(*version);
-                buf.extend_from_slice(&features.to_be_bytes());
-                Ok(buf)
+                let mut writer = PayloadWriter::with_capacity(5)?;
+                writer.write_u8(*version)?;
+                writer.write_u32(*features)?;
+                Ok(writer.finish())
             }
-            Self::ExecStart { argv } => encode_exec_start(argv),
+            Self::ExecStart {
+                target,
+                argv,
+                env,
+                cwd,
+                user,
+                deadline_ms,
+                stdout_budget_bytes,
+                stderr_budget_bytes,
+            } => encode_exec_start(
+                target,
+                argv,
+                env,
+                cwd.as_deref(),
+                user.as_deref(),
+                *deadline_ms,
+                *stdout_budget_bytes,
+                *stderr_budget_bytes,
+            ),
             Self::StreamData { channel, eof, data } => {
                 let total = 2usize
                     .checked_add(data.len())
@@ -106,22 +176,57 @@ impl Message {
                         len: u32::MAX,
                         max: MAX_FRAME_PAYLOAD_BYTES,
                     })?;
-                check_payload_len(total)?;
-                let mut buf = Vec::with_capacity(total);
-                buf.push(*channel as u8);
-                buf.push(u8::from(*eof));
-                buf.extend_from_slice(data);
-                Ok(buf)
+                let mut writer = PayloadWriter::with_capacity(total)?;
+                writer.write_u8(*channel as u8)?;
+                writer.write_bool(*eof)?;
+                writer.write_bytes(data)?;
+                Ok(writer.finish())
             }
             Self::StreamCredit { channel, bytes } => {
-                let mut buf = Vec::with_capacity(5);
-                buf.push(*channel as u8);
-                buf.extend_from_slice(&bytes.to_be_bytes());
-                Ok(buf)
+                let mut writer = PayloadWriter::with_capacity(5)?;
+                writer.write_u8(*channel as u8)?;
+                writer.write_u32(*bytes)?;
+                Ok(writer.finish())
             }
             Self::ExecCancel | Self::Shutdown => Ok(Vec::new()),
-            Self::ExecExit { code } => Ok(code.to_be_bytes().to_vec()),
+            Self::ExecExit {
+                code,
+                timed_out,
+                stdout_truncated,
+                stderr_truncated,
+            } => {
+                let mut writer = PayloadWriter::with_capacity(if code.is_some() { 8 } else { 4 })?;
+                writer.write_opt_i32(*code)?;
+                writer.write_bool(*timed_out)?;
+                writer.write_bool(*stdout_truncated)?;
+                writer.write_bool(*stderr_truncated)?;
+                Ok(writer.finish())
+            }
             Self::Ping { seq } | Self::Pong { seq } => Ok(seq.to_be_bytes().to_vec()),
+            Self::CopyInStart {
+                dst_guest,
+                max_bytes,
+            } => {
+                let mut writer = PayloadWriter::new();
+                writer.write_str(dst_guest)?;
+                writer.write_u64(*max_bytes)?;
+                Ok(writer.finish())
+            }
+            Self::CopyOutStart {
+                src_guest,
+                max_bytes,
+            } => {
+                let mut writer = PayloadWriter::new();
+                writer.write_str(src_guest)?;
+                writer.write_u64(*max_bytes)?;
+                Ok(writer.finish())
+            }
+            Self::CopyDone { bytes_transferred } => Ok(bytes_transferred.to_be_bytes().to_vec()),
+            Self::CopyError { message } => {
+                let mut writer = PayloadWriter::new();
+                writer.write_str(message)?;
+                Ok(writer.finish())
+            }
         }
     }
 
@@ -140,15 +245,7 @@ impl Message {
             FrameKind::ExecStart => decode_exec_start(&mut reader)?,
             FrameKind::StreamData => {
                 let channel = StreamChannel::try_from(reader.read_u8()?)?;
-                let eof = match reader.read_u8()? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(ProtocolError::InvalidPayload(format!(
-                            "invalid eof flag byte in StreamData: {other}"
-                        )));
-                    }
-                };
+                let eof = reader.read_bool("StreamData.eof")?;
                 let data = reader.take_rest().to_vec();
                 return Ok(Self::StreamData { channel, eof, data });
             }
@@ -158,7 +255,10 @@ impl Message {
             },
             FrameKind::ExecCancel => Self::ExecCancel,
             FrameKind::ExecExit => Self::ExecExit {
-                code: reader.read_i32()?,
+                code: reader.read_opt_i32("ExecExit.code")?,
+                timed_out: reader.read_bool("ExecExit.timed_out")?,
+                stdout_truncated: reader.read_bool("ExecExit.stdout_truncated")?,
+                stderr_truncated: reader.read_bool("ExecExit.stderr_truncated")?,
             },
             FrameKind::Ping => Self::Ping {
                 seq: reader.read_u64()?,
@@ -167,40 +267,89 @@ impl Message {
                 seq: reader.read_u64()?,
             },
             FrameKind::Shutdown => Self::Shutdown,
+            FrameKind::CopyInStart => Self::CopyInStart {
+                dst_guest: reader.read_str()?,
+                max_bytes: reader.read_u64()?,
+            },
+            FrameKind::CopyOutStart => Self::CopyOutStart {
+                src_guest: reader.read_str()?,
+                max_bytes: reader.read_u64()?,
+            },
+            FrameKind::CopyDone => Self::CopyDone {
+                bytes_transferred: reader.read_u64()?,
+            },
+            FrameKind::CopyError => Self::CopyError {
+                message: reader.read_str()?,
+            },
         };
         reader.finish(kind)?;
         Ok(msg)
     }
 }
 
-fn encode_exec_start(argv: &[String]) -> Result<Vec<u8>, ProtocolError> {
+#[allow(clippy::too_many_arguments)]
+fn encode_exec_start(
+    target: &ExecTargetWire,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+    user: Option<&str>,
+    deadline_ms: u64,
+    stdout_budget_bytes: u64,
+    stderr_budget_bytes: u64,
+) -> Result<Vec<u8>, ProtocolError> {
     if argv.is_empty() {
         return Err(ProtocolError::InvalidPayload(
             "ExecStart argv must not be empty".to_owned(),
         ));
     }
-    let mut total = 4usize;
-    for arg in argv {
-        total = total
-            .checked_add(4)
-            .and_then(|n| n.checked_add(arg.len()))
-            .ok_or(ProtocolError::PayloadTooLarge {
-                len: u32::MAX,
-                max: MAX_FRAME_PAYLOAD_BYTES,
-            })?;
-    }
-    check_payload_len(total)?;
+    let argc = u32::try_from(argv.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+        len: u32::MAX,
+        max: MAX_FRAME_PAYLOAD_BYTES,
+    })?;
+    let envc = u32::try_from(env.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+        len: u32::MAX,
+        max: MAX_FRAME_PAYLOAD_BYTES,
+    })?;
 
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&(argv.len() as u32).to_be_bytes());
-    for arg in argv {
-        buf.extend_from_slice(&(arg.len() as u32).to_be_bytes());
-        buf.extend_from_slice(arg.as_bytes());
+    let mut writer = PayloadWriter::new();
+    match target {
+        ExecTargetWire::Guest => writer.write_u8(0)?,
+        ExecTargetWire::Container { id_or_name } => {
+            writer.write_u8(1)?;
+            writer.write_str(id_or_name)?;
+        }
     }
-    Ok(buf)
+    writer.write_u32(argc)?;
+    for arg in argv {
+        writer.write_str(arg)?;
+    }
+    writer.write_u32(envc)?;
+    for (key, value) in env {
+        writer.write_str(key)?;
+        writer.write_str(value)?;
+    }
+    writer.write_opt_str(cwd)?;
+    writer.write_opt_str(user)?;
+    writer.write_u64(deadline_ms)?;
+    writer.write_u64(stdout_budget_bytes)?;
+    writer.write_u64(stderr_budget_bytes)?;
+    Ok(writer.finish())
 }
 
 fn decode_exec_start(reader: &mut PayloadReader<'_>) -> Result<Message, ProtocolError> {
+    let target = match reader.read_u8()? {
+        0 => ExecTargetWire::Guest,
+        1 => ExecTargetWire::Container {
+            id_or_name: reader.read_str()?,
+        },
+        other => {
+            return Err(ProtocolError::InvalidPayload(format!(
+                "invalid ExecTargetWire tag byte: {other}"
+            )));
+        }
+    };
+
     let argc = reader.read_u32()? as usize;
     if argc == 0 {
         return Err(ProtocolError::InvalidPayload(
@@ -216,12 +365,143 @@ fn decode_exec_start(reader: &mut PayloadReader<'_>) -> Result<Message, Protocol
     }
     let mut argv = Vec::with_capacity(argc);
     for _ in 0..argc {
-        let len = reader.read_u32()? as usize;
-        let raw = reader.read_bytes(len)?;
-        let arg = std::str::from_utf8(raw)?;
-        argv.push(arg.to_owned());
+        argv.push(reader.read_str()?);
     }
-    Ok(Message::ExecStart { argv })
+
+    let envc = reader.read_u32()? as usize;
+    // Each env pair requires at least two 4-byte length prefixes.
+    if envc > reader.remaining() / 8 {
+        return Err(ProtocolError::InvalidPayload(format!(
+            "ExecStart envc {envc} exceeds remaining payload bytes ({})",
+            reader.remaining()
+        )));
+    }
+    let mut env = BTreeMap::new();
+    for _ in 0..envc {
+        let key = reader.read_str()?;
+        let value = reader.read_str()?;
+        if env.insert(key, value).is_some() {
+            return Err(ProtocolError::InvalidPayload(
+                "ExecStart env contains duplicate key".to_owned(),
+            ));
+        }
+    }
+
+    let cwd = reader.read_opt_str("ExecStart.cwd")?;
+    let user = reader.read_opt_str("ExecStart.user")?;
+    let deadline_ms = reader.read_u64()?;
+    let stdout_budget_bytes = reader.read_u64()?;
+    let stderr_budget_bytes = reader.read_u64()?;
+
+    Ok(Message::ExecStart {
+        target,
+        argv,
+        env,
+        cwd,
+        user,
+        deadline_ms,
+        stdout_budget_bytes,
+        stderr_budget_bytes,
+    })
+}
+
+struct PayloadWriter {
+    buf: Vec<u8>,
+}
+
+impl PayloadWriter {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn with_capacity(cap: usize) -> Result<Self, ProtocolError> {
+        check_payload_len(cap)?;
+        Ok(Self {
+            buf: Vec::with_capacity(cap),
+        })
+    }
+
+    fn reserve_extra(&self, extra: usize) -> Result<(), ProtocolError> {
+        let next = self
+            .buf
+            .len()
+            .checked_add(extra)
+            .ok_or(ProtocolError::PayloadTooLarge {
+                len: u32::MAX,
+                max: MAX_FRAME_PAYLOAD_BYTES,
+            })?;
+        check_payload_len(next)?;
+        Ok(())
+    }
+
+    fn write_u8(&mut self, value: u8) -> Result<(), ProtocolError> {
+        self.reserve_extra(1)?;
+        self.buf.push(value);
+        Ok(())
+    }
+
+    fn write_bool(&mut self, value: bool) -> Result<(), ProtocolError> {
+        self.write_u8(u8::from(value))
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
+        self.reserve_extra(bytes.len())?;
+        self.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn write_u32(&mut self, value: u32) -> Result<(), ProtocolError> {
+        self.write_bytes(&value.to_be_bytes())
+    }
+
+    fn write_i32(&mut self, value: i32) -> Result<(), ProtocolError> {
+        self.write_bytes(&value.to_be_bytes())
+    }
+
+    fn write_u64(&mut self, value: u64) -> Result<(), ProtocolError> {
+        self.write_bytes(&value.to_be_bytes())
+    }
+
+    fn write_str(&mut self, s: &str) -> Result<(), ProtocolError> {
+        let len = u32::try_from(s.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+            len: u32::MAX,
+            max: MAX_FRAME_PAYLOAD_BYTES,
+        })?;
+        let extra = 4usize
+            .checked_add(s.len())
+            .ok_or(ProtocolError::PayloadTooLarge {
+                len: u32::MAX,
+                max: MAX_FRAME_PAYLOAD_BYTES,
+            })?;
+        self.reserve_extra(extra)?;
+        self.buf.extend_from_slice(&len.to_be_bytes());
+        self.buf.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    fn write_opt_str(&mut self, opt: Option<&str>) -> Result<(), ProtocolError> {
+        match opt {
+            None => self.write_u8(0),
+            Some(s) => {
+                self.write_u8(1)?;
+                self.write_str(s)
+            }
+        }
+    }
+
+    fn write_opt_i32(&mut self, opt: Option<i32>) -> Result<(), ProtocolError> {
+        match opt {
+            None => self.write_u8(0),
+            Some(v) => {
+                self.write_u8(1)?;
+                self.write_i32(v)
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 struct PayloadReader<'a> {
@@ -252,23 +532,63 @@ impl<'a> PayloadReader<'a> {
         Ok(slice)
     }
 
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], ProtocolError> {
+        let slice = self.read_bytes(N)?;
+        let mut arr = [0u8; N];
+        arr.copy_from_slice(slice);
+        Ok(arr)
+    }
+
     fn read_u8(&mut self) -> Result<u8, ProtocolError> {
         Ok(self.read_bytes(1)?[0])
     }
 
+    fn read_bool(&mut self, field: &str) -> Result<bool, ProtocolError> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(ProtocolError::InvalidPayload(format!(
+                "invalid boolean byte for {field}: {other}"
+            ))),
+        }
+    }
+
     fn read_u32(&mut self) -> Result<u32, ProtocolError> {
-        let bytes: [u8; 4] = self.read_bytes(4)?.try_into().expect("slice len is 4");
-        Ok(u32::from_be_bytes(bytes))
+        Ok(u32::from_be_bytes(self.read_array()?))
     }
 
     fn read_i32(&mut self) -> Result<i32, ProtocolError> {
-        let bytes: [u8; 4] = self.read_bytes(4)?.try_into().expect("slice len is 4");
-        Ok(i32::from_be_bytes(bytes))
+        Ok(i32::from_be_bytes(self.read_array()?))
     }
 
     fn read_u64(&mut self) -> Result<u64, ProtocolError> {
-        let bytes: [u8; 8] = self.read_bytes(8)?.try_into().expect("slice len is 8");
-        Ok(u64::from_be_bytes(bytes))
+        Ok(u64::from_be_bytes(self.read_array()?))
+    }
+
+    fn read_str(&mut self) -> Result<String, ProtocolError> {
+        let len = self.read_u32()? as usize;
+        let raw = self.read_bytes(len)?;
+        Ok(std::str::from_utf8(raw)?.to_owned())
+    }
+
+    fn read_opt_str(&mut self, field: &str) -> Result<Option<String>, ProtocolError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_str()?)),
+            other => Err(ProtocolError::InvalidPayload(format!(
+                "invalid option tag byte for {field}: {other}"
+            ))),
+        }
+    }
+
+    fn read_opt_i32(&mut self, field: &str) -> Result<Option<i32>, ProtocolError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_i32()?)),
+            other => Err(ProtocolError::InvalidPayload(format!(
+                "invalid option tag byte for {field}: {other}"
+            ))),
+        }
     }
 
     fn take_rest(&mut self) -> &'a [u8] {
@@ -293,8 +613,31 @@ mod tests {
     use super::*;
     use crate::PROTOCOL_VERSION;
 
+    fn sample_guest_exec_start() -> Message {
+        Message::ExecStart {
+            target: ExecTargetWire::Guest,
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "".to_owned(),
+                "echo xin chào".to_owned(),
+            ],
+            env: BTreeMap::new(),
+            cwd: None,
+            user: None,
+            deadline_ms: 15_000,
+            stdout_budget_bytes: 1_048_576,
+            stderr_budget_bytes: 262_144,
+        }
+    }
+
     #[test]
     fn all_message_variants_roundtrip() {
+        let mut populated_env = BTreeMap::new();
+        populated_env.insert("Z_VAR".to_owned(), "last".to_owned());
+        populated_env.insert("A_VAR".to_owned(), "first".to_owned());
+        populated_env.insert("EMPTY".to_owned(), String::new());
+
         let samples = vec![
             (Message::Hello { version: PROTOCOL_VERSION }, Lane::Control),
             (
@@ -304,14 +647,19 @@ mod tests {
                 },
                 Lane::Control,
             ),
+            (sample_guest_exec_start(), Lane::Control),
             (
                 Message::ExecStart {
-                    argv: vec![
-                        "/bin/sh".to_owned(),
-                        "-c".to_owned(),
-                        "".to_owned(),
-                        "echo xin chào".to_owned(),
-                    ],
+                    target: ExecTargetWire::Container {
+                        id_or_name: "pg-test-123".to_owned(),
+                    },
+                    argv: vec!["psql".to_owned(), "-U".to_owned(), "app".to_owned()],
+                    env: populated_env,
+                    cwd: Some("/workspace/db".to_owned()),
+                    user: Some("1000:1000".to_owned()),
+                    deadline_ms: u64::MAX,
+                    stdout_budget_bytes: 0,
+                    stderr_budget_bytes: u64::MAX,
                 },
                 Lane::Control,
             ),
@@ -347,10 +695,62 @@ mod tests {
                 Lane::Control,
             ),
             (Message::ExecCancel, Lane::Control),
-            (Message::ExecExit { code: -15 }, Lane::Control),
+            (
+                Message::ExecExit {
+                    code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ExecExit {
+                    code: Some(-1),
+                    timed_out: false,
+                    stdout_truncated: true,
+                    stderr_truncated: false,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ExecExit {
+                    code: None,
+                    timed_out: true,
+                    stdout_truncated: true,
+                    stderr_truncated: true,
+                },
+                Lane::Control,
+            ),
             (Message::Ping { seq: u64::MAX }, Lane::Control),
             (Message::Pong { seq: 42 }, Lane::Control),
             (Message::Shutdown, Lane::Control),
+            (
+                Message::CopyInStart {
+                    dst_guest: "/workspace/src".to_owned(),
+                    max_bytes: 8 * 1024 * 1024,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::CopyOutStart {
+                    src_guest: "/workspace/dist".to_owned(),
+                    max_bytes: 16 * 1024 * 1024,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::CopyDone {
+                    bytes_transferred: 123_456,
+                },
+                Lane::Data,
+            ),
+            (
+                Message::CopyError {
+                    message: "tar entry escapes root".to_owned(),
+                },
+                Lane::Control,
+            ),
         ];
 
         for (msg, expected_lane) in samples {
@@ -360,6 +760,42 @@ mod tests {
                 Message::decode(msg.kind(), &payload).expect("valid payload decodes");
             assert_eq!(decoded, msg);
         }
+    }
+
+    #[test]
+    fn exec_start_env_encoding_is_deterministic() {
+        let mut env_a = BTreeMap::new();
+        env_a.insert("B".to_owned(), "2".to_owned());
+        env_a.insert("A".to_owned(), "1".to_owned());
+        env_a.insert("C".to_owned(), "3".to_owned());
+
+        let mut env_b = BTreeMap::new();
+        env_b.insert("C".to_owned(), "3".to_owned());
+        env_b.insert("A".to_owned(), "1".to_owned());
+        env_b.insert("B".to_owned(), "2".to_owned());
+
+        let msg_a = Message::ExecStart {
+            target: ExecTargetWire::Guest,
+            argv: vec!["env".to_owned()],
+            env: env_a,
+            cwd: None,
+            user: None,
+            deadline_ms: 1000,
+            stdout_budget_bytes: 1024,
+            stderr_budget_bytes: 1024,
+        };
+        let msg_b = Message::ExecStart {
+            target: ExecTargetWire::Guest,
+            argv: vec!["env".to_owned()],
+            env: env_b,
+            cwd: None,
+            user: None,
+            deadline_ms: 1000,
+            stdout_budget_bytes: 1024,
+            stderr_budget_bytes: 1024,
+        };
+
+        assert_eq!(msg_a.encode_payload().unwrap(), msg_b.encode_payload().unwrap());
     }
 
     #[test]
@@ -390,19 +826,48 @@ mod tests {
     }
 
     #[test]
-    fn exec_start_rejects_empty_argv_and_invalid_utf8() {
-        let empty = Message::ExecStart { argv: Vec::new() };
+    fn exec_start_rejects_empty_argv_invalid_tags_duplicate_env_and_invalid_utf8() {
+        let empty = Message::ExecStart {
+            target: ExecTargetWire::Guest,
+            argv: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            user: None,
+            deadline_ms: 1000,
+            stdout_budget_bytes: 1024,
+            stderr_budget_bytes: 1024,
+        };
         assert!(matches!(
             empty.encode_payload(),
             Err(ProtocolError::InvalidPayload(_))
         ));
+
+        // target=Guest (0), argc=0.
+        let mut zero_argc = vec![0u8];
+        zero_argc.extend_from_slice(&0u32.to_be_bytes());
         assert!(matches!(
-            Message::decode(FrameKind::ExecStart, &0u32.to_be_bytes()),
+            Message::decode(FrameKind::ExecStart, &zero_argc),
             Err(ProtocolError::InvalidPayload(_))
         ));
 
-        // Valid argc=1, len=2, invalid UTF-8 bytes 0xFF 0xFE.
-        let mut bad_utf8 = Vec::new();
+        // target=Guest (0), argc=u32::MAX (must fail preallocation bound without OOM).
+        let mut huge_argc = vec![0u8];
+        huge_argc.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            Message::decode(FrameKind::ExecStart, &huge_argc),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Invalid ExecTargetWire discriminant (2).
+        let mut bad_target = sample_guest_exec_start().encode_payload().unwrap();
+        bad_target[0] = 2;
+        assert!(matches!(
+            Message::decode(FrameKind::ExecStart, &bad_target),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Invalid UTF-8 in argv[0] (target=Guest, argc=1, len=2, [0xFF, 0xFE]).
+        let mut bad_utf8 = vec![0u8];
         bad_utf8.extend_from_slice(&1u32.to_be_bytes());
         bad_utf8.extend_from_slice(&2u32.to_be_bytes());
         bad_utf8.extend_from_slice(&[0xFF, 0xFE]);
@@ -410,44 +875,217 @@ mod tests {
             Message::decode(FrameKind::ExecStart, &bad_utf8),
             Err(ProtocolError::InvalidUtf8)
         );
+
+        // Invalid UTF-8 in ExecTargetWire::Container id_or_name.
+        let mut bad_container_utf8 = vec![1u8];
+        bad_container_utf8.extend_from_slice(&2u32.to_be_bytes());
+        bad_container_utf8.extend_from_slice(&[0xFF, 0xFE]);
+        assert_eq!(
+            Message::decode(FrameKind::ExecStart, &bad_container_utf8),
+            Err(ProtocolError::InvalidUtf8)
+        );
+
+        // Duplicate env key: target=Guest, argc=1 ("a"), envc=2 ("K"="1", "K"="2"), cwd=None, user=None, 3x u64=0.
+        let mut dup_env = Vec::new();
+        dup_env.push(0u8);
+        dup_env.extend_from_slice(&1u32.to_be_bytes());
+        dup_env.extend_from_slice(&1u32.to_be_bytes());
+        dup_env.push(b'a');
+        dup_env.extend_from_slice(&2u32.to_be_bytes());
+        for val in *b"12" {
+            dup_env.extend_from_slice(&1u32.to_be_bytes());
+            dup_env.push(b'K');
+            dup_env.extend_from_slice(&1u32.to_be_bytes());
+            dup_env.push(val);
+        }
+        dup_env.extend_from_slice(&[0u8, 0u8]);
+        dup_env.extend_from_slice(&[0u8; 24]);
+        assert!(matches!(
+            Message::decode(FrameKind::ExecStart, &dup_env),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Huge envc exceeding remaining payload bytes.
+        let mut huge_envc = vec![0u8];
+        huge_envc.extend_from_slice(&1u32.to_be_bytes());
+        huge_envc.extend_from_slice(&1u32.to_be_bytes());
+        huge_envc.push(b'a');
+        huge_envc.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            Message::decode(FrameKind::ExecStart, &huge_envc),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Invalid Option tag on cwd (offset: 1(target) + 4(argc) + 5("a") + 4(envc=0) = 14).
+        let mut base = Vec::new();
+        base.push(0u8);
+        base.extend_from_slice(&1u32.to_be_bytes());
+        base.extend_from_slice(&1u32.to_be_bytes());
+        base.push(b'a');
+        base.extend_from_slice(&0u32.to_be_bytes());
+        base.push(2u8); // invalid cwd tag
+        base.push(0u8);
+        base.extend_from_slice(&[0u8; 24]);
+        assert!(matches!(
+            Message::decode(FrameKind::ExecStart, &base),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Invalid Option tag on user.
+        base[14] = 0; // valid cwd=None
+        base[15] = 2; // invalid user tag
+        assert!(matches!(
+            Message::decode(FrameKind::ExecStart, &base),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn exec_exit_and_copy_reject_invalid_discriminants_and_utf8() {
+        // Invalid code tag byte (2).
+        assert!(matches!(
+            Message::decode(FrameKind::ExecExit, &[2, 0, 0, 0]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        // Invalid timed_out / stdout_truncated / stderr_truncated bool bytes.
+        assert!(matches!(
+            Message::decode(FrameKind::ExecExit, &[0, 2, 0, 0]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            Message::decode(FrameKind::ExecExit, &[0, 0, 2, 0]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            Message::decode(FrameKind::ExecExit, &[0, 0, 0, 2]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+
+        // Invalid UTF-8 in CopyInStart, CopyOutStart, CopyError.
+        let mut bad_copy_start = Vec::new();
+        bad_copy_start.extend_from_slice(&2u32.to_be_bytes());
+        bad_copy_start.extend_from_slice(&[0xFF, 0xFE]);
+        bad_copy_start.extend_from_slice(&1024u64.to_be_bytes());
+        assert_eq!(
+            Message::decode(FrameKind::CopyInStart, &bad_copy_start),
+            Err(ProtocolError::InvalidUtf8)
+        );
+        assert_eq!(
+            Message::decode(FrameKind::CopyOutStart, &bad_copy_start),
+            Err(ProtocolError::InvalidUtf8)
+        );
+
+        let mut bad_copy_err = Vec::new();
+        bad_copy_err.extend_from_slice(&2u32.to_be_bytes());
+        bad_copy_err.extend_from_slice(&[0xFF, 0xFE]);
+        assert_eq!(
+            Message::decode(FrameKind::CopyError, &bad_copy_err),
+            Err(ProtocolError::InvalidUtf8)
+        );
     }
 
     #[test]
     fn decode_rejects_truncated_and_trailing_payloads() {
-        let truncated_cases = [
+        let mut rich_env = BTreeMap::new();
+        rich_env.insert("K".to_owned(), "V".to_owned());
+        let rich_exec = Message::ExecStart {
+            target: ExecTargetWire::Container {
+                id_or_name: "box1".to_owned(),
+            },
+            argv: vec!["/bin/sh".to_owned()],
+            env: rich_env,
+            cwd: Some("/work".to_owned()),
+            user: Some("root".to_owned()),
+            deadline_ms: 500,
+            stdout_budget_bytes: 100,
+            stderr_budget_bytes: 100,
+        };
+        let exit_some = Message::ExecExit {
+            code: Some(42),
+            timed_out: false,
+            stdout_truncated: true,
+            stderr_truncated: false,
+        };
+        let exit_none = Message::ExecExit {
+            code: None,
+            timed_out: true,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let copy_in = Message::CopyInStart {
+            dst_guest: "/work".to_owned(),
+            max_bytes: 1024,
+        };
+        let copy_out = Message::CopyOutStart {
+            src_guest: "/work".to_owned(),
+            max_bytes: 2048,
+        };
+        let copy_done = Message::CopyDone {
+            bytes_transferred: 99,
+        };
+        let copy_error = Message::CopyError {
+            message: "denied".to_owned(),
+        };
+
+        // Every proper prefix of every structured message must fail with InvalidPayload.
+        for msg in [
+            rich_exec,
+            exit_some,
+            exit_none,
+            copy_in,
+            copy_out,
+            copy_done,
+            copy_error,
+        ] {
+            let valid = msg.encode_payload().unwrap();
+            for prefix_len in 0..valid.len() {
+                assert!(
+                    matches!(
+                        Message::decode(msg.kind(), &valid[..prefix_len]),
+                        Err(ProtocolError::InvalidPayload(_))
+                    ),
+                    "expected InvalidPayload for {:?} truncated at {prefix_len}/{}",
+                    msg.kind(),
+                    valid.len()
+                );
+            }
+            let mut with_trailing = valid;
+            with_trailing.push(0xAA);
+            assert!(
+                matches!(
+                    Message::decode(msg.kind(), &with_trailing),
+                    Err(ProtocolError::InvalidPayload(_))
+                ),
+                "expected InvalidPayload for trailing byte in {:?}",
+                msg.kind()
+            );
+        }
+
+        let static_truncated_cases = [
             (FrameKind::Hello, vec![]),
             (FrameKind::HelloAck, vec![1, 0, 0, 0]),
-            (FrameKind::ExecStart, vec![0, 0]),
-            (FrameKind::ExecStart, vec![0, 0, 0, 1, 0, 0, 0, 5, b'h', b'i']),
-            (FrameKind::ExecStart, u32::MAX.to_be_bytes().to_vec()),
             (FrameKind::StreamData, vec![0]),
             (FrameKind::StreamCredit, vec![0, 0, 0, 1]),
-            (FrameKind::ExecExit, vec![0, 0, 0]),
             (FrameKind::Ping, vec![1, 2, 3, 4, 5, 6, 7]),
             (FrameKind::Pong, vec![1, 2, 3]),
         ];
-        for (kind, payload) in truncated_cases {
+        for (kind, payload) in static_truncated_cases {
             assert!(
                 matches!(Message::decode(kind, &payload), Err(ProtocolError::InvalidPayload(_))),
                 "expected InvalidPayload for truncated {kind:?}"
             );
         }
 
-        let trailing_cases = [
+        let static_trailing_cases = [
             (FrameKind::Hello, vec![1, 99]),
             (FrameKind::HelloAck, vec![1, 0, 0, 0, 0, 99]),
-            (
-                FrameKind::ExecStart,
-                vec![0, 0, 0, 1, 0, 0, 0, 1, b'a', 0xff],
-            ),
             (FrameKind::StreamCredit, vec![1, 0, 0, 0, 8, 0]),
             (FrameKind::ExecCancel, vec![0]),
-            (FrameKind::ExecExit, vec![0, 0, 0, 0, 1]),
             (FrameKind::Ping, vec![0; 9]),
             (FrameKind::Pong, vec![0; 9]),
             (FrameKind::Shutdown, vec![1]),
         ];
-        for (kind, payload) in trailing_cases {
+        for (kind, payload) in static_trailing_cases {
             assert!(
                 matches!(Message::decode(kind, &payload), Err(ProtocolError::InvalidPayload(_))),
                 "expected InvalidPayload for trailing bytes in {kind:?}"
@@ -457,13 +1095,45 @@ mod tests {
 
     #[test]
     fn oversized_message_payload_is_rejected() {
-        let too_big = Message::StreamData {
+        let too_big_stream = Message::StreamData {
             channel: StreamChannel::Stdout,
             eof: false,
             data: vec![0u8; MAX_FRAME_PAYLOAD_BYTES as usize - 1],
         };
         assert!(matches!(
-            too_big.encode_payload(),
+            too_big_stream.encode_payload(),
+            Err(ProtocolError::PayloadTooLarge { .. })
+        ));
+
+        let too_big_exec = Message::ExecStart {
+            target: ExecTargetWire::Guest,
+            argv: vec!["x".repeat(MAX_FRAME_PAYLOAD_BYTES as usize)],
+            env: BTreeMap::new(),
+            cwd: None,
+            user: None,
+            deadline_ms: 1,
+            stdout_budget_bytes: 1,
+            stderr_budget_bytes: 1,
+        };
+        assert!(matches!(
+            too_big_exec.encode_payload(),
+            Err(ProtocolError::PayloadTooLarge { .. })
+        ));
+
+        let too_big_copy_in = Message::CopyInStart {
+            dst_guest: "a".repeat(MAX_FRAME_PAYLOAD_BYTES as usize),
+            max_bytes: 10,
+        };
+        assert!(matches!(
+            too_big_copy_in.encode_payload(),
+            Err(ProtocolError::PayloadTooLarge { .. })
+        ));
+
+        let too_big_copy_err = Message::CopyError {
+            message: "e".repeat(MAX_FRAME_PAYLOAD_BYTES as usize - 3),
+        };
+        assert!(matches!(
+            too_big_copy_err.encode_payload(),
             Err(ProtocolError::PayloadTooLarge { .. })
         ));
     }
