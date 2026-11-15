@@ -33,6 +33,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 getrandom = "0.2"
 libc = "0.2"
 sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
 windows-sys = "0.59"
 
 [profile.guest-release]

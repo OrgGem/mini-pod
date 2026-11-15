@@ -1,20 +1,26 @@
-#![forbid(unsafe_code)]
-//! Guest RPC daemon: Phase 1 spike virtio-serial agent loop.
-//!
-//! Full Execution Supervisor (incremental streaming, process-group / sub-cgroup kill on deadline
-//! or stdout/stderr budget overflow) and Podman Unix socket relay are added in Phases 3–4.
+#![deny(unsafe_code)]
+//! Guest RPC daemon: streaming virtio-serial agent, Execution Supervisor, and safe tar copy.
 
-use std::collections::BTreeMap;
+mod copy_tar;
+mod supervisor;
+#[cfg(unix)]
+mod supervisor_unix;
+
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sandbox_protocol::{
-    read_frame, write_frame, ExecTargetWire, Frame, Message, ProtocolError, StreamChannel,
-    StreamId, MAX_FRAME_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    read_frame, write_frame, Frame, Lane, Message, PriorityFrameQueue, ProtocolError,
+    StreamChannel, StreamId, MAX_FRAME_PAYLOAD_BYTES, PROTOCOL_VERSION,
 };
+
+use crate::copy_tar::{run_copy_in, run_copy_out, ActiveCopyIn};
+use crate::supervisor::{run_exec, ActiveExec, ExecSpec};
 
 const VIRTIO_PORT_CANDIDATES: [&str; 2] =
     ["/dev/virtio-ports/org.minipod.agent.0", "/dev/vport0p1"];
@@ -24,17 +30,301 @@ const PORT_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Maximum raw `StreamData` payload bytes per frame (`MAX_FRAME_PAYLOAD_BYTES` minus 2-byte header).
 const MAX_STREAM_DATA_CHUNK_BYTES: usize = MAX_FRAME_PAYLOAD_BYTES as usize - 2;
 
+#[derive(Default)]
+struct OutboundState {
+    queue: PriorityFrameQueue,
+    data_queued_by_stream: HashMap<StreamId, usize>,
+    credits: HashMap<(StreamId, u8), u64>,
+    aborted_streams: HashSet<StreamId>,
+    draining: bool,
+    closed: bool,
+    writer_err: Option<ProtocolError>,
+}
+
+pub(crate) struct OutboundQueue {
+    state: Mutex<OutboundState>,
+    cv: Condvar,
+}
+
+impl OutboundQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OutboundState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn push_frame(&self, frame: Frame) -> Result<(), ProtocolError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(closed_error(&state));
+        }
+        if frame.header.lane == Lane::Data {
+            *state
+                .data_queued_by_stream
+                .entry(frame.header.stream_id)
+                .or_insert(0) += 1;
+        }
+        state.queue.push(frame);
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn push_message(
+        &self,
+        stream_id: StreamId,
+        msg: &Message,
+    ) -> Result<(), ProtocolError> {
+        let frame = Frame::from_message(stream_id, msg)?;
+        self.push_frame(frame)
+    }
+
+    pub(crate) fn send_stream_data(
+        &self,
+        stream_id: StreamId,
+        channel: StreamChannel,
+        bytes: &[u8],
+    ) -> Result<(), ProtocolError> {
+        self.send_stream_chunks(stream_id, channel, bytes, false)
+    }
+
+    pub(crate) fn send_stream_data_final(
+        &self,
+        stream_id: StreamId,
+        channel: StreamChannel,
+        bytes: &[u8],
+    ) -> Result<(), ProtocolError> {
+        if bytes.is_empty() {
+            return self.send_stream_eof(stream_id, channel);
+        }
+        self.send_stream_chunks(stream_id, channel, bytes, true)
+    }
+
+    pub(crate) fn send_stream_eof(
+        &self,
+        stream_id: StreamId,
+        channel: StreamChannel,
+    ) -> Result<(), ProtocolError> {
+        self.push_message(
+            stream_id,
+            &Message::StreamData {
+                channel,
+                eof: true,
+                data: Vec::new(),
+            },
+        )
+    }
+
+    pub(crate) fn send_stdin_credit(
+        &self,
+        stream_id: StreamId,
+        mut bytes: usize,
+    ) -> Result<(), ProtocolError> {
+        while bytes > 0 {
+            let chunk = bytes.min(u32::MAX as usize);
+            self.push_message(
+                stream_id,
+                &Message::StreamCredit {
+                    channel: StreamChannel::Stdin,
+                    bytes: chunk as u32,
+                },
+            )?;
+            bytes -= chunk;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_exec_exit_after_data(
+        &self,
+        stream_id: StreamId,
+        msg: &Message,
+    ) -> Result<(), ProtocolError> {
+        let frame = Frame::from_message(stream_id, msg)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.closed
+            && state
+                .data_queued_by_stream
+                .get(&stream_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        {
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        clear_stream_locked(&mut state, stream_id);
+        if state.closed {
+            return Err(closed_error(&state));
+        }
+        state.queue.push(frame);
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn grant_credit(&self, stream_id: StreamId, channel: StreamChannel, bytes: u32) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .credits
+            .entry((stream_id, channel as u8))
+            .and_modify(|rem| *rem = rem.saturating_add(u64::from(bytes)))
+            .or_insert_with(|| u64::from(bytes));
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn abort_stream(&self, stream_id: StreamId) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.aborted_streams.insert(stream_id);
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn clear_stream(&self, stream_id: StreamId) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        clear_stream_locked(&mut state, stream_id);
+    }
+
+    fn send_stream_chunks(
+        &self,
+        stream_id: StreamId,
+        channel: StreamChannel,
+        bytes: &[u8],
+        mark_final_eof: bool,
+    ) -> Result<(), ProtocolError> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let take = loop {
+                if state.closed {
+                    return Err(closed_error(&state));
+                }
+                if state.aborted_streams.contains(&stream_id) {
+                    return Ok(());
+                }
+                let remaining = bytes.len() - offset;
+                match state.credits.get_mut(&(stream_id, channel as u8)) {
+                    None => break remaining.min(MAX_STREAM_DATA_CHUNK_BYTES),
+                    Some(avail) if *avail > 0 => {
+                        let allowed = usize::try_from(*avail).unwrap_or(usize::MAX);
+                        let n = remaining.min(MAX_STREAM_DATA_CHUNK_BYTES).min(allowed);
+                        *avail -= n as u64;
+                        break n;
+                    }
+                    Some(_) => {
+                        state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+            };
+
+            let end = offset + take;
+            let eof = mark_final_eof && end == bytes.len();
+            let frame = Frame::from_message(
+                stream_id,
+                &Message::StreamData {
+                    channel,
+                    eof,
+                    data: bytes[offset..end].to_vec(),
+                },
+            )?;
+            *state
+                .data_queued_by_stream
+                .entry(stream_id)
+                .or_insert(0) += 1;
+            state.queue.push(frame);
+            self.cv.notify_all();
+            offset = end;
+        }
+        Ok(())
+    }
+
+    fn pop_for_writer(&self) -> Option<Frame> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if state.closed && !state.draining {
+                return None;
+            }
+            if let Some(frame) = state.queue.pop() {
+                if frame.header.lane == Lane::Data {
+                    let sid = frame.header.stream_id;
+                    if let Some(count) = state.data_queued_by_stream.get_mut(&sid) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            state.data_queued_by_stream.remove(&sid);
+                        }
+                    }
+                    self.cv.notify_all();
+                }
+                return Some(frame);
+            }
+            if state.draining {
+                state.closed = true;
+                self.cv.notify_all();
+                return None;
+            }
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finish_and_drain(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.draining = true;
+        self.cv.notify_all();
+    }
+
+    fn fail_writer(&self, err: ProtocolError) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        state.draining = false;
+        if state.writer_err.is_none() {
+            state.writer_err = Some(err);
+        }
+        self.cv.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+
+    fn take_writer_error(&self) -> Option<ProtocolError> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .writer_err
+            .take()
+    }
+}
+
+fn clear_stream_locked(state: &mut OutboundState, stream_id: StreamId) {
+    state.credits.remove(&(stream_id, StreamChannel::Stdin as u8));
+    state.credits.remove(&(stream_id, StreamChannel::Stdout as u8));
+    state.credits.remove(&(stream_id, StreamChannel::Stderr as u8));
+    state.aborted_streams.remove(&stream_id);
+}
+
+fn closed_error(state: &OutboundState) -> ProtocolError {
+    match state.writer_err {
+        Some(ref err) => ProtocolError::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("outbound writer closed: {err}"),
+        )),
+        None => ProtocolError::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "outbound writer closed",
+        )),
+    }
+}
+
 /// Runs one guest-initiated protocol session over `reader` and `writer`.
 ///
 /// Protocol contract:
 /// 1. Guest immediately sends `Hello` on `StreamId(0)` and waits for `HelloAck` on `StreamId(0)`
 ///    matching [`PROTOCOL_VERSION`].
-/// 2. `Ping` replies with `Pong` preserving `stream_id`.
-/// 3. `ExecStart` runs the command, streams `Stdout` and `Stderr` as `StreamData` chunks
-///    (terminated with `eof: true` on each channel, preserving `stream_id`), and sends `ExecExit`.
-/// 4. `Shutdown` replies with `Shutdown` on `StreamId(0)` and returns `Ok(())`.
-/// 5. Clean frame-boundary EOF returns `Ok(())`.
-pub fn serve_session<R: Read, W: Write>(
+/// 2. Concurrent reader/writer loops keep control frames (`Ping`, `ExecCancel`, `StreamCredit`,
+///    `Shutdown`) responsive even while commands or tar streams are active.
+/// 3. `ExecStart` runs under the Execution Supervisor with incremental stdout/stderr streaming,
+///    budget capping, strict deadlines, and process-group kill on Unix.
+/// 4. `CopyInStart` and `CopyOutStart` perform safe, symlink-hardened tar transfers bounded by
+///    `max_bytes`.
+/// 5. `Shutdown` cancels active work, replies with `Shutdown` on `StreamId(0)`, drains queued
+///    frames, and returns `Ok(())`.
+pub fn serve_session<R: Read + Send, W: Write + Send>(
     reader: &mut R,
     writer: &mut W,
 ) -> Result<(), ProtocolError> {
@@ -67,140 +357,277 @@ pub fn serve_session<R: Read, W: Write>(
         }
     }
 
-    loop {
-        let frame = match read_frame(reader) {
-            Ok(frame) => frame,
-            Err(ProtocolError::Eof) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        let stream_id = frame.header.stream_id;
-        match frame.decode_message()? {
-            Message::Ping { seq } => {
-                send_message(writer, stream_id, &Message::Pong { seq })?;
-            }
-            Message::ExecStart {
-                target,
-                argv,
-                env,
-                cwd,
-                user,
-                ..
-            } => {
-                handle_exec(
-                    writer,
-                    stream_id,
-                    &target,
-                    &argv,
-                    &env,
-                    cwd.as_deref(),
-                    user.as_deref(),
-                )?;
-            }
-            Message::Shutdown => {
-                send_message(writer, StreamId(0), &Message::Shutdown)?;
-                return Ok(());
-            }
-            other => {
-                return Err(ProtocolError::InvalidPayload(format!(
-                    "unsupported message {:?} in Phase 1 spike session",
-                    other.kind()
-                )));
-            }
-        }
-    }
-}
+    let outbound = Arc::new(OutboundQueue::new());
+    let active_execs: Arc<Mutex<HashMap<StreamId, Arc<ActiveExec>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let active_copy_ins: Arc<Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
-fn handle_exec<W: Write>(
-    writer: &mut W,
-    stream_id: StreamId,
-    target: &ExecTargetWire,
-    argv: &[String],
-    env: &BTreeMap<String, String>,
-    cwd: Option<&str>,
-    user: Option<&str>,
-) -> Result<(), ProtocolError> {
-    if !matches!(target, ExecTargetWire::Guest) {
-        return Err(ProtocolError::InvalidPayload(
-            "Container exec target is not supported in Phase 1 spike session".to_owned(),
-        ));
-    }
-    if user.is_some() {
-        return Err(ProtocolError::InvalidPayload(
-            "ExecStart user switching is not supported in Phase 1 spike session".to_owned(),
-        ));
-    }
-    let Some((program, args)) = argv.split_first() else {
-        return Err(ProtocolError::InvalidPayload(
-            "ExecStart argv must not be empty".to_owned(),
-        ));
-    };
+    thread::scope(|scope| {
+        let writer_outbound = outbound.clone();
+        let writer_handle = scope.spawn(move || {
+            while let Some(frame) = writer_outbound.pop_for_writer() {
+                if let Err(err) = write_frame(writer, &frame) {
+                    writer_outbound.fail_writer(err);
+                    return;
+                }
+            }
+        });
 
-    // shortcut: buffers stdout/stderr in memory via Command::output for Phase 1 spike, Phase 3 supervisor streams incremental pipe chunks and kills process group on deadline
-    let mut cmd = Command::new(program);
-    cmd.args(args).envs(env);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    let (stdout, stderr, exit_code) = match cmd.output() {
-        Ok(output) => (output.stdout, output.stderr, output.status.code()),
-        Err(err) => {
-            let code = if err.kind() == io::ErrorKind::PermissionDenied {
-                126
-            } else {
-                127
+        let mut workers = Vec::new();
+        let mut session_res: Result<(), ProtocolError> = Ok(());
+        let mut shutdown_requested = false;
+
+        loop {
+            reap_finished_workers(&mut workers);
+
+            let frame = match read_frame(reader) {
+                Ok(frame) => frame,
+                Err(ProtocolError::Eof) => break,
+                Err(err) => {
+                    session_res = Err(err);
+                    break;
+                }
             };
-            let msg = format!("failed to execute '{program}': {err}\n");
-            (Vec::new(), msg.into_bytes(), Some(code))
-        }
-    };
 
-    send_stream_bytes(writer, stream_id, StreamChannel::Stdout, &stdout)?;
-    send_stream_bytes(writer, stream_id, StreamChannel::Stderr, &stderr)?;
-    send_message(
-        writer,
-        stream_id,
-        &Message::ExecExit {
-            code: exit_code,
-            timed_out: false,
-            stdout_truncated: false,
-            stderr_truncated: false,
-        },
-    )?;
-    Ok(())
+            let stream_id = frame.header.stream_id;
+            let msg = match frame.decode_message() {
+                Ok(msg) => msg,
+                Err(err) => {
+                    session_res = Err(err);
+                    break;
+                }
+            };
+
+            match msg {
+                Message::Ping { seq } => {
+                    if let Err(err) = outbound.push_message(stream_id, &Message::Pong { seq }) {
+                        session_res = Err(err);
+                        break;
+                    }
+                }
+                Message::ExecStart {
+                    target,
+                    argv,
+                    env,
+                    cwd,
+                    user,
+                    deadline_ms,
+                    stdout_budget_bytes,
+                    stderr_budget_bytes,
+                } => {
+                    if stream_id == StreamId(0) || is_stream_active(&active_execs, &active_copy_ins, stream_id) {
+                        session_res = Err(ProtocolError::InvalidPayload(format!(
+                            "invalid or duplicate stream_id {stream_id} for ExecStart"
+                        )));
+                        break;
+                    }
+                    let (handle, stdin_rx) = ActiveExec::new(stream_id);
+                    active_execs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(stream_id, handle.clone());
+
+                    let spec = ExecSpec {
+                        stream_id,
+                        target,
+                        argv,
+                        env,
+                        cwd,
+                        user,
+                        deadline_ms,
+                        stdout_budget_bytes,
+                        stderr_budget_bytes,
+                    };
+                    let worker_outbound = outbound.clone();
+                    let worker_execs = active_execs.clone();
+                    workers.push(scope.spawn(move || {
+                        run_exec(spec, handle, stdin_rx, worker_outbound, worker_execs);
+                    }));
+                }
+                Message::ExecCancel => {
+                    outbound.abort_stream(stream_id);
+                    let handle = active_execs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&stream_id)
+                        .cloned();
+                    if let Some(handle) = handle {
+                        handle.cancel(&outbound);
+                    }
+                }
+                Message::StreamData {
+                    channel: StreamChannel::Stdin,
+                    eof,
+                    data,
+                } => {
+                    let exec_target = active_execs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&stream_id)
+                        .cloned();
+                    if let Some(exec_handle) = exec_target {
+                        exec_handle.send_stdin(data, eof);
+                    } else {
+                        let copy_target = {
+                            let mut guard =
+                                active_copy_ins.lock().unwrap_or_else(|e| e.into_inner());
+                            let entry = guard.get(&stream_id).cloned();
+                            if eof {
+                                guard.remove(&stream_id);
+                            }
+                            entry
+                        };
+                        if let Some(copy_handle) = copy_target {
+                            copy_handle.push_chunk(data, eof);
+                        }
+                    }
+                }
+                Message::StreamData { channel, .. } => {
+                    session_res = Err(ProtocolError::InvalidPayload(format!(
+                        "unexpected host-to-guest StreamData on channel {channel:?}"
+                    )));
+                    break;
+                }
+                Message::StreamCredit { channel, bytes } => {
+                    outbound.grant_credit(stream_id, channel, bytes);
+                }
+                Message::CopyInStart {
+                    dst_guest,
+                    max_bytes,
+                } => {
+                    if stream_id == StreamId(0) || is_stream_active(&active_execs, &active_copy_ins, stream_id) {
+                        session_res = Err(ProtocolError::InvalidPayload(format!(
+                            "invalid or duplicate stream_id {stream_id} for CopyInStart"
+                        )));
+                        break;
+                    }
+                    let (handle, rx) = ActiveCopyIn::new();
+                    active_copy_ins
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(stream_id, handle);
+
+                    let worker_outbound = outbound.clone();
+                    let worker_copies = active_copy_ins.clone();
+                    workers.push(scope.spawn(move || {
+                        run_copy_in(
+                            stream_id,
+                            dst_guest,
+                            max_bytes,
+                            rx,
+                            worker_outbound,
+                            worker_copies,
+                        );
+                    }));
+                }
+                Message::CopyOutStart {
+                    src_guest,
+                    max_bytes,
+                } => {
+                    if stream_id == StreamId(0) || is_stream_active(&active_execs, &active_copy_ins, stream_id) {
+                        session_res = Err(ProtocolError::InvalidPayload(format!(
+                            "invalid or duplicate stream_id {stream_id} for CopyOutStart"
+                        )));
+                        break;
+                    }
+                    let worker_outbound = outbound.clone();
+                    workers.push(scope.spawn(move || {
+                        run_copy_out(stream_id, src_guest, max_bytes, worker_outbound);
+                    }));
+                }
+                Message::Shutdown => {
+                    shutdown_requested = true;
+                    break;
+                }
+                other => {
+                    session_res = Err(ProtocolError::InvalidPayload(format!(
+                        "unsupported host-to-guest message {:?}",
+                        other.kind()
+                    )));
+                    break;
+                }
+            }
+        }
+
+        if shutdown_requested || session_res.is_err() || outbound.is_closed() {
+            cancel_all_active(&active_execs, &active_copy_ins, &outbound);
+        }
+
+        for handle in workers {
+            let _ = handle.join();
+        }
+
+        if shutdown_requested && session_res.is_ok() {
+            if let Err(err) = outbound.push_message(StreamId(0), &Message::Shutdown) {
+                session_res = Err(err);
+            }
+        }
+
+        outbound.finish_and_drain();
+        let _ = writer_handle.join();
+
+        if session_res.is_err() {
+            session_res
+        } else if let Some(writer_err) = outbound.take_writer_error() {
+            Err(writer_err)
+        } else {
+            Ok(())
+        }
+    })
 }
 
-fn send_stream_bytes<W: Write>(
-    writer: &mut W,
+fn is_stream_active(
+    active_execs: &Mutex<HashMap<StreamId, Arc<ActiveExec>>>,
+    active_copy_ins: &Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>,
     stream_id: StreamId,
-    channel: StreamChannel,
-    bytes: &[u8],
-) -> Result<(), ProtocolError> {
-    if bytes.is_empty() {
-        return send_message(
-            writer,
-            stream_id,
-            &Message::StreamData {
-                channel,
-                eof: true,
-                data: Vec::new(),
-            },
-        );
+) -> bool {
+    active_execs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&stream_id)
+        || active_copy_ins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&stream_id)
+}
+
+fn cancel_all_active(
+    active_execs: &Mutex<HashMap<StreamId, Arc<ActiveExec>>>,
+    active_copy_ins: &Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>,
+    outbound: &OutboundQueue,
+) {
+    let execs: Vec<_> = active_execs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for handle in execs {
+        handle.cancel(outbound);
     }
 
-    let mut chunks = bytes.chunks(MAX_STREAM_DATA_CHUNK_BYTES).peekable();
-    while let Some(chunk) = chunks.next() {
-        let eof = chunks.peek().is_none();
-        send_message(
-            writer,
-            stream_id,
-            &Message::StreamData {
-                channel,
-                eof,
-                data: chunk.to_vec(),
-            },
-        )?;
+    let copy_ins: Vec<_> = active_copy_ins
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for handle in copy_ins {
+        handle.abort();
     }
-    Ok(())
+}
+
+fn reap_finished_workers(workers: &mut Vec<thread::ScopedJoinHandle<'_, ()>>) {
+    let mut i = 0;
+    while i < workers.len() {
+        if workers[i].is_finished() {
+            let handle = workers.swap_remove(i);
+            let _ = handle.join();
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn send_message<W: Write>(
@@ -263,9 +690,39 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use sandbox_protocol::ExecTargetWire;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::fs;
     use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "minipod-agent-test-{label}-{}-{}",
+                std::process::id(),
+                TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).expect("create test temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct ChannelReader {
         rx: Receiver<Vec<u8>>,
@@ -327,6 +784,35 @@ mod tests {
         )
     }
 
+    fn start_test_session() -> (
+        ChannelReader,
+        ChannelWriter,
+        thread::JoinHandle<Result<(), ProtocolError>>,
+    ) {
+        let ((mut host_rx, mut host_tx), (mut agent_rx, mut agent_tx)) = duplex_pair();
+        let agent = thread::spawn(move || serve_session(&mut agent_rx, &mut agent_tx));
+
+        let hello = read_frame(&mut host_rx).expect("guest must emit Hello first");
+        assert_eq!(hello.header.stream_id, StreamId(0));
+        assert_eq!(
+            hello.decode_message().unwrap(),
+            Message::Hello {
+                version: PROTOCOL_VERSION
+            }
+        );
+
+        send_message(
+            &mut host_tx,
+            StreamId(0),
+            &Message::HelloAck {
+                version: PROTOCOL_VERSION,
+                features: 0,
+            },
+        )
+        .unwrap();
+        (host_rx, host_tx, agent)
+    }
+
     fn shell_cmd(script: &str) -> Vec<String> {
         #[cfg(windows)]
         {
@@ -360,52 +846,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn interactive_session_handles_handshake_ping_exec_and_shutdown() {
-        let ((mut host_rx, mut host_tx), (mut agent_rx, mut agent_tx)) = duplex_pair();
-        let agent = thread::spawn(move || serve_session(&mut agent_rx, &mut agent_tx));
-
-        // 1. Guest initiates handshake before host writes anything.
-        let hello = read_frame(&mut host_rx).expect("guest must emit Hello first");
-        assert_eq!(hello.header.stream_id, StreamId(0));
-        assert_eq!(
-            hello.decode_message().unwrap(),
-            Message::Hello {
-                version: PROTOCOL_VERSION
-            }
-        );
-
-        send_message(
-            &mut host_tx,
-            StreamId(0),
-            &Message::HelloAck {
-                version: PROTOCOL_VERSION,
-                features: 0,
-            },
-        )
-        .unwrap();
-
-        // 2. Ping / Pong preserves arbitrary StreamId.
-        send_message(&mut host_tx, StreamId(9), &Message::Ping { seq: 1234 }).unwrap();
-        let pong = read_frame(&mut host_rx).expect("Pong expected");
-        assert_eq!(pong.header.stream_id, StreamId(9));
-        assert_eq!(pong.decode_message().unwrap(), Message::Pong { seq: 1234 });
-
-        // 3. ExecStart runs a real command producing stdout, stderr, and non-zero exit code.
-        #[cfg(windows)]
-        let script = "echo hello-out& echo hello-err 1>&2& exit /b 7";
-        #[cfg(unix)]
-        let script = "printf 'hello-out\\n'; printf 'hello-err\\n' >&2; exit 7";
-
-        send_message(&mut host_tx, StreamId(11), &guest_exec_start(shell_cmd(script))).unwrap();
-
+    fn collect_exec_response(
+        host_rx: &mut ChannelReader,
+        stream_id: StreamId,
+    ) -> (Vec<u8>, Vec<u8>, bool, bool, Message) {
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let mut stdout_eof = false;
         let mut stderr_eof = false;
         let exit_msg = loop {
-            let frame = read_frame(&mut host_rx).expect("exec response frame");
-            assert_eq!(frame.header.stream_id, StreamId(11));
+            let frame = read_frame(host_rx).expect("exec response frame");
+            assert_eq!(frame.header.stream_id, stream_id);
             match frame.decode_message().unwrap() {
                 Message::StreamData {
                     channel: StreamChannel::Stdout,
@@ -431,6 +882,141 @@ mod tests {
                 other => panic!("unexpected frame during exec: {other:?}"),
             }
         };
+        (stdout_bytes, stderr_bytes, stdout_eof, stderr_eof, exit_msg)
+    }
+
+    fn make_raw_tar_with_entry(
+        path: &str,
+        entry_type: tar::EntryType,
+        data: &[u8],
+        linkname: Option<&str>,
+    ) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+
+        let mut buf = Vec::new();
+        if let Some(target) = linkname {
+            let mut builder = tar::Builder::new(&mut buf);
+            builder
+                .append_link(&mut header, path, target)
+                .expect("append link entry");
+            builder.finish().unwrap();
+        } else {
+            // Write raw header bytes directly so even `..` or absolute paths bypass tar::Builder checks.
+            let path_bytes = path.as_bytes();
+            let raw = header.as_mut_bytes();
+            let copy_len = path_bytes.len().min(100);
+            raw[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
+            header.set_cksum();
+            buf.extend_from_slice(header.as_bytes());
+            if !data.is_empty() {
+                buf.extend_from_slice(data);
+                let rem = data.len() % 512;
+                if rem != 0 {
+                    buf.resize(buf.len() + (512 - rem), 0);
+                }
+            }
+            buf.extend_from_slice(&[0u8; 1024]);
+        }
+        buf
+    }
+
+    fn send_copy_in(
+        host_tx: &mut ChannelWriter,
+        host_rx: &mut ChannelReader,
+        stream_id: StreamId,
+        dst_guest: &str,
+        max_bytes: u64,
+        tar_bytes: &[u8],
+        chunk_size: usize,
+    ) -> Message {
+        send_message(
+            host_tx,
+            stream_id,
+            &Message::CopyInStart {
+                dst_guest: dst_guest.to_owned(),
+                max_bytes,
+            },
+        )
+        .unwrap();
+
+        if tar_bytes.is_empty() {
+            send_message(
+                host_tx,
+                stream_id,
+                &Message::StreamData {
+                    channel: StreamChannel::Stdin,
+                    eof: true,
+                    data: Vec::new(),
+                },
+            )
+            .unwrap();
+        } else {
+            let mut chunks = tar_bytes.chunks(chunk_size.max(1)).peekable();
+            while let Some(chunk) = chunks.next() {
+                let eof = chunks.peek().is_none();
+                send_message(
+                    host_tx,
+                    stream_id,
+                    &Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof,
+                        data: chunk.to_vec(),
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        loop {
+            let frame = read_frame(host_rx).expect("copy_in reply frame");
+            assert_eq!(frame.header.stream_id, stream_id);
+            match frame.decode_message().unwrap() {
+                Message::StreamCredit {
+                    channel: StreamChannel::Stdin,
+                    ..
+                } => continue,
+                msg @ (Message::CopyDone { .. } | Message::CopyError { .. }) => return msg,
+                other => panic!("unexpected frame during copy_in: {other:?}"),
+            }
+        }
+    }
+
+    fn shutdown_test_session(
+        mut host_rx: ChannelReader,
+        mut host_tx: ChannelWriter,
+        agent: thread::JoinHandle<Result<(), ProtocolError>>,
+    ) {
+        send_message(&mut host_tx, StreamId(0), &Message::Shutdown).unwrap();
+        let ack = read_frame(&mut host_rx).unwrap();
+        assert_eq!(ack.header.stream_id, StreamId(0));
+        assert_eq!(ack.decode_message().unwrap(), Message::Shutdown);
+        drop(host_tx);
+        agent.join().expect("agent thread did not panic").unwrap();
+    }
+
+    #[test]
+    fn interactive_session_handles_handshake_ping_exec_and_shutdown() {
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        // Ping / Pong preserves arbitrary StreamId.
+        send_message(&mut host_tx, StreamId(9), &Message::Ping { seq: 1234 }).unwrap();
+        let pong = read_frame(&mut host_rx).expect("Pong expected");
+        assert_eq!(pong.header.stream_id, StreamId(9));
+        assert_eq!(pong.decode_message().unwrap(), Message::Pong { seq: 1234 });
+
+        // ExecStart runs a real command producing stdout, stderr, and non-zero exit code.
+        #[cfg(windows)]
+        let script = "echo hello-out& echo hello-err 1>&2& exit /b 7";
+        #[cfg(unix)]
+        let script = "printf 'hello-out\\n'; printf 'hello-err\\n' >&2; exit 7";
+
+        send_message(&mut host_tx, StreamId(11), &guest_exec_start(shell_cmd(script))).unwrap();
+
+        let (stdout_bytes, stderr_bytes, stdout_eof, stderr_eof, exit_msg) =
+            collect_exec_response(&mut host_rx, StreamId(11));
         assert!(stdout_eof && stderr_eof);
         assert_eq!(
             exit_msg,
@@ -452,7 +1038,7 @@ mod tests {
             String::from_utf8_lossy(&stderr_bytes)
         );
 
-        // 4. Missing binary reports error on stderr and exit code 127.
+        // Missing binary reports error on stderr and exit code 127.
         send_message(
             &mut host_tx,
             StreamId(12),
@@ -496,14 +1082,7 @@ mod tests {
             }
         );
 
-        // 5. Shutdown acks on StreamId(0) and exits loop cleanly.
-        send_message(&mut host_tx, StreamId(0), &Message::Shutdown).unwrap();
-        let ack = read_frame(&mut host_rx).unwrap();
-        assert_eq!(ack.header.stream_id, StreamId(0));
-        assert_eq!(ack.decode_message().unwrap(), Message::Shutdown);
-
-        drop(host_tx);
-        agent.join().expect("agent thread did not panic").unwrap();
+        shutdown_test_session(host_rx, host_tx, agent);
     }
 
     #[test]
@@ -556,11 +1135,18 @@ mod tests {
     }
 
     #[test]
-    fn send_stream_bytes_chunks_large_output_within_frame_limit() {
+    fn outbound_queue_chunks_large_stream_within_frame_limit() {
         let payload = vec![b'x'; MAX_STREAM_DATA_CHUNK_BYTES + 17];
-        let mut wire = Vec::new();
-        send_stream_bytes(&mut wire, StreamId(5), StreamChannel::Stdout, &payload)
+        let outbound = OutboundQueue::new();
+        outbound
+            .send_stream_data_final(StreamId(5), StreamChannel::Stdout, &payload)
             .expect("chunking must fit within MAX_FRAME_PAYLOAD_BYTES");
+        outbound.finish_and_drain();
+
+        let mut wire = Vec::new();
+        while let Some(frame) = outbound.pop_for_writer() {
+            write_frame(&mut wire, &frame).unwrap();
+        }
 
         let mut cursor = Cursor::new(wire);
         let first = read_frame(&mut cursor).unwrap();
@@ -589,31 +1175,842 @@ mod tests {
     }
 
     #[test]
-    fn spike_handle_exec_rejects_unsupported_container_and_user_switch() {
-        let mut wire = Vec::new();
-        let err_container = handle_exec(
-            &mut wire,
-            StreamId(1),
-            &ExecTargetWire::Container {
-                id_or_name: "c1".to_owned(),
-            },
-            &["/bin/true".to_owned()],
-            &BTreeMap::new(),
-            None,
-            None,
-        );
-        assert!(matches!(err_container, Err(ProtocolError::InvalidPayload(_))));
+    fn exec_rejects_container_target_and_invalid_user_without_killing_session() {
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
 
-        let err_user = handle_exec(
-            &mut wire,
+        send_message(
+            &mut host_tx,
             StreamId(1),
-            &ExecTargetWire::Guest,
-            &["/bin/true".to_owned()],
-            &BTreeMap::new(),
-            None,
-            Some("nobody"),
+            &Message::ExecStart {
+                target: ExecTargetWire::Container {
+                    id_or_name: "c1".to_owned(),
+                },
+                argv: vec!["/bin/true".to_owned()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 5_000,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        let (_, stderr_c, stdout_eof_c, stderr_eof_c, exit_c) =
+            collect_exec_response(&mut host_rx, StreamId(1));
+        assert!(stdout_eof_c && stderr_eof_c);
+        assert!(matches!(exit_c, Message::ExecExit { code: Some(125), .. }));
+        assert!(String::from_utf8_lossy(&stderr_c).contains("Phase 4"));
+
+        send_message(
+            &mut host_tx,
+            StreamId(2),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: vec!["/bin/true".to_owned()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: Some("minipod_missing_user_99999".to_owned()),
+                deadline_ms: 5_000,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        let (_, stderr_u, stdout_eof_u, stderr_eof_u, exit_u) =
+            collect_exec_response(&mut host_rx, StreamId(2));
+        assert!(stdout_eof_u && stderr_eof_u);
+        assert!(matches!(exit_u, Message::ExecExit { code: Some(126), .. }));
+        assert!(!stderr_u.is_empty());
+
+        // Session must remain healthy after diagnostic rejections.
+        send_message(&mut host_tx, StreamId(0), &Message::Ping { seq: 55 }).unwrap();
+        let pong = read_frame(&mut host_rx).unwrap();
+        assert_eq!(pong.decode_message().unwrap(), Message::Pong { seq: 55 });
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn exec_streams_stdin_stdout_and_enforces_env_and_cwd() {
+        let tmp = TestTempDir::new("exec-io");
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        #[cfg(windows)]
+        let argv = vec![
+            "cmd".to_owned(),
+            "/V:ON".to_owned(),
+            "/C".to_owned(),
+            "set /p line= & echo !line!-%MINIPOD_TAG% & cd".to_owned(),
+        ];
+        #[cfg(unix)]
+        let argv = shell_cmd("IFS= read -r line; printf '%s-%s\\n' \"$line\" \"$MINIPOD_TAG\"; pwd");
+
+        let mut env = BTreeMap::new();
+        env.insert("MINIPOD_TAG".to_owned(), "ok42".to_owned());
+
+        send_message(
+            &mut host_tx,
+            StreamId(3),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv,
+                env,
+                cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                user: None,
+                deadline_ms: 15_000,
+                stdout_budget_bytes: 65_536,
+                stderr_budget_bytes: 65_536,
+            },
+        )
+        .unwrap();
+
+        send_message(
+            &mut host_tx,
+            StreamId(3),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: false,
+                data: b"hello".to_vec(),
+            },
+        )
+        .unwrap();
+        send_message(
+            &mut host_tx,
+            StreamId(3),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: true,
+                data: b"\n".to_vec(),
+            },
+        )
+        .unwrap();
+
+        let mut stdout_bytes = Vec::new();
+        let mut saw_exit = None;
+        while saw_exit.is_none() {
+            let frame = read_frame(&mut host_rx).unwrap();
+            assert_eq!(frame.header.stream_id, StreamId(3));
+            match frame.decode_message().unwrap() {
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    data,
+                    ..
+                } => stdout_bytes.extend_from_slice(&data),
+                Message::StreamData {
+                    channel: StreamChannel::Stderr,
+                    ..
+                }
+                | Message::StreamCredit {
+                    channel: StreamChannel::Stdin,
+                    ..
+                } => {}
+                msg @ Message::ExecExit { .. } => saw_exit = Some(msg),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(
+            saw_exit.unwrap(),
+            Message::ExecExit {
+                code: Some(0),
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
         );
-        assert!(matches!(err_user, Err(ProtocolError::InvalidPayload(_))));
-        assert!(wire.is_empty());
+        let out_str = String::from_utf8_lossy(&stdout_bytes);
+        assert!(out_str.contains("hello") && out_str.contains("ok42"), "stdout: {out_str:?}");
+        assert!(
+            out_str.contains(&tmp.path().file_name().unwrap().to_string_lossy().to_string()),
+            "expected cwd in stdout: {out_str:?}"
+        );
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn exec_budget_overflow_truncates_kills_and_reports_flags() {
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        #[cfg(windows)]
+        let script = "for /L %i in (1,1,500) do @echo 0123456789abcdef0123456789abcdef";
+        #[cfg(unix)]
+        let script = "i=0; while [ $i -lt 500 ]; do printf '0123456789abcdef0123456789abcdef\\n'; i=$((i+1)); done";
+
+        send_message(
+            &mut host_tx,
+            StreamId(4),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: shell_cmd(script),
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 15_000,
+                stdout_budget_bytes: 120,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        let (stdout_bytes, _stderr_bytes, stdout_eof, stderr_eof, exit_msg) =
+            collect_exec_response(&mut host_rx, StreamId(4));
+        assert!(stdout_eof && stderr_eof);
+        assert_eq!(stdout_bytes.len(), 120, "forwarded bytes must be capped at exact budget");
+        assert_eq!(
+            exit_msg,
+            Message::ExecExit {
+                code: None,
+                timed_out: false,
+                stdout_truncated: true,
+                stderr_truncated: false,
+            }
+        );
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn exec_deadline_and_cancel_kill_running_process_and_keep_ping_responsive() {
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        // 1. Deadline timeout test.
+        #[cfg(windows)]
+        let slow_argv = vec![
+            "ping".to_owned(),
+            "-n".to_owned(),
+            "10".to_owned(),
+            "127.0.0.1".to_owned(),
+        ];
+        #[cfg(unix)]
+        let slow_argv = shell_cmd("sleep 10");
+
+        send_message(
+            &mut host_tx,
+            StreamId(5),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: slow_argv.clone(),
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 150,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        let (_, _, stdout_eof, stderr_eof, exit_timeout) =
+            collect_exec_response(&mut host_rx, StreamId(5));
+        assert!(stdout_eof && stderr_eof);
+        assert_eq!(
+            exit_timeout,
+            Message::ExecExit {
+                code: None,
+                timed_out: true,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+        );
+
+        // 2. Concurrent Ping + ExecCancel test.
+        send_message(
+            &mut host_tx,
+            StreamId(6),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: slow_argv,
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 30_000,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        send_message(&mut host_tx, StreamId(0), &Message::Ping { seq: 777 }).unwrap();
+        let mut got_pong = false;
+        let mut cancel_sent = false;
+        let mut got_cancel_exit = None;
+
+        while got_cancel_exit.is_none() || !got_pong {
+            if !cancel_sent && got_pong {
+                send_message(&mut host_tx, StreamId(6), &Message::ExecCancel).unwrap();
+                cancel_sent = true;
+            }
+            let frame = read_frame(&mut host_rx).unwrap();
+            match frame.decode_message().unwrap() {
+                Message::Pong { seq: 777 } => {
+                    assert_eq!(frame.header.stream_id, StreamId(0));
+                    got_pong = true;
+                }
+                Message::StreamData { .. } => {}
+                msg @ Message::ExecExit { .. } => {
+                    assert_eq!(frame.header.stream_id, StreamId(6));
+                    got_cancel_exit = Some(msg);
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(
+            got_cancel_exit.unwrap(),
+            Message::ExecExit {
+                code: None,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+        );
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_kill_terminates_orphan_grandchild() {
+        let tmp = TestTempDir::new("pgid-kill");
+        let pid_file = tmp.path().join("grandchild.pid");
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        let script = format!(
+            "sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        );
+        send_message(
+            &mut host_tx,
+            StreamId(20),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 30_000,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild_pid: i32 = loop {
+            if let Ok(raw) = fs::read_to_string(&pid_file) {
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < wait_deadline, "grandchild did not write pid file in time");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        let start = Instant::now();
+        send_message(&mut host_tx, StreamId(20), &Message::ExecCancel).unwrap();
+        let (_, _, stdout_eof, stderr_eof, exit_msg) =
+            collect_exec_response(&mut host_rx, StreamId(20));
+        assert!(stdout_eof && stderr_eof);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "process-group kill must close grandchild pipes immediately without waiting 30s"
+        );
+        assert_eq!(
+            exit_msg,
+            Message::ExecExit {
+                code: None,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let is_running = |pid: i32| -> bool {
+                let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+                    return false;
+                };
+                for line in status.lines() {
+                    if let Some(rest) = line.strip_prefix("State:") {
+                        return !rest.trim_start().starts_with('Z');
+                    }
+                }
+                true
+            };
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            while is_running(grandchild_pid) && Instant::now() < reap_deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !is_running(grandchild_pid),
+                "orphan grandchild PID {grandchild_pid} must be terminated (not running) after process-group kill"
+            );
+        }
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn stream_credit_enforces_stdout_backpressure() {
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        // Opt into credit flow control for StreamId(30) Stdout with 10 bytes initially.
+        send_message(
+            &mut host_tx,
+            StreamId(30),
+            &Message::StreamCredit {
+                channel: StreamChannel::Stdout,
+                bytes: 10,
+            },
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let script = "echo 0123456789abcdefghij";
+        #[cfg(unix)]
+        let script = "printf '0123456789abcdefghij'";
+
+        send_message(&mut host_tx, StreamId(30), &guest_exec_start(shell_cmd(script))).unwrap();
+
+        // First chunk must be capped at 10 bytes while remaining bytes wait for credit.
+        let first = loop {
+            let f = read_frame(&mut host_rx).unwrap();
+            if let Message::StreamData {
+                channel: StreamChannel::Stdout,
+                eof,
+                data,
+            } = f.decode_message().unwrap()
+            {
+                assert!(!eof);
+                assert_eq!(data.len(), 10);
+                break data;
+            }
+        };
+
+        // Grant remaining credit and verify full stdout arrives followed by ExecExit.
+        send_message(
+            &mut host_tx,
+            StreamId(30),
+            &Message::StreamCredit {
+                channel: StreamChannel::Stdout,
+                bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        let (rest_stdout, _, stdout_eof, stderr_eof, exit_msg) =
+            collect_exec_response(&mut host_rx, StreamId(30));
+        assert!(stdout_eof && stderr_eof);
+        assert!(matches!(exit_msg, Message::ExecExit { code: Some(0), .. }));
+
+        let mut all = first;
+        all.extend_from_slice(&rest_stdout);
+        let text = String::from_utf8_lossy(&all);
+        assert!(text.contains("0123456789abcdefghij"), "stdout was {text:?}");
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn user_resolution_parses_numeric_and_passwd_tables() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1001:Alice:/home/alice:/bin/sh\n";
+        let group = "root:x:0:\ndevs:x:2000:alice\n";
+
+        assert_eq!(
+            supervisor::resolve_user_ids_from_tables("0", Some(passwd), Some(group)),
+            Ok((0, 0))
+        );
+        assert_eq!(
+            supervisor::resolve_user_ids_from_tables("1000", Some(passwd), Some(group)),
+            Ok((1000, 1001))
+        );
+        assert_eq!(
+            supervisor::resolve_user_ids_from_tables("1000:2000", Some(passwd), Some(group)),
+            Ok((1000, 2000))
+        );
+        assert_eq!(
+            supervisor::resolve_user_ids_from_tables("alice", Some(passwd), Some(group)),
+            Ok((1000, 1001))
+        );
+        assert_eq!(
+            supervisor::resolve_user_ids_from_tables("alice:devs", Some(passwd), Some(group)),
+            Ok((1000, 2000))
+        );
+        assert!(supervisor::resolve_user_ids_from_tables("bob", Some(passwd), Some(group)).is_err());
+        assert!(supervisor::resolve_user_ids_from_tables("alice:nope", Some(passwd), Some(group)).is_err());
+        assert!(supervisor::resolve_user_ids_from_tables("1000:2000:3000", Some(passwd), Some(group)).is_err());
+        assert!(supervisor::resolve_user_ids_from_tables("", Some(passwd), Some(group)).is_err());
+    }
+
+    #[test]
+    fn copy_in_and_copy_out_roundtrip_and_security_rejections() {
+        let tmp = TestTempDir::new("copy-tar");
+        let src_dir = tmp.path().join("src");
+        let sub_dir = src_dir.join("nested");
+        fs::create_dir_all(&sub_dir).unwrap();
+        fs::write(src_dir.join("hello.txt"), b"hello-tar-world").unwrap();
+        fs::write(sub_dir.join("data.bin"), vec![0xABu8; 70_000]).unwrap();
+
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        // 1. CopyOutStart streams multi-chunk tar archive followed strictly by CopyDone.
+        send_message(
+            &mut host_tx,
+            StreamId(40),
+            &Message::CopyOutStart {
+                src_guest: src_dir.to_string_lossy().into_owned(),
+                max_bytes: 1_048_576,
+            },
+        )
+        .unwrap();
+
+        let mut tar_out = Vec::new();
+        let mut saw_eof = false;
+        let bytes_transferred = loop {
+            let frame = read_frame(&mut host_rx).unwrap();
+            assert_eq!(frame.header.stream_id, StreamId(40));
+            match frame.decode_message().unwrap() {
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    eof,
+                    data,
+                } => {
+                    assert!(!saw_eof, "no StreamData may follow eof: true");
+                    tar_out.extend_from_slice(&data);
+                    if eof {
+                        saw_eof = true;
+                    }
+                }
+                Message::CopyDone { bytes_transferred } => {
+                    assert!(saw_eof, "CopyDone must strictly follow StreamData eof: true");
+                    break bytes_transferred;
+                }
+                other => panic!("unexpected copy_out frame: {other:?}"),
+            }
+        };
+        assert_eq!(bytes_transferred as usize, tar_out.len());
+        assert!(tar_out.len() > 65_536, "expected multi-chunk tar output");
+
+        // 2. CopyInStart unpacks that tar archive cleanly into a new destination directory.
+        let dst_dir = tmp.path().join("dst").join("unpacked");
+        let reply = send_copy_in(
+            &mut host_tx,
+            &mut host_rx,
+            StreamId(41),
+            &dst_dir.to_string_lossy(),
+            1_048_576,
+            &tar_out,
+            16_384,
+        );
+        assert_eq!(
+            reply,
+            Message::CopyDone {
+                bytes_transferred: tar_out.len() as u64
+            }
+        );
+        assert_eq!(fs::read(dst_dir.join("hello.txt")).unwrap(), b"hello-tar-world");
+        assert_eq!(
+            fs::read(dst_dir.join("nested").join("data.bin")).unwrap(),
+            vec![0xABu8; 70_000]
+        );
+
+        // 3. CopyOutStart rejects max_bytes overflow.
+        send_message(
+            &mut host_tx,
+            StreamId(42),
+            &Message::CopyOutStart {
+                src_guest: src_dir.to_string_lossy().into_owned(),
+                max_bytes: 1024,
+            },
+        )
+        .unwrap();
+        let err_frame = read_frame(&mut host_rx).unwrap();
+        assert_eq!(err_frame.header.stream_id, StreamId(42));
+        assert!(matches!(
+            err_frame.decode_message().unwrap(),
+            Message::CopyError { .. }
+        ));
+
+        // 4. CopyInStart rejects `..`, absolute path, symlink, hardlink, FIFO, and max_bytes overflow.
+        let evil_dst = tmp.path().join("evil-dst");
+        let traversal_tar =
+            make_raw_tar_with_entry("../escape.txt", tar::EntryType::Regular, b"pwn", None);
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(43),
+                &evil_dst.to_string_lossy(),
+                65_536,
+                &traversal_tar,
+                65_536,
+            ),
+            Message::CopyError { .. }
+        ));
+        assert!(!tmp.path().join("escape.txt").exists());
+
+        let abs_tar =
+            make_raw_tar_with_entry("/etc/shadow_test", tar::EntryType::Regular, b"pwn", None);
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(44),
+                &evil_dst.to_string_lossy(),
+                65_536,
+                &abs_tar,
+                65_536,
+            ),
+            Message::CopyError { .. }
+        ));
+
+        let symlink_tar =
+            make_raw_tar_with_entry("sym", tar::EntryType::Symlink, &[], Some("/etc/passwd"));
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(45),
+                &evil_dst.to_string_lossy(),
+                65_536,
+                &symlink_tar,
+                65_536,
+            ),
+            Message::CopyError { .. }
+        ));
+
+        let hardlink_tar =
+            make_raw_tar_with_entry("hard", tar::EntryType::Link, &[], Some("target"));
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(46),
+                &evil_dst.to_string_lossy(),
+                65_536,
+                &hardlink_tar,
+                65_536,
+            ),
+            Message::CopyError { .. }
+        ));
+
+        let fifo_tar = make_raw_tar_with_entry("pipe", tar::EntryType::Fifo, &[], None);
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(47),
+                &evil_dst.to_string_lossy(),
+                65_536,
+                &fifo_tar,
+                65_536,
+            ),
+            Message::CopyError { .. }
+        ));
+
+        // 5. CopyInStart rejects max_bytes overflow, relative paths, and '..' dst_guest cleanly.
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(48),
+                &evil_dst.to_string_lossy(),
+                512,
+                &tar_out,
+                1024,
+            ),
+            Message::CopyError { .. }
+        ));
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(49),
+                "relative/dst",
+                65_536,
+                &make_raw_tar_with_entry("ok.txt", tar::EntryType::Regular, b"hi", None),
+                65_536,
+            ),
+            Message::CopyError { .. }
+        ));
+
+        // 6. Single-file CopyOutStart packs basename cleanly.
+        let single_file = src_dir.join("hello.txt");
+        send_message(
+            &mut host_tx,
+            StreamId(50),
+            &Message::CopyOutStart {
+                src_guest: single_file.to_string_lossy().into_owned(),
+                max_bytes: 65_536,
+            },
+        )
+        .unwrap();
+        let mut single_tar = Vec::new();
+        loop {
+            let f = read_frame(&mut host_rx).unwrap();
+            match f.decode_message().unwrap() {
+                Message::StreamData { data, .. } => single_tar.extend_from_slice(&data),
+                Message::CopyDone { .. } => break,
+                other => panic!("unexpected single-file copy_out frame: {other:?}"),
+            }
+        }
+        let single_dst = tmp.path().join("single-dst");
+        assert!(matches!(
+            send_copy_in(
+                &mut host_tx,
+                &mut host_rx,
+                StreamId(51),
+                &single_dst.to_string_lossy(),
+                65_536,
+                &single_tar,
+                65_536,
+            ),
+            Message::CopyDone { .. }
+        ));
+        assert_eq!(fs::read(single_dst.join("hello.txt")).unwrap(), b"hello-tar-world");
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_copy_tar_rejects_existing_symlink_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestTempDir::new("unix-symlink");
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let sym_link = root.join("link");
+        symlink(&outside, &sym_link).unwrap();
+
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        let good_tar =
+            make_raw_tar_with_entry("pwned.txt", tar::EntryType::Regular, b"nope", None);
+        let reply_in = send_copy_in(
+            &mut host_tx,
+            &mut host_rx,
+            StreamId(50),
+            &sym_link.join("sub").to_string_lossy(),
+            65_536,
+            &good_tar,
+            65_536,
+        );
+        assert!(matches!(reply_in, Message::CopyError { .. }));
+        assert!(!outside.join("sub").exists());
+
+        send_message(
+            &mut host_tx,
+            StreamId(51),
+            &Message::CopyOutStart {
+                src_guest: root.to_string_lossy().into_owned(),
+                max_bytes: 65_536,
+            },
+        )
+        .unwrap();
+        let err_frame = read_frame(&mut host_rx).unwrap();
+        assert!(matches!(
+            err_frame.decode_message().unwrap(),
+            Message::CopyError { .. }
+        ));
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn exec_stderr_budget_overflow_truncates_and_kills() {
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        #[cfg(windows)]
+        let script = "for /L %i in (1,1,500) do @echo err0123456789abcdef0123456789 1>&2";
+        #[cfg(unix)]
+        let script = "i=0; while [ $i -lt 500 ]; do printf 'err0123456789abcdef0123456789\\n' >&2; i=$((i+1)); done";
+
+        send_message(
+            &mut host_tx,
+            StreamId(14),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: shell_cmd(script),
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 15_000,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 64,
+            },
+        )
+        .unwrap();
+
+        let (_stdout_bytes, stderr_bytes, stdout_eof, stderr_eof, exit_msg) =
+            collect_exec_response(&mut host_rx, StreamId(14));
+        assert!(stdout_eof && stderr_eof);
+        assert_eq!(stderr_bytes.len(), 64);
+        assert_eq!(
+            exit_msg,
+            Message::ExecExit {
+                code: None,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: true,
+            }
+        );
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn outbound_queue_preempts_data_with_control_and_holds_exec_exit_until_drained() {
+        let outbound = OutboundQueue::new();
+        outbound
+            .send_stream_data(StreamId(1), StreamChannel::Stdout, b"chunk-1")
+            .unwrap();
+        outbound.send_stream_eof(StreamId(1), StreamChannel::Stdout).unwrap();
+        outbound
+            .push_message(StreamId(0), &Message::Pong { seq: 99 })
+            .unwrap();
+
+        let outbound_bg = Arc::new(outbound);
+        let outbound_waiter = outbound_bg.clone();
+        let exit_enqueuer = thread::spawn(move || {
+            outbound_waiter
+                .enqueue_exec_exit_after_data(
+                    StreamId(1),
+                    &Message::ExecExit {
+                        code: Some(0),
+                        timed_out: false,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    },
+                )
+                .unwrap();
+        });
+
+        // 1. Control Pong must dequeue before Data frames.
+        let first = outbound_bg.pop_for_writer().unwrap();
+        assert_eq!(first.decode_message().unwrap(), Message::Pong { seq: 99 });
+
+        // 2. Drain Data frames for StreamId(1); ExecExit cannot overtake them.
+        let d1 = outbound_bg.pop_for_writer().unwrap();
+        assert!(matches!(
+            d1.decode_message().unwrap(),
+            Message::StreamData { eof: false, .. }
+        ));
+        let d2 = outbound_bg.pop_for_writer().unwrap();
+        assert!(matches!(
+            d2.decode_message().unwrap(),
+            Message::StreamData { eof: true, .. }
+        ));
+
+        // 3. Only after Data frames drained does ExecExit arrive.
+        exit_enqueuer.join().unwrap();
+        let exit = outbound_bg.pop_for_writer().unwrap();
+        assert!(matches!(exit.decode_message().unwrap(), Message::ExecExit { .. }));
+        outbound_bg.finish_and_drain();
+        assert!(outbound_bg.pop_for_writer().is_none());
     }
 }
