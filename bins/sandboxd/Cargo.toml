@@ -1,0 +1,14 @@
+[package]
+name = "sandboxd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sandbox-core = { workspace = true }
+sandbox-protocol = { workspace = true }
+sandbox-runtime = { workspace = true }
+sandbox-vmm = { workspace = true }
+sandbox-image = { workspace = true }
+sandbox-docker-compat = { workspace = true }

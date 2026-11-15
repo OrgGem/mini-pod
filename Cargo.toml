@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sandbox-core",
+    "crates/sandbox-protocol",
+    "crates/sandbox-runtime",
+    "crates/sandbox-vmm",
+    "crates/sandbox-image",
+    "crates/sandbox-docker-compat",
+    "crates/sandbox-client",
+    "bins/sandboxd",
+    "bins/sandbox-cli",
+    "guest/tiny-init",
+    "guest/sandbox-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+sandbox-core = { path = "crates/sandbox-core" }
+sandbox-protocol = { path = "crates/sandbox-protocol" }
+sandbox-runtime = { path = "crates/sandbox-runtime" }
+sandbox-vmm = { path = "crates/sandbox-vmm" }
+sandbox-image = { path = "crates/sandbox-image" }
+sandbox-docker-compat = { path = "crates/sandbox-docker-compat" }
+sandbox-client = { path = "crates/sandbox-client" }
+async-trait = "0.1"
+
+[profile.guest-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

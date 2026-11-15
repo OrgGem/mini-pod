@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+
+# VM, runtime, and spike artifacts
+*.qcow2
+*.raw
+*.img
+*.iso
+*.vmdk
+*.fd
+*.pid
+*.sock
+*.journal
+
+# Secrets and local environment
+*.pem
+*.key
+.env
+.env.*
+
+# OS and editor junk
+.DS_Store
+Thumbs.db

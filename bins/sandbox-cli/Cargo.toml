@@ -1,0 +1,10 @@
+[package]
+name = "sandbox-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sandbox-core = { workspace = true }
+sandbox-client = { workspace = true }
