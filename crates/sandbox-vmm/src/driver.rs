@@ -360,7 +360,11 @@ fn boot_single_attempt(
             cpu_quota: proc_caps.cpu_quota,
             host_rss: proc_caps.host_rss,
             host_storage: EnforcementLevel::BestEffort,
-            egress_filter: EnforcementLevel::HardLimit,
+            egress_filter: if matches!(boot_cfg.spec.network, NetworkPolicy::Unrestricted) {
+                EnforcementLevel::Unsupported
+            } else {
+                EnforcementLevel::HardLimit
+            },
         },
         egress_rx,
     })

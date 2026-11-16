@@ -614,8 +614,7 @@ pub fn kill_verified_orphan_process(
 
     #[cfg(not(target_os = "linux"))]
     {
-        // shortcut: macOS/non-procfs Unix lacks /proc/<pid>/stat starttime; accepts only the
-        // documented start_token=0 fallback until Darwin proc_pidinfo/sysctl verification is added
+        // shortcut: macOS/non-procfs Unix lacks /proc/<pid>/stat starttime (accepts start_token=0 fallback), add Darwin proc_pidinfo/sysctl verification if non-Linux hosts run persistent daemon reconcilers
         if expected_start_token != 0 {
             return Ok(false);
         }

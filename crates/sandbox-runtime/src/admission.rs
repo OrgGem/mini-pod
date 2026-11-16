@@ -345,7 +345,9 @@ impl AdmissionController {
             (ticket_id, waiter, guard)
         };
 
-        let deadline = Instant::now() + self.inner.limits.admission_queue_timeout;
+        let deadline = Instant::now()
+            .checked_add(self.inner.limits.admission_queue_timeout)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
         loop {
             let (notified, reject_reason) = {
                 let mut state = lock_unpoisoned(&self.inner.state);

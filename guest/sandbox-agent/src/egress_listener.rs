@@ -318,25 +318,26 @@ fn spawn_egress_connection(
 
     let relay_outbound = Arc::clone(outbound);
     let relay_tunnels = Arc::clone(active_tunnels);
-    thread::Builder::new()
+    let relay_handle = Arc::clone(&handle);
+    match thread::Builder::new()
         .name(format!("minipod-egress-{}", guest_sid.0))
         .spawn(move || {
             let ack = connect_rx.recv_timeout(EGRESS_OPEN_ACK_TIMEOUT);
             let res = match ack {
-                Ok(Ok(())) if !handle.is_closed() => relay_tunnel_socket(
+                Ok(Ok(())) if !relay_handle.is_closed() => relay_tunnel_socket(
                     guest_sid,
                     TunnelSocket::Tcp(stream),
                     TunnelSocket::Tcp(writer_sock),
-                    &handle,
+                    &relay_handle,
                     stdin_rx,
                     &relay_outbound,
                 ),
                 Ok(Ok(())) | Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    handle.close(&relay_outbound);
+                    relay_handle.close(&relay_outbound);
                     Ok(())
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    handle.close(&relay_outbound);
+                    relay_handle.close(&relay_outbound);
                     let _ = relay_outbound.push_message(guest_sid, &Message::StreamClose);
                     Ok(())
                 }
@@ -346,13 +347,24 @@ fn spawn_egress_connection(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&guest_sid);
-            handle.close_stdin_only();
+            relay_handle.close_stdin_only();
 
             if let Err(err) = res {
                 eprintln!("[sandbox-agent] egress stream {guest_sid} transport error: {err}");
             }
-        })
-        .ok()
+        }) {
+        Ok(thread_handle) => Some(thread_handle),
+        Err(err) => {
+            eprintln!("[sandbox-agent] failed to spawn egress relay thread {guest_sid}: {err}");
+            active_tunnels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&guest_sid);
+            handle.close(outbound);
+            let _ = outbound.push_message(guest_sid, &Message::StreamClose);
+            None
+        }
+    }
 }
 
 fn allocate_guest_stream_id(next_seq: &AtomicU32) -> Option<StreamId> {

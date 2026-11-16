@@ -1007,8 +1007,8 @@ mod tests {
         assert!(env_custom.contains(&"FOO=bar"));
         assert!(env_custom.contains(&"HTTP_PROXY=http://custom:8080"));
         assert!(env_custom.contains(&"no_proxy=corp.local"));
-        assert!(!env_custom.iter().any(|e| *e == "HTTP_PROXY=http://10.88.0.1:3128"));
-        assert!(!env_custom.iter().any(|e| *e == "no_proxy=localhost,127.0.0.1,::1,10.88.0.1"));
+        assert!(!env_custom.contains(&"HTTP_PROXY=http://10.88.0.1:3128"));
+        assert!(!env_custom.contains(&"no_proxy=localhost,127.0.0.1,::1,10.88.0.1"));
         assert!(env_custom.contains(&"HTTPS_PROXY=http://10.88.0.1:3128"));
         assert!(env_custom.contains(&"NO_PROXY=localhost,127.0.0.1,::1,10.88.0.1"));
 

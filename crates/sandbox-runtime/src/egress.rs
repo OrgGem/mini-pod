@@ -706,7 +706,7 @@ impl HostEgressProxy {
             break head;
         };
 
-        if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+        if (300..=399).contains(&resp.status) {
             if let Err(err) = self
                 .validate_redirect_headers(&resp.headers, &parsed_target.host, parsed_target.port)
                 .await
@@ -835,6 +835,12 @@ enum BodyMode {
     ContentLength(u64),
     Chunked,
     UntilEof,
+}
+
+#[derive(Debug)]
+struct ParsedHttpHeaders {
+    headers: Vec<(String, String)>,
+    body_mode: BodyMode,
 }
 
 #[derive(Debug)]
@@ -1055,7 +1061,7 @@ fn split_crlf_lines(raw: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
 fn parse_http_headers(
     header_lines: &[&[u8]],
     default_until_eof: bool,
-) -> Result<(Vec<(String, String)>, BodyMode), &'static str> {
+) -> Result<ParsedHttpHeaders, &'static str> {
     if header_lines.len() > MAX_HEADER_COUNT {
         return Err("too many HTTP headers");
     }
@@ -1117,7 +1123,7 @@ fn parse_http_headers(
         BodyMode::Empty
     };
 
-    Ok((headers, body_mode))
+    Ok(ParsedHttpHeaders { headers, body_mode })
 }
 
 fn parse_http_request_head(raw: &[u8]) -> Result<HttpRequestHead, &'static str> {
@@ -1141,12 +1147,12 @@ fn parse_http_request_head(raw: &[u8]) -> Result<HttpRequestHead, &'static str> 
         return Err("unsupported HTTP version");
     }
 
-    let (headers, body_mode) = parse_http_headers(header_lines, false)?;
+    let parsed = parse_http_headers(header_lines, false)?;
     Ok(HttpRequestHead {
         method: method.to_owned(),
         raw_target: raw_target.to_owned(),
-        headers,
-        body_mode,
+        headers: parsed.headers,
+        body_mode: parsed.body_mode,
     })
 }
 
@@ -1178,13 +1184,13 @@ fn parse_http_response_head(raw: &[u8]) -> Result<HttpResponseHead, &'static str
         return Err("invalid control character in reason phrase");
     }
 
-    let (headers, body_mode) = parse_http_headers(header_lines, true)?;
+    let parsed = parse_http_headers(header_lines, true)?;
     Ok(HttpResponseHead {
         version: version.to_owned(),
         status,
         reason: reason.to_owned(),
-        headers,
-        body_mode,
+        headers: parsed.headers,
+        body_mode: parsed.body_mode,
     })
 }
 
@@ -2017,7 +2023,9 @@ mod tests {
             Ok(vec![pub_ip]),
             // req 6 -> api.example.com -> pub_ip (302 to //127.0.0.1/secret)
             Ok(vec![pub_ip]),
-            // req 7 -> api.example.com -> pub_ip (302 to legitimate https://cdn.example.com/ok -> pub_ip:443)
+            // req 7 -> api.example.com -> pub_ip (300 Multiple Choices to http://10.0.0.1/)
+            Ok(vec![pub_ip]),
+            // req 8 -> api.example.com -> pub_ip (302 to legitimate https://cdn.example.com/ok -> pub_ip:443)
             Ok(vec![pub_ip]),
             Ok(vec!["93.184.216.34:443".parse().unwrap()]),
         ]);
@@ -2034,6 +2042,8 @@ mod tests {
             b"HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nContent-Length: 0\r\n\r\n"
                 .to_vec(),
             b"HTTP/1.1 302 Found\r\nLocation: //127.0.0.1/secret\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 300 Multiple Choices\r\nLocation: http://10.0.0.1/\r\nContent-Length: 0\r\n\r\n"
                 .to_vec(),
             b"HTTP/1.1 302 Found\r\nLocation: https://cdn.example.com/ok\r\nContent-Length: 0\r\n\r\n"
                 .to_vec(),
@@ -2054,7 +2064,7 @@ mod tests {
         let proxy = HostEgressProxy::new(policy, dns.clone(), dialer.clone());
         let req = b"GET http://api.example.com/start HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
 
-        for case in 1..=6 {
+        for case in 1..=7 {
             let resp = run_proxy_once(&proxy, req).await;
             let text = String::from_utf8_lossy(&resp);
             assert!(
