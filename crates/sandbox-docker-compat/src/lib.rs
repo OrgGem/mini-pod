@@ -21,6 +21,8 @@ pub use policy::{
 };
 pub use ports::{ActivePortForward, PortForwardRegistry};
 pub use rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json, RewriteError};
+#[cfg(windows)]
+pub use server::NamedPipeServerHandle;
 #[cfg(unix)]
 pub use server::UnixServerHandle;
-pub use server::{DockerCompatServer, HttpServerHandle};
+pub use server::DockerCompatServer;

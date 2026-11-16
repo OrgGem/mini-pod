@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,7 +28,6 @@ use sandbox_vmm::{
 use sandboxd::server::{serve_endpoint_with_shutdown, DaemonState};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
 static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -645,28 +643,63 @@ async fn wait_for_daemon_status(
     }
 }
 
-async fn http_get_ping(docker_uri: &str) -> String {
-    let host_port = docker_uri
-        .strip_prefix("http://")
-        .expect("docker_uri must start with http://");
-    let addr: SocketAddr = host_port
-        .parse()
-        .expect("docker_uri must bind loopback ip:port");
-    assert!(addr.ip().is_loopback(), "docker_uri must bind loopback");
-
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .expect("connect to Docker compat loopback HTTP endpoint");
-    stream
-        .write_all(b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .expect("write /_ping request");
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .await
-        .expect("read /_ping response");
-    String::from_utf8_lossy(&buf).into_owned()
+async fn ipc_get_ping(docker_uri: &str) -> String {
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe_name = docker_uri
+            .strip_prefix("npipe:////./pipe/")
+            .expect("docker_uri on Windows must start with npipe:////./pipe/");
+        let pipe_path = format!(r"\\.\pipe\{pipe_name}");
+        let mut stream = {
+            let mut opened = None;
+            for attempt in 0..=20 {
+                match ClientOptions::new()
+                    .security_qos_flags(0x0001_0000)
+                    .open(&pipe_path)
+                {
+                    Ok(client) => {
+                        opened = Some(client);
+                        break;
+                    }
+                    Err(err) if err.raw_os_error() == Some(231) && attempt < 20 => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(err) => panic!("connect to Docker Named Pipe '{pipe_path}': {err}"),
+                }
+            }
+            opened.expect("timed out waiting for busy Docker Named Pipe")
+        };
+        stream
+            .write_all(b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write /_ping request over Named Pipe");
+        let mut buf = Vec::new();
+        stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read /_ping response over Named Pipe");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+    #[cfg(unix)]
+    {
+        let sock_path = docker_uri
+            .strip_prefix("unix://")
+            .expect("docker_uri on Unix must start with unix://");
+        let mut stream = tokio::net::UnixStream::connect(sock_path)
+            .await
+            .expect("connect to Docker Unix socket endpoint");
+        stream
+            .write_all(b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write /_ping request over Unix socket");
+        let mut buf = Vec::new();
+        stream
+            .read_to_end(&mut buf)
+            .await
+            .expect("read /_ping response over Unix socket");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 }
 
 fn run_mcp_stdio_session(ep_uri: &str, mcp_log_path: &Path) {
@@ -987,11 +1020,28 @@ async fn e2e_rc_daemon_sdk_cli_mcp_and_incident_recovery_drill() {
         .enable_docker_compat(&lease1.id, false)
         .await
         .expect("enable_docker_compat");
-    assert!(
-        docker_uri.starts_with("http://127.0.0.1:"),
-        "expected loopback Docker compat URI, got {docker_uri}"
-    );
-    let ping_resp = http_get_ping(&docker_uri).await;
+    #[cfg(windows)]
+    {
+        let pipe_name = docker_uri.strip_prefix("npipe:////./pipe/").unwrap_or_else(|| {
+            panic!("expected owner-only Named Pipe Docker URI, got {docker_uri}")
+        });
+        assert!(
+            pipe_name.starts_with("minipod-docker-"),
+            "unexpected Docker Named Pipe leaf '{pipe_name}'"
+        );
+        sandbox_vmm::verify_non_owner_named_pipe_denied(pipe_name).expect(
+            "NT kernel must deny non-owner restricted token access to enable_docker_compat Named Pipe",
+        );
+    }
+    #[cfg(unix)]
+    {
+        let sock_str = docker_uri
+            .strip_prefix("unix://")
+            .unwrap_or_else(|| panic!("expected owner-only Unix socket Docker URI, got {docker_uri}"));
+        sandbox_vmm::verify_non_owner_unix_socket_denied(Path::new(sock_str), 65534, 65534)
+            .expect("Unix enable_docker_compat socket must enforce 0700/0600 owner-only access");
+    }
+    let ping_resp = ipc_get_ping(&docker_uri).await;
     assert!(
         ping_resp.starts_with("HTTP/1.1 200 OK"),
         "expected /_ping 200 OK, got: {ping_resp:?}"

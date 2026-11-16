@@ -4,11 +4,11 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::Path;
 #[cfg(any(unix, test))]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_client::{
@@ -16,9 +16,11 @@ use sandbox_client::{
     DaemonStatusInfo, ExecWireClientMsg, ExecWireEvent, WireError,
 };
 use sandbox_core::{DestroyStatus, NetworkPolicy, SandboxError, SandboxId};
-use sandbox_docker_compat::{
-    DockerCompatPolicy, DockerCompatServer, HttpServerHandle, ReaperSocketPolicy,
-};
+#[cfg(windows)]
+use sandbox_docker_compat::NamedPipeServerHandle;
+#[cfg(unix)]
+use sandbox_docker_compat::UnixServerHandle;
+use sandbox_docker_compat::{DockerCompatPolicy, DockerCompatServer, ReaperSocketPolicy};
 use sandbox_image::{verify_installed_bundle, BundleOverlayStore, HelperCommandOutput};
 use sandbox_runtime::{
     ExecStream, LocalRuntimeManager, OutputStreamKind, RuntimeManager, SandboxTunnelPort,
@@ -29,7 +31,7 @@ use sandbox_vmm::{
 };
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::ServeConfig;
@@ -37,29 +39,61 @@ use crate::config::ServeConfig;
 const CONTAINER_EGRESS_PROXY_URL: &str = "http://10.88.0.1:3128";
 const EXEC_CLIENT_MSG_QUEUE_DEPTH: usize = 32;
 
+static NEXT_DOCKER_COMPAT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+enum DockerListenerHandle {
+    #[cfg(windows)]
+    NamedPipe(NamedPipeServerHandle),
+    #[cfg(unix)]
+    Unix(UnixServerHandle),
+}
+
+impl DockerListenerHandle {
+    async fn shutdown(self) {
+        match self {
+            #[cfg(windows)]
+            Self::NamedPipe(handle) => handle.shutdown().await,
+            #[cfg(unix)]
+            Self::Unix(handle) => handle.shutdown().await,
+        }
+    }
+}
+
 struct CachedDockerCompat {
     allow_reaper_socket: bool,
     uri: String,
     #[cfg(test)]
     proxy_url: Option<String>,
-    handle: HttpServerHandle,
+    compat: Arc<DockerCompatServer>,
+    handle: Option<DockerListenerHandle>,
+}
+
+impl CachedDockerCompat {
+    async fn shutdown(mut self) {
+        self.compat.registry().release_all();
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown().await;
+        }
+    }
+}
+
+impl Drop for CachedDockerCompat {
+    fn drop(&mut self) {
+        self.compat.registry().release_all();
+    }
 }
 
 /// Shared runtime and Docker compatibility state served by `sandboxd`.
 pub struct DaemonState {
     runtime: Arc<LocalRuntimeManager>,
-    docker_compat: AsyncMutex<HashMap<SandboxId, CachedDockerCompat>>,
+    docker_compat: Arc<Mutex<HashMap<SandboxId, CachedDockerCompat>>>,
     shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl DaemonState {
     /// Wraps an initialized [`LocalRuntimeManager`] in [`DaemonState`].
     pub fn new(runtime: Arc<LocalRuntimeManager>) -> Self {
-        Self {
-            runtime,
-            docker_compat: AsyncMutex::new(HashMap::new()),
-            shutdown_tx: None,
-        }
+        Self::build_inner(runtime, None)
     }
 
     /// Wraps an initialized [`LocalRuntimeManager`] with a daemon shutdown signal sender.
@@ -67,10 +101,32 @@ impl DaemonState {
         runtime: Arc<LocalRuntimeManager>,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
+        Self::build_inner(runtime, Some(shutdown_tx))
+    }
+
+    fn build_inner(
+        runtime: Arc<LocalRuntimeManager>,
+        shutdown_tx: Option<watch::Sender<bool>>,
+    ) -> Self {
+        let docker_compat = Arc::new(Mutex::new(HashMap::<SandboxId, CachedDockerCompat>::new()));
+        let listener_map = Arc::clone(&docker_compat);
+        runtime.register_destroy_listener(move |sandbox_id| {
+            let removed = listener_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(sandbox_id);
+            if let Some(entry) = removed {
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn(async move {
+                        entry.shutdown().await;
+                    });
+                }
+            }
+        });
         Self {
             runtime,
-            docker_compat: AsyncMutex::new(HashMap::new()),
-            shutdown_tx: Some(shutdown_tx),
+            docker_compat,
+            shutdown_tx,
         }
     }
 
@@ -86,7 +142,8 @@ impl DaemonState {
         daemon_status_info(&self.runtime)
     }
 
-    /// Lazily binds (or returns the cached) loopback HTTP Docker compatibility listener for `id`.
+    /// Lazily binds (or returns the cached) owner-only local IPC Docker compatibility listener
+    /// (`npipe://` with owner-only DACL on Windows; `unix://` `0600` in `0700` dir on Unix).
     pub async fn enable_docker_compat(
         &self,
         id: &SandboxId,
@@ -94,15 +151,20 @@ impl DaemonState {
     ) -> Result<String, SandboxError> {
         let network = self.runtime.active_sandbox_network(id)?;
 
-        let mut map = self.docker_compat.lock().await;
-        if let Some(existing) = map.get(id) {
-            if existing.allow_reaper_socket == allow_reaper_socket {
-                return Ok(existing.uri.clone());
+        let previous = {
+            let mut map = self
+                .docker_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = map.get(id) {
+                if existing.allow_reaper_socket == allow_reaper_socket {
+                    return Ok(existing.uri.clone());
+                }
             }
-        }
-
-        if let Some(previous) = map.remove(id) {
-            previous.handle.shutdown().await;
+            map.remove(id)
+        };
+        if let Some(prev) = previous {
+            prev.shutdown().await;
         }
 
         let container_proxy_http_url = match network {
@@ -125,32 +187,52 @@ impl DaemonState {
                 container_proxy_http_url: container_proxy_http_url.clone(),
             },
         ));
-        let handle = compat
-            .bind_loopback_http(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await?;
-        let uri = format!("http://{}", handle.local_addr());
+        let (uri, handle) = bind_owner_only_docker_listener(
+            &compat,
+            &self.runtime.config().state_dir,
+        )
+        .await?;
 
-        map.insert(
-            id.clone(),
-            CachedDockerCompat {
-                allow_reaper_socket,
-                uri: uri.clone(),
-                #[cfg(test)]
-                proxy_url: container_proxy_http_url,
-                handle,
-            },
-        );
+        // Re-check liveness so a concurrent destroy during listener bind never leaks an orphan entry.
+        if let Err(err) = self.runtime.active_sandbox_network(id) {
+            compat.registry().release_all();
+            handle.shutdown().await;
+            return Err(err);
+        }
+
+        let displaced = {
+            let mut map = self
+                .docker_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(
+                id.clone(),
+                CachedDockerCompat {
+                    allow_reaper_socket,
+                    uri: uri.clone(),
+                    #[cfg(test)]
+                    proxy_url: container_proxy_http_url,
+                    compat,
+                    handle: Some(handle),
+                },
+            )
+        };
+        if let Some(old) = displaced {
+            old.shutdown().await;
+        }
+
         Ok(uri)
     }
 
     /// Tears down any cached Docker compatibility server for `id` and idempotently destroys `id`.
     pub async fn destroy_sandbox(&self, id: &SandboxId) -> Result<DestroyStatus, SandboxError> {
-        let removed = {
-            let mut map = self.docker_compat.lock().await;
-            map.remove(id)
-        };
+        let removed = self
+            .docker_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
         if let Some(entry) = removed {
-            entry.handle.shutdown().await;
+            entry.shutdown().await;
         }
         self.runtime.destroy(id).await
     }
@@ -159,11 +241,14 @@ impl DaemonState {
     /// all remaining active sandboxes.
     pub async fn shutdown_all(&self) {
         let handles: Vec<CachedDockerCompat> = {
-            let mut map = self.docker_compat.lock().await;
+            let mut map = self
+                .docker_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.drain().map(|(_, entry)| entry).collect()
         };
         for entry in handles {
-            entry.handle.shutdown().await;
+            entry.shutdown().await;
         }
 
         if let Err(err) = self.runtime.drain_warm_pool().await {
@@ -176,6 +261,48 @@ impl DaemonState {
             }
         }
     }
+}
+
+#[cfg(windows)]
+async fn bind_owner_only_docker_listener(
+    compat: &Arc<DockerCompatServer>,
+    _state_dir: &Path,
+) -> Result<(String, DockerListenerHandle), SandboxError> {
+    let seq = NEXT_DOCKER_COMPAT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pipe_name = format!("minipod-docker-{}-{seq}", std::process::id());
+    let handle = compat.bind_named_pipe_with_factory(
+        &pipe_name,
+        sandbox_vmm::create_owner_only_async_named_pipe,
+    )?;
+    let uri = handle.uri().to_owned();
+    Ok((uri, DockerListenerHandle::NamedPipe(handle)))
+}
+
+#[cfg(unix)]
+async fn bind_owner_only_docker_listener(
+    compat: &Arc<DockerCompatServer>,
+    state_dir: &Path,
+) -> Result<(String, DockerListenerHandle), SandboxError> {
+    use std::os::unix::fs::MetadataExt;
+    use sandbox_vmm::validate_socket_path;
+
+    let seq = NEXT_DOCKER_COMPAT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let state_candidate = state_dir.join("dck").join(format!("d-{seq}.sock"));
+    let sock_path = if validate_socket_path(&state_candidate).is_ok() {
+        state_candidate
+    } else {
+        let uid = fs::metadata("/proc/self")
+            .or_else(|_| fs::symlink_metadata(state_dir))
+            .map(|m| m.uid())
+            .unwrap_or(0);
+        PathBuf::from("/tmp")
+            .join(format!("mpd-{uid}-{}", std::process::id()))
+            .join(format!("d-{seq}.sock"))
+    };
+    validate_socket_path(&sock_path)?;
+    let handle = compat.bind_unix_owner_only(&sock_path).await?;
+    let uri = format!("unix://{}", handle.socket_path().display());
+    Ok((uri, DockerListenerHandle::Unix(handle)))
 }
 
 /// Computes a [`DaemonStatusInfo`] snapshot from a [`LocalRuntimeManager`].
@@ -1270,13 +1397,22 @@ mod tests {
         assert_eq!(extracted, b"payload-123".len() as u64);
         assert_eq!(fs::read(download_dir.join("data.txt")).unwrap(), b"payload-123");
 
-        // EnableDockerCompat binds loopback endpoint, caches same policy, and cleans up on destroy.
+        // EnableDockerCompat binds owner-only IPC endpoint, caches same policy, and cleans up on destroy.
         let docker_uri_1 = client.enable_docker_compat(&lease.id, false).await.unwrap();
-        assert!(docker_uri_1.starts_with("http://127.0.0.1:"));
+        #[cfg(windows)]
+        assert!(
+            docker_uri_1.starts_with("npipe:////./pipe/minipod-docker-"),
+            "unexpected Windows Docker IPC URI: {docker_uri_1}"
+        );
+        #[cfg(unix)]
+        assert!(
+            docker_uri_1.starts_with("unix:///"),
+            "unexpected Unix Docker IPC URI: {docker_uri_1}"
+        );
         let docker_uri_2 = client.enable_docker_compat(&lease.id, false).await.unwrap();
         assert_eq!(docker_uri_1, docker_uri_2);
         {
-            let map = state.docker_compat.lock().await;
+            let map = state.docker_compat.lock().unwrap();
             let entry = map.get(&lease.id).unwrap();
             assert_eq!(entry.proxy_url.as_deref(), Some(CONTAINER_EGRESS_PROXY_URL));
         }
@@ -1288,7 +1424,7 @@ mod tests {
             .unwrap();
         let _iso_uri = client.enable_docker_compat(&iso_lease.id, true).await.unwrap();
         {
-            let map = state.docker_compat.lock().await;
+            let map = state.docker_compat.lock().unwrap();
             assert_eq!(map.get(&iso_lease.id).unwrap().proxy_url, None);
         }
         client.destroy(&iso_lease.id).await.unwrap();
@@ -1296,7 +1432,7 @@ mod tests {
         let destroyed = client.destroy(&lease.id).await.unwrap();
         assert_eq!(destroyed, DestroyStatus::AllResourcesCleaned);
         {
-            let map = state.docker_compat.lock().await;
+            let map = state.docker_compat.lock().unwrap();
             assert!(!map.contains_key(&lease.id));
         }
 
@@ -1305,6 +1441,17 @@ mod tests {
             client.enable_docker_compat(&lease.id, false).await,
             Err(SandboxError::NotFound(_))
         ));
+
+        // TTL expiry via RuntimeManager::destroy must also evict cached Docker compat listeners (#16).
+        let mut short_spec = sample_spec(NetworkPolicy::Isolated);
+        short_spec.lease_ttl = Duration::from_millis(30);
+        let ttl_lease = client.spawn(short_spec).await.unwrap();
+        let _ttl_docker_uri = client.enable_docker_compat(&ttl_lease.id, false).await.unwrap();
+        assert!(state.docker_compat.lock().unwrap().contains_key(&ttl_lease.id));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Direct runtime.destroy (the same path invoked by the TTL sweeper) must trigger listener cleanup.
+        state.runtime.destroy(&ttl_lease.id).await.unwrap();
+        assert!(!state.docker_compat.lock().unwrap().contains_key(&ttl_lease.id));
     }
 
     #[tokio::test]

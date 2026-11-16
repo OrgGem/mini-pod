@@ -9,6 +9,39 @@ const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const DOCKER_SOCKET_WIN_PREFIX_PATH: &str = "//var/run/docker.sock";
 const GUEST_PODMAN_SOCKET_PATH: &str = "/run/podman/podman.sock";
 const DEFAULT_CONTAINER_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.88.0.1";
+const MAX_JSON_NESTING_DEPTH: usize = 128;
+
+const KNOWN_ROOT_FIELDS: &[&str] = &["Volumes", "ExposedPorts", "HostConfig", "Env"];
+const KNOWN_HOST_CONFIG_FIELDS: &[&str] = &[
+    "Privileged",
+    "PidMode",
+    "NetworkMode",
+    "IpcMode",
+    "UsernsMode",
+    "UTSMode",
+    "CgroupnsMode",
+    "Binds",
+    "Mounts",
+    "PortBindings",
+    "PublishAllPorts",
+    "CapAdd",
+    "Devices",
+    "DeviceCgroupRules",
+    "SecurityOpt",
+];
+const KNOWN_MOUNT_FIELDS: &[&str] = &[
+    "Type",
+    "Source",
+    "Target",
+    "Destination",
+    "VolumeOptions",
+    "BindOptions",
+    "TmpfsOptions",
+    "ReadOnly",
+];
+const KNOWN_VOLUME_OPTIONS_FIELDS: &[&str] = &["NoCopy", "Labels", "DriverConfig", "Subpath"];
+const KNOWN_DRIVER_CONFIG_FIELDS: &[&str] = &["Name", "Options"];
+const KNOWN_PORT_BINDING_FIELDS: &[&str] = &["HostIp", "HostPort"];
 
 /// Controls whether a container's request to mount `/var/run/docker.sock` (e.g., Testcontainers
 /// Ryuk reaper) is rejected or rewritten to the guest VM's internal Podman Unix socket.
@@ -80,9 +113,11 @@ pub fn sanitize_container_create(
 ) -> Result<SanitizedCreatePlan, PolicyRejection> {
     let mut root: Value = serde_json::from_slice(body)
         .map_err(|err| PolicyRejection::new(format!("invalid container create JSON: {err}")))?;
+    reject_duplicate_json_keys(body)?;
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| PolicyRejection::new("container create body must be a JSON object"))?;
+    canonicalize_struct_keys(root_obj, KNOWN_ROOT_FIELDS, "CreateContainer")?;
 
     if let Some(volumes) = root_obj.get("Volumes") {
         validate_top_level_volumes(volumes)?;
@@ -99,6 +134,7 @@ pub fn sanitize_container_create(
             let hc = host_cfg.as_object_mut().ok_or_else(|| {
                 PolicyRejection::new("HostConfig must be a JSON object when provided")
             })?;
+            canonicalize_struct_keys(hc, KNOWN_HOST_CONFIG_FIELDS, "HostConfig")?;
             validate_host_config_security(hc, policy)?;
             requested_ports = normalize_host_config_ports(hc, &exposed_tcp_ports)?;
         }
@@ -116,6 +152,146 @@ pub fn sanitize_container_create(
         rewritten_body,
         requested_ports,
     })
+}
+
+fn reject_duplicate_json_keys(body: &[u8]) -> Result<(), PolicyRejection> {
+    fn skip_ws(b: &[u8], i: &mut usize) {
+        while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\r' | b'\n') {
+            *i += 1;
+        }
+    }
+
+    fn scan_string_end(b: &[u8], start_quote: usize) -> Result<usize, PolicyRejection> {
+        let mut i = start_quote + 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => return Ok(i + 1),
+                _ => i += 1,
+            }
+        }
+        Err(PolicyRejection::new("unterminated JSON string"))
+    }
+
+    fn scan_value(b: &[u8], i: &mut usize, depth: usize) -> Result<(), PolicyRejection> {
+        if depth > MAX_JSON_NESTING_DEPTH {
+            return Err(PolicyRejection::new("JSON nesting depth exceeded"));
+        }
+        skip_ws(b, i);
+        let Some(&ch) = b.get(*i) else {
+            return Err(PolicyRejection::new("unexpected end of JSON payload"));
+        };
+        match ch {
+            b'{' => {
+                *i += 1;
+                skip_ws(b, i);
+                if b.get(*i) == Some(&b'}') {
+                    *i += 1;
+                    return Ok(());
+                }
+                let mut seen = BTreeSet::new();
+                loop {
+                    skip_ws(b, i);
+                    if b.get(*i) != Some(&b'"') {
+                        return Err(PolicyRejection::new("expected JSON object key string"));
+                    }
+                    let end = scan_string_end(b, *i)?;
+                    let key: String = serde_json::from_slice(&b[*i..end]).map_err(|err| {
+                        PolicyRejection::new(format!("invalid JSON object key: {err}"))
+                    })?;
+                    *i = end;
+                    if !seen.insert(key.clone()) {
+                        return Err(PolicyRejection::new(format!(
+                            "duplicate JSON object key '{key}' is forbidden"
+                        )));
+                    }
+                    skip_ws(b, i);
+                    if b.get(*i) != Some(&b':') {
+                        return Err(PolicyRejection::new("expected ':' after JSON object key"));
+                    }
+                    *i += 1;
+                    scan_value(b, i, depth + 1)?;
+                    skip_ws(b, i);
+                    match b.get(*i) {
+                        Some(b',') => *i += 1,
+                        Some(b'}') => {
+                            *i += 1;
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(PolicyRejection::new(
+                                "expected ',' or '}' in JSON object",
+                            ));
+                        }
+                    }
+                }
+            }
+            b'[' => {
+                *i += 1;
+                skip_ws(b, i);
+                if b.get(*i) == Some(&b']') {
+                    *i += 1;
+                    return Ok(());
+                }
+                loop {
+                    scan_value(b, i, depth + 1)?;
+                    skip_ws(b, i);
+                    match b.get(*i) {
+                        Some(b',') => *i += 1,
+                        Some(b']') => {
+                            *i += 1;
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(PolicyRejection::new(
+                                "expected ',' or ']' in JSON array",
+                            ));
+                        }
+                    }
+                }
+            }
+            b'"' => {
+                *i = scan_string_end(b, *i)?;
+                Ok(())
+            }
+            _ => {
+                while *i < b.len()
+                    && !matches!(b[*i], b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}')
+                {
+                    *i += 1;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut idx = 0usize;
+    scan_value(body, &mut idx, 0)
+}
+
+fn canonicalize_struct_keys(
+    obj: &mut Map<String, Value>,
+    known_fields: &[&str],
+    context: &str,
+) -> Result<(), PolicyRejection> {
+    let mut seen_ci = BTreeSet::new();
+    let entries: Vec<(String, Value)> = std::mem::take(obj).into_iter().collect();
+    for (raw_key, val) in entries {
+        let lower = raw_key.to_ascii_lowercase();
+        if !seen_ci.insert(lower) {
+            return Err(PolicyRejection::new(format!(
+                "ambiguous case-colliding field '{raw_key}' in {context}"
+            )));
+        }
+        let canonical = known_fields
+            .iter()
+            .copied()
+            .find(|candidate| candidate.eq_ignore_ascii_case(&raw_key))
+            .map(str::to_owned)
+            .unwrap_or(raw_key);
+        obj.insert(canonical, val);
+    }
+    Ok(())
 }
 
 fn inject_container_proxy_env(
@@ -257,6 +433,40 @@ fn validate_host_config_security(
         sanitize_mounts(mounts, policy.reaper_socket)?;
     }
 
+    for list_field in ["Devices", "DeviceCgroupRules", "CapAdd"] {
+        if let Some(val) = hc.get(list_field) {
+            if !val.is_null() {
+                let arr = val.as_array().ok_or_else(|| {
+                    PolicyRejection::new(format!("HostConfig.{list_field} must be a JSON array"))
+                })?;
+                if !arr.is_empty() {
+                    return Err(PolicyRejection::new(format!(
+                        "HostConfig.{list_field} is forbidden inside sandbox isolation"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(sec_opt) = hc.get("SecurityOpt") {
+        if !sec_opt.is_null() {
+            let arr = sec_opt.as_array().ok_or_else(|| {
+                PolicyRejection::new("HostConfig.SecurityOpt must be a JSON array")
+            })?;
+            for entry in arr {
+                let opt = entry.as_str().ok_or_else(|| {
+                    PolicyRejection::new("HostConfig.SecurityOpt entries must be strings")
+                })?;
+                let lower = opt.to_ascii_lowercase();
+                if lower.contains("unconfined") || lower.contains("disable") {
+                    return Err(PolicyRejection::new(format!(
+                        "HostConfig.SecurityOpt '{opt}' is forbidden inside sandbox isolation"
+                    )));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -328,6 +538,20 @@ fn sanitize_mounts(
         let obj = item
             .as_object_mut()
             .ok_or_else(|| PolicyRejection::new("HostConfig.Mounts entries must be JSON objects"))?;
+        canonicalize_struct_keys(obj, KNOWN_MOUNT_FIELDS, "HostConfig.Mounts[]")?;
+        if let Some(dest) = obj.remove("Destination") {
+            match obj.get("Target") {
+                None | Some(Value::Null) => {
+                    obj.insert("Target".to_owned(), dest);
+                }
+                Some(existing) if existing == &dest => {}
+                Some(_) => {
+                    return Err(PolicyRejection::new(
+                        "conflicting Target and Destination in HostConfig.Mounts entry",
+                    ));
+                }
+            }
+        }
         let mount_type = obj
             .get("Type")
             .and_then(Value::as_str)
@@ -404,7 +628,7 @@ fn sanitize_tmpfs_mount(obj: &Map<String, Value>) -> Result<(), PolicyRejection>
     Ok(())
 }
 
-fn sanitize_volume_mount(obj: &Map<String, Value>) -> Result<(), PolicyRejection> {
+fn sanitize_volume_mount(obj: &mut Map<String, Value>) -> Result<(), PolicyRejection> {
     let target = obj
         .get("Target")
         .and_then(Value::as_str)
@@ -428,16 +652,29 @@ fn sanitize_volume_mount(obj: &Map<String, Value>) -> Result<(), PolicyRejection
         }
     }
 
-    if let Some(vol_opts) = obj.get("VolumeOptions") {
+    if let Some(vol_opts) = obj.get_mut("VolumeOptions") {
         if !vol_opts.is_null() {
-            let opts_obj = vol_opts.as_object().ok_or_else(|| {
+            let opts_obj = vol_opts.as_object_mut().ok_or_else(|| {
                 PolicyRejection::new("VolumeOptions must be a JSON object")
             })?;
-            if let Some(driver_cfg) = opts_obj.get("DriverConfig") {
+            canonicalize_struct_keys(opts_obj, KNOWN_VOLUME_OPTIONS_FIELDS, "VolumeOptions")?;
+            if let Some(subpath) = opts_obj.get("Subpath").and_then(Value::as_str) {
+                if subpath.contains("..") || subpath.starts_with('/') || subpath.contains('\\') {
+                    return Err(PolicyRejection::new(format!(
+                        "unsafe VolumeOptions.Subpath '{subpath}' is forbidden"
+                    )));
+                }
+            }
+            if let Some(driver_cfg) = opts_obj.get_mut("DriverConfig") {
                 if !driver_cfg.is_null() {
-                    let dc_obj = driver_cfg.as_object().ok_or_else(|| {
+                    let dc_obj = driver_cfg.as_object_mut().ok_or_else(|| {
                         PolicyRejection::new("VolumeOptions.DriverConfig must be a JSON object")
                     })?;
+                    canonicalize_struct_keys(
+                        dc_obj,
+                        KNOWN_DRIVER_CONFIG_FIELDS,
+                        "VolumeOptions.DriverConfig",
+                    )?;
                     if let Some(driver_opts) = dc_obj.get("Options") {
                         if !driver_opts.is_null() {
                             let d_map = driver_opts.as_object().ok_or_else(|| {
@@ -516,11 +753,19 @@ fn normalize_host_config_ports(
                         });
                     } else {
                         for entry in entries {
-                            let binding = entry.as_object().ok_or_else(|| {
-                                PolicyRejection::new(format!(
-                                    "PortBindings['{raw_key}'] entries must be objects"
-                                ))
-                            })?;
+                            let mut binding = entry
+                                .as_object()
+                                .ok_or_else(|| {
+                                    PolicyRejection::new(format!(
+                                        "PortBindings['{raw_key}'] entries must be objects"
+                                    ))
+                                })?
+                                .clone();
+                            canonicalize_struct_keys(
+                                &mut binding,
+                                KNOWN_PORT_BINDING_FIELDS,
+                                "PortBindings[]",
+                            )?;
                             validate_host_ip(binding.get("HostIp"))?;
                             let host_port = parse_host_port(binding.get("HostPort"))?;
                             requested.push(RequestedPortBinding {
@@ -1015,5 +1260,30 @@ mod tests {
         // 4. Rejects non-array Env cleanly.
         let bad_env = serde_json::to_vec(&json!({ "Image": "alpine", "Env": "FOO=1" })).unwrap();
         assert!(sanitize_container_create(&bad_env, &policy_enabled).is_err());
+    }
+
+    #[test]
+    fn rejects_lowercase_smuggled_fields_duplicate_keys_and_privileged_capabilities() {
+        let policy = DockerCompatPolicy::default();
+
+        let smuggling_payloads: &[&[u8]] = &[
+            br#"{"Image":"alpine","hostconfig":{"privileged":true}}"#,
+            br#"{"Image":"alpine","hostconfig":{"binds":["/etc:/mnt"]}}"#,
+            br#"{"Image":"alpine","HOSTCONFIG":{"mounts":[{"type":"bind","source":"/etc","destination":"/mnt"}]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"Privileged":true},"HostConfig":{"Privileged":false}}"#,
+            br#"{"Image":"alpine","\u0048ostConfig":{"Privileged":true},"HostConfig":{"Privileged":false}}"#,
+            br#"{"Image":"alpine","HostConfig":{},"hostconfig":{"Privileged":true}}"#,
+            br#"{"Image":"alpine","HostConfig":{"CapAdd":["SYS_ADMIN"]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"Devices":[{"PathOnHost":"/dev/sda"}]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"SecurityOpt":["seccomp=unconfined"]}}"#,
+        ];
+
+        for raw in smuggling_payloads {
+            assert!(
+                sanitize_container_create(raw, &policy).is_err(),
+                "must reject smuggled/duplicate payload: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 }

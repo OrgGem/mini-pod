@@ -1,6 +1,7 @@
 //! HTTP/1.1 Docker Engine API compatibility router, hijack dispatcher, and host listeners.
 
 use std::io;
+#[cfg(test)]
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -10,7 +11,10 @@ use sandbox_core::{SandboxError, SandboxId};
 use sandbox_runtime::{SandboxTunnelPort, TunnelStream};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
 use tokio::net::TcpListener;
+#[cfg(windows)]
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::hijack::relay_upgraded;
@@ -31,12 +35,14 @@ pub struct DockerCompatServer {
     registry: Arc<PortForwardRegistry>,
 }
 
-/// Active loopback TCP listener handle for [`DockerCompatServer::bind_loopback_http`].
+/// Active loopback TCP listener handle for unit tests (`#[cfg(test)]` only).
+#[cfg(test)]
 pub struct HttpServerHandle {
     local_addr: SocketAddr,
     task: Option<JoinHandle<()>>,
 }
 
+#[cfg(test)]
 impl HttpServerHandle {
     /// Returns the actual bound loopback socket address.
     pub fn local_addr(&self) -> SocketAddr {
@@ -52,8 +58,49 @@ impl HttpServerHandle {
     }
 }
 
+#[cfg(test)]
 impl Drop for HttpServerHandle {
     fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Active owner-only Windows Named Pipe listener handle for [`DockerCompatServer::bind_named_pipe_with_factory`].
+#[cfg(windows)]
+pub struct NamedPipeServerHandle {
+    pipe_uri: String,
+    pipe_path: String,
+    shutdown_tx: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl NamedPipeServerHandle {
+    /// Returns the `DOCKER_HOST`-compatible Named Pipe URI (`npipe:////./pipe/<name>`).
+    pub fn uri(&self) -> &str {
+        &self.pipe_uri
+    }
+
+    /// Returns the Win32 Named Pipe path (`\\.\pipe\<name>`).
+    pub fn pipe_path(&self) -> &str {
+        &self.pipe_path
+    }
+
+    /// Signals the accept loop to stop and waits for the listening pipe instance to close.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NamedPipeServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -104,6 +151,7 @@ enum StreamNext {
 }
 
 enum DockerRoute<'a> {
+    ForbiddenLibpod,
     ContainerCreate,
     ContainerStart {
         version_prefix: Option<&'a str>,
@@ -299,7 +347,82 @@ impl DockerCompatServer {
         })
     }
 
-    /// Binds a loopback-only HTTP/1.1 TCP listener and spawns the accept loop.
+    /// Binds an owner-only Windows Named Pipe listener using the caller-provided factory closure
+    /// (which enforces `FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS`, and an
+    /// owner-only Win32 DACL) and spawns the multi-instance accept loop.
+    #[cfg(windows)]
+    pub fn bind_named_pipe_with_factory<F>(
+        self: &Arc<Self>,
+        pipe_name: &str,
+        mut create_pipe: F,
+    ) -> Result<NamedPipeServerHandle, SandboxError>
+    where
+        F: FnMut(
+                &str,
+                bool,
+            )
+                -> Result<tokio::net::windows::named_pipe::NamedPipeServer, SandboxError>
+            + Send
+            + 'static,
+    {
+        if pipe_name.is_empty()
+            || pipe_name.contains('\\')
+            || pipe_name.contains('/')
+            || pipe_name.contains('\0')
+            || pipe_name.contains("..")
+        {
+            return Err(SandboxError::InvalidSpec(format!(
+                "invalid Docker Named Pipe leaf name '{pipe_name}'"
+            )));
+        }
+
+        let mut server_pipe = create_pipe(pipe_name, true)?;
+        let pipe_uri = format!("npipe:////./pipe/{pipe_name}");
+        let pipe_path = format!(r"\\.\pipe\{pipe_name}");
+        let name_owned = pipe_name.to_owned();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let compat = Arc::clone(self);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.wait_for(|done| *done) => break,
+                    res = server_pipe.connect() => res,
+                };
+                match accepted {
+                    Ok(()) => {
+                        let next_pipe = match create_pipe(&name_owned, false) {
+                            Ok(next) => next,
+                            Err(_) => {
+                                let srv = Arc::clone(&compat);
+                                tokio::spawn(async move {
+                                    let _ = srv.serve_stream(server_pipe).await;
+                                });
+                                break;
+                            }
+                        };
+                        let connected = std::mem::replace(&mut server_pipe, next_pipe);
+                        let srv = Arc::clone(&compat);
+                        tokio::spawn(async move {
+                            let _ = srv.serve_stream(connected).await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(NamedPipeServerHandle {
+            pipe_uri,
+            pipe_path,
+            shutdown_tx,
+            task: Some(task),
+        })
+    }
+
+    /// Binds a loopback-only HTTP/1.1 TCP listener for in-crate router unit tests (`#[cfg(test)]`).
+    #[cfg(test)]
     pub async fn bind_loopback_http(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -354,44 +477,138 @@ impl DockerCompatServer {
     async fn dispatch_request<S>(
         &self,
         client: &mut PrefixedReader<S>,
-        req: HttpRequestHead,
+        mut req: HttpRequestHead,
     ) -> io::Result<StreamNext>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        match parse_docker_route(&req.method, &req.path) {
-            DockerRoute::ContainerCreate => self.handle_container_create(client, req).await,
+        let canonical_path = match canonicalize_docker_path(&req.path) {
+            Ok(path) => path,
+            Err(reason) => {
+                write_json_error(client, 400, "Bad Request", reason, true)
+                    .await
+                    .map_err(http_to_io)?;
+                return Ok(StreamNext::Close);
+            }
+        };
+        req.path = canonical_path;
+        req.raw_target = match &req.query {
+            Some(q) => format!("{}?{q}", req.path),
+            None => req.path.clone(),
+        };
+
+        let route = match parse_docker_route(&req.method, &req.path) {
+            DockerRoute::ForbiddenLibpod => {
+                let close = req.wants_close();
+                write_json_error(
+                    client,
+                    403,
+                    "Forbidden",
+                    "Podman native /libpod API is disabled on the Docker compatibility endpoint",
+                    close,
+                )
+                .await
+                .map_err(http_to_io)?;
+                return Ok(if close {
+                    StreamNext::Close
+                } else {
+                    StreamNext::Continue
+                });
+            }
+            DockerRoute::ContainerCreate => {
+                let (ver_prefix, _) = strip_api_version(&req.path);
+                req.path = match ver_prefix {
+                    Some(vp) => format!("{vp}/containers/create"),
+                    None => "/containers/create".to_owned(),
+                };
+                req.raw_target = match &req.query {
+                    Some(q) => format!("{}?{q}", req.path),
+                    None => req.path.clone(),
+                };
+                return self.handle_container_create(client, req).await;
+            }
             DockerRoute::ContainerStart {
                 version_prefix,
                 raw_id,
                 id,
-            } => {
-                self.handle_start_or_restart(client, &req, version_prefix, raw_id, &id)
-                    .await
-            }
+            } => RouteDispatch::Start {
+                version_prefix: version_prefix.map(str::to_owned),
+                raw_id: raw_id.to_owned(),
+                id,
+            },
             DockerRoute::ContainerRestart {
                 version_prefix,
                 raw_id,
                 id,
-            } => {
-                self.handle_start_or_restart(client, &req, version_prefix, raw_id, &id)
-                    .await
-            }
+            } => RouteDispatch::Restart {
+                version_prefix: version_prefix.map(str::to_owned),
+                raw_id: raw_id.to_owned(),
+                id,
+            },
             DockerRoute::ContainerStop { id } | DockerRoute::ContainerKill { id } => {
+                RouteDispatch::StopOrKill { id }
+            }
+            DockerRoute::ContainerDelete { id } => RouteDispatch::Delete { id },
+            DockerRoute::ContainerInspect { id } => RouteDispatch::Inspect { id },
+            DockerRoute::ContainerList => RouteDispatch::List,
+            DockerRoute::ExecOrAttachHijack | DockerRoute::PassThrough => RouteDispatch::Pass,
+        };
+
+        enum RouteDispatch {
+            Start {
+                version_prefix: Option<String>,
+                raw_id: String,
+                id: String,
+            },
+            Restart {
+                version_prefix: Option<String>,
+                raw_id: String,
+                id: String,
+            },
+            StopOrKill {
+                id: String,
+            },
+            Delete {
+                id: String,
+            },
+            Inspect {
+                id: String,
+            },
+            List,
+            Pass,
+        }
+
+        match route {
+            RouteDispatch::Start {
+                version_prefix,
+                raw_id,
+                id,
+            }
+            | RouteDispatch::Restart {
+                version_prefix,
+                raw_id,
+                id,
+            } => {
+                self.handle_start_or_restart(
+                    client,
+                    &req,
+                    version_prefix.as_deref(),
+                    &raw_id,
+                    &id,
+                )
+                .await
+            }
+            RouteDispatch::StopOrKill { id } => {
                 self.handle_stop_kill_or_delete(client, &req, &id, false)
                     .await
             }
-            DockerRoute::ContainerDelete { id } => {
+            RouteDispatch::Delete { id } => {
                 self.handle_stop_kill_or_delete(client, &req, &id, true)
                     .await
             }
-            DockerRoute::ContainerInspect { id } => {
-                self.handle_container_inspect(client, &req, &id).await
-            }
-            DockerRoute::ContainerList => self.handle_containers_list(client, &req).await,
-            DockerRoute::ExecOrAttachHijack | DockerRoute::PassThrough => {
-                self.handle_passthrough_or_hijack(client, &req).await
-            }
+            RouteDispatch::Inspect { id } => self.handle_container_inspect(client, &req, &id).await,
+            RouteDispatch::List => self.handle_containers_list(client, &req).await,
+            RouteDispatch::Pass => self.handle_passthrough_or_hijack(client, &req).await,
         }
     }
 
@@ -1051,6 +1268,68 @@ async fn write_request_and_bytes<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+fn canonicalize_docker_path(raw_path: &str) -> Result<String, &'static str> {
+    if !raw_path.starts_with('/') || raw_path.contains('\\') || raw_path.contains('\0') {
+        return Err("invalid Docker API request path");
+    }
+
+    let mut segments = Vec::new();
+    for raw_seg in raw_path.split('/') {
+        if raw_seg.is_empty() {
+            continue;
+        }
+        let bytes = raw_seg.as_bytes();
+        let mut norm = String::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 2 >= bytes.len() {
+                    return Err("malformed percent-encoding in Docker API path");
+                }
+                let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+                else {
+                    return Err("malformed percent-encoding in Docker API path");
+                };
+                let decoded = (hi << 4) | lo;
+                if decoded <= 0x1F || decoded == 0x7F || decoded == b'\\' {
+                    return Err("forbidden encoded character in Docker API path");
+                }
+                if decoded.is_ascii_alphanumeric()
+                    || matches!(decoded, b'-' | b'.' | b'_' | b'~')
+                {
+                    norm.push(decoded as char);
+                } else {
+                    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                    norm.push('%');
+                    norm.push(HEX[(decoded >> 4) as usize] as char);
+                    norm.push(HEX[(decoded & 0x0F) as usize] as char);
+                }
+                i += 3;
+            } else {
+                if bytes[i] <= 0x1F || bytes[i] == 0x7F {
+                    return Err("control character in Docker API path");
+                }
+                let ch = raw_seg[i..]
+                    .chars()
+                    .next()
+                    .ok_or("invalid UTF-8 in Docker API path")?;
+                norm.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        if norm == "." || norm == ".." {
+            return Err("dot segments in Docker API path are forbidden");
+        }
+        segments.push(norm);
+    }
+
+    if segments.is_empty() {
+        Ok("/".to_owned())
+    } else {
+        Ok(format!("/{}", segments.join("/")))
+    }
+}
+
 fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
     let (version_prefix, normalized) = strip_api_version(path);
     let trimmed = normalized.trim_start_matches('/');
@@ -1058,11 +1337,25 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
         return DockerRoute::PassThrough;
     }
     let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts
+        .first()
+        .is_some_and(|first| first.eq_ignore_ascii_case("libpod"))
+    {
+        return DockerRoute::ForbiddenLibpod;
+    }
 
     if method.eq_ignore_ascii_case("POST") {
         match parts.as_slice() {
-            ["containers", "create"] => return DockerRoute::ContainerCreate,
-            ["containers", raw_id, "start"] => {
+            [c, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("create") =>
+            {
+                return DockerRoute::ContainerCreate;
+            }
+            [c, raw_id, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("start") =>
+            {
                 if let Some(id) = decode_safe_container_id(raw_id) {
                     return DockerRoute::ContainerStart {
                         version_prefix,
@@ -1071,7 +1364,10 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
                     };
                 }
             }
-            ["containers", raw_id, "restart"] => {
+            [c, raw_id, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("restart") =>
+            {
                 if let Some(id) = decode_safe_container_id(raw_id) {
                     return DockerRoute::ContainerRestart {
                         version_prefix,
@@ -1080,30 +1376,48 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
                     };
                 }
             }
-            ["containers", raw_id, "stop"] => {
+            [c, raw_id, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("stop") =>
+            {
                 if let Some(id) = decode_safe_container_id(raw_id) {
                     return DockerRoute::ContainerStop { id };
                 }
             }
-            ["containers", raw_id, "kill"] => {
+            [c, raw_id, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("kill") =>
+            {
                 if let Some(id) = decode_safe_container_id(raw_id) {
                     return DockerRoute::ContainerKill { id };
                 }
             }
-            ["exec", raw_id, "start"] => {
+            [e, raw_id, action]
+                if e.eq_ignore_ascii_case("exec") && action.eq_ignore_ascii_case("start") =>
+            {
                 if decode_safe_container_id(raw_id).is_some() {
                     return DockerRoute::ExecOrAttachHijack;
                 }
             }
-            ["containers", raw_id, "attach"] if decode_safe_container_id(raw_id).is_some() => {
+            [c, raw_id, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("attach")
+                    && decode_safe_container_id(raw_id).is_some() =>
+            {
                 return DockerRoute::ExecOrAttachHijack;
             }
             _ => {}
         }
     } else if method.eq_ignore_ascii_case("GET") {
         match parts.as_slice() {
-            ["containers", "json"] => return DockerRoute::ContainerList,
-            ["containers", raw_id, "json"] => {
+            [c, j]
+                if c.eq_ignore_ascii_case("containers") && j.eq_ignore_ascii_case("json") =>
+            {
+                return DockerRoute::ContainerList;
+            }
+            [c, raw_id, j]
+                if c.eq_ignore_ascii_case("containers") && j.eq_ignore_ascii_case("json") =>
+            {
                 if let Some(id) = decode_safe_container_id(raw_id) {
                     return DockerRoute::ContainerInspect { id };
                 }
@@ -1111,8 +1425,8 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
             _ => {}
         }
     } else if method.eq_ignore_ascii_case("DELETE") {
-        if let ["containers", raw_id] = parts.as_slice() {
-            if *raw_id != "prune" {
+        if let [c, raw_id] = parts.as_slice() {
+            if c.eq_ignore_ascii_case("containers") && !raw_id.eq_ignore_ascii_case("prune") {
                 if let Some(id) = decode_safe_container_id(raw_id) {
                     return DockerRoute::ContainerDelete { id };
                 }
@@ -2142,6 +2456,37 @@ mod tests {
         assert!(matches!(
             parse_docker_route("DELETE", "/containers/my%2Dbox"),
             DockerRoute::ContainerDelete { ref id } if id == "my-box"
+        ));
+
+        // Double slashes and percent-encoded unreserved literals canonicalize before routing.
+        assert_eq!(
+            canonicalize_docker_path("//v1.45//containers//%63reate").unwrap(),
+            "/v1.45/containers/create"
+        );
+        assert!(matches!(
+            parse_docker_route(
+                "POST",
+                &canonicalize_docker_path("//v1.45//containers//%63reate").unwrap()
+            ),
+            DockerRoute::ContainerCreate
+        ));
+
+        // Preserves %2F inside image references while rejecting dot segments and /libpod.
+        assert_eq!(
+            canonicalize_docker_path("/v1.45/images/minipod-e2e%2fecho-http:1.0/json").unwrap(),
+            "/v1.45/images/minipod-e2e%2Fecho-http:1.0/json"
+        );
+        assert!(canonicalize_docker_path("/containers/./create").is_err());
+        assert!(canonicalize_docker_path("/containers/%2e%2e/create").is_err());
+        assert!(canonicalize_docker_path("/containers/a%00b/json").is_err());
+        assert!(canonicalize_docker_path("/containers/a%5cb/json").is_err());
+
+        assert!(matches!(
+            parse_docker_route(
+                "POST",
+                &canonicalize_docker_path("/v5.0.0/%6cibpod/containers/create").unwrap()
+            ),
+            DockerRoute::ForbiddenLibpod
         ));
     }
 }

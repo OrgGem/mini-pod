@@ -89,6 +89,79 @@ struct Phase6Harness {
     manager: Arc<LocalRuntimeManager>,
 }
 
+struct TestDockerCompatHandle {
+    #[cfg(windows)]
+    inner: sandbox_docker_compat::NamedPipeServerHandle,
+    #[cfg(unix)]
+    short_dir_cleanup: Option<PathBuf>,
+    #[cfg(unix)]
+    inner: sandbox_docker_compat::UnixServerHandle,
+}
+
+impl TestDockerCompatHandle {
+    async fn shutdown(self) {
+        #[cfg(windows)]
+        {
+            self.inner.shutdown().await;
+        }
+        #[cfg(unix)]
+        {
+            self.inner.shutdown().await;
+            if let Some(dir) = self.short_dir_cleanup {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+}
+
+async fn bind_test_docker_compat(
+    compat: &Arc<DockerCompatServer>,
+    base_dir: &Path,
+) -> (TestDockerCompatHandle, Docker) {
+    let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    {
+        let _ = base_dir;
+        let pipe_name = format!("minipod-p6-dc-{}-{seq}", std::process::id());
+        let inner = compat
+            .bind_named_pipe_with_factory(
+                &pipe_name,
+                sandbox_vmm::create_owner_only_async_named_pipe,
+            )
+            .expect("bind owner-only DockerCompatServer Named Pipe");
+        let docker = Docker::connect_with_named_pipe(inner.uri(), 60, bollard::API_DEFAULT_VERSION)
+            .expect("connect bollard Named Pipe client");
+        (TestDockerCompatHandle { inner }, docker)
+    }
+    #[cfg(unix)]
+    {
+        let candidate = base_dir.join(format!("dc-{seq}")).join("d.sock");
+        let (socket_path, short_dir_cleanup) = if candidate
+            .to_str()
+            .is_some_and(|s| s.len() <= sandbox_vmm::MAX_UNIX_SOCKET_PATH_BYTES)
+        {
+            (candidate, None)
+        } else {
+            let short_dir = PathBuf::from(format!("/tmp/mp6dc-{}-{seq}", std::process::id()));
+            (short_dir.join("d.sock"), Some(short_dir))
+        };
+        let inner = compat
+            .bind_unix_owner_only(&socket_path)
+            .await
+            .expect("bind owner-only DockerCompatServer Unix socket");
+        let uri = format!("unix://{}", socket_path.display());
+        let docker = Docker::connect_with_unix(&uri, 60, bollard::API_DEFAULT_VERSION)
+            .expect("connect bollard Unix client");
+        (
+            TestDockerCompatHandle {
+                short_dir_cleanup,
+                inner,
+            },
+            docker,
+        )
+    }
+}
+
 struct MockTcpServer {
     addr: SocketAddr,
     task: JoinHandle<()>,
@@ -1158,16 +1231,7 @@ async fn e2e_separated_four_metric_benchmark_cold_warm_snapshot_container_ready(
             lease.id.clone(),
             DockerCompatPolicy::default(),
         ));
-        let server = compat
-            .bind_loopback_http("127.0.0.1:0".parse().expect("loopback addr"))
-            .await
-            .expect("bind DockerCompatServer");
-        let docker = Docker::connect_with_http(
-            &format!("http://{}", server.local_addr()),
-            60,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .expect("connect bollard HTTP client");
+        let (server, docker) = bind_test_docker_compat(&compat, &container_harness.state_dir).await;
 
         let cold_t0 = Instant::now();
         import_tar_image(&docker, &fixtures.echo_image_tar).await;

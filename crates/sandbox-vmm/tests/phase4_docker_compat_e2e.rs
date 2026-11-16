@@ -83,9 +83,171 @@ struct Phase4Fixtures {
 }
 
 struct Phase4Harness {
-    _temp: TestTempDir,
+    temp: TestTempDir,
     _installed: InstalledBundle,
     manager: Arc<LocalRuntimeManager>,
+}
+
+struct TestDockerCompatHandle {
+    uri: String,
+    #[cfg(windows)]
+    pipe_name: String,
+    #[cfg(windows)]
+    inner: sandbox_docker_compat::NamedPipeServerHandle,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+    #[cfg(unix)]
+    short_dir_cleanup: Option<PathBuf>,
+    #[cfg(unix)]
+    inner: sandbox_docker_compat::UnixServerHandle,
+}
+
+impl TestDockerCompatHandle {
+    fn docker_uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn assert_non_owner_denied(&self) {
+        #[cfg(windows)]
+        {
+            sandbox_vmm::verify_non_owner_named_pipe_denied(&self.pipe_name).expect(
+                "NT kernel must deny non-owner restricted token access to Docker Named Pipe",
+            );
+        }
+        #[cfg(unix)]
+        {
+            sandbox_vmm::verify_non_owner_unix_socket_denied(&self.socket_path, 65534, 65534)
+                .expect("Unix Docker socket must enforce 0700/0600 owner-only permissions");
+        }
+    }
+
+    async fn send_raw_http(&self, raw_request: &[u8]) -> String {
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ClientOptions;
+            let pipe_path = format!(r"\\.\pipe\{}", self.pipe_name);
+            let mut stream = {
+                let mut opened = None;
+                for attempt in 0..=20 {
+                    match ClientOptions::new()
+                        .security_qos_flags(0x0001_0000)
+                        .open(&pipe_path)
+                    {
+                        Ok(client) => {
+                            opened = Some(client);
+                            break;
+                        }
+                        Err(err) if err.raw_os_error() == Some(231) && attempt < 20 => {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        Err(err) => panic!("open Docker Named Pipe '{pipe_path}': {err}"),
+                    }
+                }
+                opened.expect("timed out opening busy Docker Named Pipe")
+            };
+            stream
+                .write_all(raw_request)
+                .await
+                .expect("write raw HTTP over Named Pipe");
+            stream.flush().await.expect("flush Named Pipe");
+            let mut buf = Vec::new();
+            stream
+                .read_to_end(&mut buf)
+                .await
+                .expect("read raw HTTP response over Named Pipe");
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        #[cfg(unix)]
+        {
+            let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
+                .await
+                .expect("connect Docker Unix socket");
+            stream
+                .write_all(raw_request)
+                .await
+                .expect("write raw HTTP over Unix socket");
+            stream.flush().await.expect("flush Unix socket");
+            let mut buf = Vec::new();
+            stream
+                .read_to_end(&mut buf)
+                .await
+                .expect("read raw HTTP response over Unix socket");
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    }
+
+    async fn shutdown(self) {
+        #[cfg(windows)]
+        {
+            self.inner.shutdown().await;
+        }
+        #[cfg(unix)]
+        {
+            self.inner.shutdown().await;
+            if let Some(dir) = self.short_dir_cleanup {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+}
+
+async fn bind_test_docker_compat(
+    compat: &Arc<DockerCompatServer>,
+    base_dir: &Path,
+    label: &str,
+) -> (TestDockerCompatHandle, Docker) {
+    let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    {
+        let _ = base_dir;
+        let pipe_name = format!("minipod-p4-dc-{label}-{}-{seq}", std::process::id());
+        let inner = compat
+            .bind_named_pipe_with_factory(
+                &pipe_name,
+                sandbox_vmm::create_owner_only_async_named_pipe,
+            )
+            .expect("bind owner-only DockerCompatServer Named Pipe");
+        let uri = inner.uri().to_owned();
+        let docker = Docker::connect_with_named_pipe(&uri, 60, bollard::API_DEFAULT_VERSION)
+            .expect("connect bollard Named Pipe client");
+        (
+            TestDockerCompatHandle {
+                uri,
+                pipe_name,
+                inner,
+            },
+            docker,
+        )
+    }
+    #[cfg(unix)]
+    {
+        let candidate = base_dir.join(format!("dc-{label}-{seq}")).join("d.sock");
+        let (socket_path, short_dir_cleanup) = if candidate
+            .to_str()
+            .is_some_and(|s| s.len() <= sandbox_vmm::MAX_UNIX_SOCKET_PATH_BYTES)
+        {
+            (candidate, None)
+        } else {
+            let short_dir = PathBuf::from(format!("/tmp/mp4dc-{}-{seq}", std::process::id()));
+            (short_dir.join("d.sock"), Some(short_dir))
+        };
+        let inner = compat
+            .bind_unix_owner_only(&socket_path)
+            .await
+            .expect("bind owner-only DockerCompatServer Unix socket");
+        let uri = format!("unix://{}", socket_path.display());
+        let docker = Docker::connect_with_unix(&uri, 60, bollard::API_DEFAULT_VERSION)
+            .expect("connect bollard Unix client");
+        (
+            TestDockerCompatHandle {
+                uri,
+                socket_path,
+                short_dir_cleanup,
+                inner,
+            },
+            docker,
+        )
+    }
 }
 
 struct EnvVarGuard {
@@ -254,7 +416,7 @@ fn build_phase4_runtime(fixtures: &Phase4Fixtures, prefix: &str) -> Phase4Harnes
     );
 
     Phase4Harness {
-        _temp: temp,
+        temp,
         _installed: installed,
         manager,
     }
@@ -405,17 +567,10 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
             ..Default::default()
         },
     ));
-    let server = compat
-        .bind_loopback_http("127.0.0.1:0".parse().expect("loopback addr"))
-        .await
-        .expect("bind DockerCompatServer");
+    let (server, docker) = bind_test_docker_compat(&compat, harness.temp.path(), "bollard").await;
 
-    let docker = Docker::connect_with_http(
-        &format!("http://{}", server.local_addr()),
-        60,
-        bollard::API_DEFAULT_VERSION,
-    )
-    .expect("connect bollard HTTP client");
+    // 0. Owner-only IPC access control (#5): second OS user / restricted token denied.
+    server.assert_non_owner_denied();
 
     // 1. Connectivity: ping & version.
     let pong = docker.ping().await.expect("docker ping");
@@ -424,6 +579,39 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
     assert!(
         version.api_version.is_some() || version.version.is_some(),
         "expected version info from guest Podman: {version:?}"
+    );
+
+    // 1b. URL canonicalization, /libpod block, lowercase JSON smuggling & duplicate key defense (#15).
+    let libpod_resp = server
+        .send_raw_http(
+            b"GET /v1.45/%6cibpod/_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+    assert!(
+        libpod_resp.starts_with("HTTP/1.1 403 Forbidden"),
+        "expected 403 Forbidden for /libpod endpoint, got: {libpod_resp:?}"
+    );
+
+    let smuggled_body = r#"{"Image":"minipod-e2e/echo-http:1.0","hostconfig":{"binds":["/etc:/mnt"]}}"#;
+    let smuggled_req = format!(
+        "POST //v1.45//containers//%63reate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{smuggled_body}",
+        smuggled_body.len()
+    );
+    let smuggled_resp = server.send_raw_http(smuggled_req.as_bytes()).await;
+    assert!(
+        smuggled_resp.starts_with("HTTP/1.1 400 Bad Request"),
+        "expected 400 Bad Request for //containers//%63reate lowercase hostconfig bypass, got: {smuggled_resp:?}"
+    );
+
+    let dup_key_body = r#"{"Image":"minipod-e2e/echo-http:1.0","HostConfig":{},"HostConfig":{"Privileged":true}}"#;
+    let dup_key_req = format!(
+        "POST /containers/create HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{dup_key_body}",
+        dup_key_body.len()
+    );
+    let dup_key_resp = server.send_raw_http(dup_key_req.as_bytes()).await;
+    assert!(
+        dup_key_resp.starts_with("HTTP/1.1 400 Bad Request"),
+        "expected 400 Bad Request for duplicate HostConfig JSON keys, got: {dup_key_resp:?}"
     );
 
     // 2. Offline image import (no external registry pull inside Isolated VM).
@@ -797,22 +985,15 @@ async fn e2e_testcontainers_full_lifecycle_and_ryuk_reaper() {
             ..Default::default()
         },
     ));
-    let server = compat
-        .bind_loopback_http("127.0.0.1:0".parse().expect("loopback addr"))
-        .await
-        .expect("bind DockerCompatServer");
-
-    let base_url = format!("http://{}", server.local_addr());
-    let docker = Docker::connect_with_http(&base_url, 60, bollard::API_DEFAULT_VERSION)
-        .expect("connect bollard HTTP client");
+    let (server, docker) = bind_test_docker_compat(&compat, harness.temp.path(), "tc").await;
 
     import_tar_image(&docker, &fixtures.echo_image_tar).await;
     import_tar_image(&docker, &fixtures.ryuk_image_tar).await;
 
-    let docker_host = format!("tcp://{}", server.local_addr());
     let _env_guard = EnvVarGuard::new(&[
-        ("DOCKER_HOST", Some(docker_host.as_str())),
+        ("DOCKER_HOST", Some(server.docker_uri())),
         ("TESTCONTAINERS_COMMAND", Some("remove")),
+        ("TESTCONTAINERS_HOST_OVERRIDE", Some("127.0.0.1")),
     ]);
 
     // 1. Start Ryuk via testcontainers with standard /var/run/docker.sock bind mount
