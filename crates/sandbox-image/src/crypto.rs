@@ -116,7 +116,7 @@ pub fn decode_hex_exact<const N: usize>(hex_str: &str) -> Result<[u8; N], Sandbo
         )));
     }
     let mut out = [0u8; N];
-    for (i, pair) in raw.chunks_exact(2).enumerate() {
+    for (i, pair) in raw.as_chunks::<2>().0.iter().enumerate() {
         let hi = decode_hex_nibble(pair[0])?;
         let lo = decode_hex_nibble(pair[1])?;
         out[i] = (hi << 4) | lo;

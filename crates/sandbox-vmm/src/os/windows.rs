@@ -1011,8 +1011,13 @@ pub fn validate_owner_only_dacl(
             )));
         }
         if require_protected
-            && (ace_flags.len() % 2 != 0
-                || ace_flags.as_bytes().chunks_exact(2).any(|flag| flag == b"ID"))
+            && (!ace_flags.len().is_multiple_of(2)
+                || ace_flags
+                    .as_bytes()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|flag| flag == b"ID"))
         {
             return Err(SandboxError::PolicyViolation(format!(
                 "unexpected inherited ACE '({ace})' in protected SDDL '{dacl_sddl}' for '{target}'"

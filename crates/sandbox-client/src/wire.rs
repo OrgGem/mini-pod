@@ -15,8 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Maximum control wire frame payload size (24 MiB, accommodating base64-encoded 16 MiB tar payloads).
 pub const MAX_CONTROL_FRAME_BYTES: usize = 24 * 1024 * 1024;
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Lossless wire representation of all 11 [`SandboxError`] variants.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -630,16 +629,17 @@ pub fn decode_base64(encoded: &str) -> Result<Vec<u8>, SandboxError> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(SandboxError::Transport(
             "invalid base64 length: must be a multiple of 4".to_owned(),
         ));
     }
 
     let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
-    let num_chunks = bytes.len() / 4;
+    let (chunks, _) = bytes.as_chunks::<4>();
+    let num_chunks = chunks.len();
 
-    for (chunk_idx, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
         let is_last = chunk_idx + 1 == num_chunks;
         let pad_2 = chunk[2] == b'=';
         let pad_3 = chunk[3] == b'=';
@@ -662,8 +662,16 @@ pub fn decode_base64(encoded: &str) -> Result<Vec<u8>, SandboxError> {
 
         let v0 = decode_b64_sextet(chunk[0])?;
         let v1 = decode_b64_sextet(chunk[1])?;
-        let v2 = if pad_2 { 0 } else { decode_b64_sextet(chunk[2])? };
-        let v3 = if pad_3 { 0 } else { decode_b64_sextet(chunk[3])? };
+        let v2 = if pad_2 {
+            0
+        } else {
+            decode_b64_sextet(chunk[2])?
+        };
+        let v3 = if pad_3 {
+            0
+        } else {
+            decode_b64_sextet(chunk[3])?
+        };
 
         if pad_2 && (v1 & 0x0f) != 0 {
             return Err(SandboxError::Transport(
@@ -1177,7 +1185,7 @@ fn req_bytes_b64(obj: &Map<String, Value>, key: &str, ctx: &str) -> Result<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::io::{duplex, AsyncWriteExt};
 
     fn sample_spec(network: NetworkPolicy, optional_budgets: bool) -> SandboxSpec {
         SandboxSpec {
@@ -1236,21 +1244,10 @@ mod tests {
     #[test]
     fn base64_rejects_invalid_padding_characters_and_nonzero_unused_bits() {
         let invalid = [
-            "A",
-            "AA",
-            "AAA",
-            "AAAA=",
-            "====",
-            "A===",
-            "AA=A",
-            "Zg==AAAA",
-            "Zm8=AAAA",
-            "Zm9v\n",
-            "Zm 9",
-            "Zm9$",
+            "A", "AA", "AAA", "AAAA=", "====", "A===", "AA=A", "Zg==AAAA", "Zm8=AAAA", "Zm9v\n",
+            "Zm 9", "Zm9$",
             // Non-zero lower 4 bits before `==`: 'Z' = 25, 'h' = 33 (0b10_0001).
-            "Zh==",
-            // Non-zero lower 2 bits before `=`: 'Z','m','9' (61 = 0b1111_01).
+            "Zh==", // Non-zero lower 2 bits before `=`: 'Z','m','9' (61 = 0b1111_01).
             "Zm9=",
         ];
         for bad in invalid {
@@ -1287,7 +1284,8 @@ mod tests {
             assert_eq!(decoded_resp, resp);
 
             let evt = ExecWireEvent::Error(wire);
-            let decoded_evt = ExecWireEvent::from_json_bytes(&evt.to_json_bytes().unwrap()).unwrap();
+            let decoded_evt =
+                ExecWireEvent::from_json_bytes(&evt.to_json_bytes().unwrap()).unwrap();
             assert_eq!(decoded_evt, evt);
         }
 
@@ -1422,7 +1420,8 @@ mod tests {
             ExecWireClientMsg::Cancel,
         ];
         for msg in client_msgs {
-            let decoded = ExecWireClientMsg::from_json_bytes(&msg.to_json_bytes().unwrap()).unwrap();
+            let decoded =
+                ExecWireClientMsg::from_json_bytes(&msg.to_json_bytes().unwrap()).unwrap();
             assert_eq!(decoded, msg);
         }
 

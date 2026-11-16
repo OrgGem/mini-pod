@@ -10,7 +10,9 @@ use sandbox_core::{GuestArch, SandboxError, SandboxId, SandboxSpec};
 use sandbox_runtime::{DiskOverlayPort, PreparedOverlay};
 
 use crate::crypto::BundleVerifier;
-use crate::installer::{check_regular_file_path, map_fs_error, verify_installed_bundle};
+use crate::installer::{
+    check_regular_file_path, map_fs_error, with_verified_installed_bundle_read_locked,
+};
 use crate::qcow2::{create_qcow2_overlay_atomic_with_runner, HelperCommandRunner};
 
 /// [`DiskOverlayPort`] implementation backed by an Ed25519-verified Portable Runtime Bundle
@@ -122,37 +124,38 @@ impl DiskOverlayPort for BundleOverlayStore {
         let host_budget_bytes = u64::from(spec.budget.host_storage_budget_mb) * 1024 * 1024;
 
         tokio::task::spawn_blocking(move || {
-            let installed = verify_installed_bundle(&bundle_dir, &verifier)?;
-            let base_rootfs = installed.base_rootfs_qcow2_path();
+            with_verified_installed_bundle_read_locked(&bundle_dir, &verifier, |installed| {
+                let base_rootfs = installed.base_rootfs_qcow2_path();
 
-            create_qcow2_overlay_atomic_with_runner(
-                &qemu_img_bin,
-                &base_rootfs,
-                &overlay_path,
-                Some(virtual_disk_mb),
-                command_runner.as_ref(),
-            )?;
+                create_qcow2_overlay_atomic_with_runner(
+                    &qemu_img_bin,
+                    &base_rootfs,
+                    &overlay_path,
+                    Some(virtual_disk_mb),
+                    command_runner.as_ref(),
+                )?;
 
-            let meta = fs::symlink_metadata(&overlay_path).map_err(|err| {
-                map_fs_error(&overlay_path, "inspect created qcow2 overlay", err)
-            })?;
-            let provisioned_host_bytes = meta.len();
-            if provisioned_host_bytes > host_budget_bytes {
-                let _ = fs::remove_file(&overlay_path);
-                return Err(SandboxError::BudgetExceeded(format!(
-                    "provisioned overlay size ({provisioned_host_bytes} bytes) exceeds host_storage_budget_mb ({host_budget_bytes} bytes)"
-                )));
-            }
+                let meta = fs::symlink_metadata(&overlay_path).map_err(|err| {
+                    map_fs_error(&overlay_path, "inspect created qcow2 overlay", err)
+                })?;
+                let provisioned_host_bytes = meta.len();
+                if provisioned_host_bytes > host_budget_bytes {
+                    let _ = fs::remove_file(&overlay_path);
+                    return Err(SandboxError::BudgetExceeded(format!(
+                        "provisioned overlay size ({provisioned_host_bytes} bytes) exceeds host_storage_budget_mb ({host_budget_bytes} bytes)"
+                    )));
+                }
 
-            let kernel_cmdline = default_kernel_cmdline(installed.manifest().guest_arch);
-            Ok(PreparedOverlay {
-                overlay_path,
-                kernel_path: installed.kernel_path(),
-                initramfs_path: installed.initrd_path(),
-                rootfs_path: base_rootfs,
-                kernel_cmdline,
-                virtual_disk_mb,
-                provisioned_host_bytes,
+                let kernel_cmdline = default_kernel_cmdline(installed.manifest().guest_arch);
+                Ok(PreparedOverlay {
+                    overlay_path,
+                    kernel_path: installed.kernel_path(),
+                    initramfs_path: installed.initrd_path(),
+                    rootfs_path: base_rootfs,
+                    kernel_cmdline,
+                    virtual_disk_mb,
+                    provisioned_host_bytes,
+                })
             })
         })
         .await

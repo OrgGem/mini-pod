@@ -597,7 +597,7 @@ struct GuestEgressPermit {
 }
 
 impl GuestEgressPermit {
-    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Arc<Self>> {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         let mut cur = counter.load(Ordering::Acquire);
         loop {
             if cur >= limit {
@@ -610,9 +610,9 @@ impl GuestEgressPermit {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Some(Arc::new(Self {
+                    return Some(Self {
                         counter: Arc::clone(counter),
-                    }));
+                    });
                 }
                 Err(actual) => cur = actual,
             }
@@ -661,6 +661,7 @@ enum StreamHandler {
         inbound_tx: mpsc::UnboundedSender<TunnelInbound>,
         queued_bytes: Arc<AtomicUsize>,
         stdin_credits: Arc<StdinCreditWindow>,
+        _egress_permit: Option<GuestEgressPermit>,
     },
 }
 
@@ -1054,6 +1055,7 @@ impl VmSessionPort for QemuVmSession {
                     inbound_tx,
                     queued_bytes: Arc::clone(&queued_bytes),
                     stdin_credits: Arc::clone(&stdin_credits),
+                    _egress_permit: None,
                 },
             );
         }
@@ -1106,7 +1108,6 @@ impl VmSessionPort for QemuVmSession {
             stdin_credits,
             tunnel_handle,
             self.session_closed_tx.subscribe(),
-            None,
         );
 
         Ok(tunnel_stream)
@@ -1556,16 +1557,13 @@ fn spawn_tunnel_pumps(
     stdin_credits: Arc<StdinCreditWindow>,
     tunnel_handle: TunnelStreamHandle,
     session_closed_rx: watch::Receiver<Option<String>>,
-    egress_permit: Option<Arc<GuestEgressPermit>>,
 ) {
     let (remote_eof_tx, remote_eof_rx) = oneshot::channel();
     let (remote_abort_tx, remote_abort_rx) = oneshot::channel();
 
     let inbound_outbound = Arc::clone(&outbound);
-    let inbound_permit = egress_permit.clone();
     let inbound_session_closed = session_closed_rx.clone();
     rt.spawn(async move {
-        let _permit = inbound_permit;
         pump_tunnel_inbound(
             stream_id,
             inbound_outbound,
@@ -1579,7 +1577,6 @@ fn spawn_tunnel_pumps(
         .await;
     });
     rt.spawn(async move {
-        let _permit = egress_permit;
         pump_tunnel_outbound(
             stream_id,
             outbound,
@@ -1710,10 +1707,12 @@ async fn pump_tunnel_outbound(
                 // When the host called `shutdown()` before dropping (e.g., HTTP proxy response
                 // before client TCP FIN), keep draining `read_half` until `stdin_eof`.
                 if !graceful_write {
+                    stdin_credits.close();
+                    lock_unpoisoned(&ops).remove(&stream_id);
                     if let Ok(frame) = Frame::from_message(stream_id, &Message::StreamClose) {
                         let _ = outbound.enqueue_control(frame);
                     }
-                    break;
+                    return;
                 }
             }
             read_res = async {
@@ -2011,33 +2010,31 @@ fn run_reader_loop(
                         inbound_tx,
                         queued_bytes,
                         ..
-                    }) if channel == StreamChannel::Stdout => {
-                        if !data.is_empty() || eof {
-                            let len = data.len();
-                            let prev = queued_bytes.fetch_add(len, Ordering::AcqRel);
-                            if prev.saturating_add(len) > MAX_STREAM_INBOUND_BUFFER_BYTES {
-                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
-                                if let Some(StreamHandler::Tunnel {
-                                    inbound_tx,
-                                    stdin_credits,
-                                    ..
-                                }) = map.remove(&stream_id)
-                                {
-                                    stdin_credits.close();
-                                    let _ = inbound_tx.send(TunnelInbound::RemoteClose);
-                                }
-                                drop(map);
-                                if let Ok(close_frame) =
-                                    Frame::from_message(stream_id, &Message::StreamClose)
-                                {
-                                    let _ = outbound.enqueue_control(close_frame);
-                                }
-                            } else if inbound_tx
-                                .send(TunnelInbound::Data { data, eof })
-                                .is_err()
+                    }) if channel == StreamChannel::Stdout && (!data.is_empty() || eof) => {
+                        let len = data.len();
+                        let prev = queued_bytes.fetch_add(len, Ordering::AcqRel);
+                        if prev.saturating_add(len) > MAX_STREAM_INBOUND_BUFFER_BYTES {
+                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            if let Some(StreamHandler::Tunnel {
+                                inbound_tx,
+                                stdin_credits,
+                                ..
+                            }) = map.remove(&stream_id)
                             {
-                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                                stdin_credits.close();
+                                let _ = inbound_tx.send(TunnelInbound::RemoteClose);
                             }
+                            drop(map);
+                            if let Ok(close_frame) =
+                                Frame::from_message(stream_id, &Message::StreamClose)
+                            {
+                                let _ = outbound.enqueue_control(close_frame);
+                            }
+                        } else if inbound_tx
+                            .send(TunnelInbound::Data { data, eof })
+                            .is_err()
+                        {
+                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
                         }
                     }
                     _ => {}
@@ -2280,6 +2277,7 @@ fn handle_egress_open(
                     inbound_tx,
                     queued_bytes: Arc::clone(&queued_bytes),
                     stdin_credits: Arc::clone(&stdin_credits),
+                    _egress_permit: Some(permit),
                 },
             );
             if let Ok(frame) = Frame::from_message(stream_id, &Message::ConnectAck) {
@@ -2298,7 +2296,6 @@ fn handle_egress_open(
                 stdin_credits,
                 tunnel_handle,
                 session_closed_tx.subscribe(),
-                Some(permit),
             );
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3609,57 +3606,54 @@ mod tests {
             let mut client = IpcStream::connect(&sock_path).unwrap();
             while let Ok(frame) = read_frame(&mut client) {
                 let sid = frame.header.stream_id;
-                match frame.decode_message().unwrap() {
-                    Message::ExecStart { argv, .. } => {
-                        if argv.first().map(String::as_str) == Some("flood") {
-                            // Emit 300 chunks without waiting so caller's 256-slot output_rx fills up.
-                            for _ in 0..300 {
-                                if write_frame(
-                                    &mut client,
-                                    &Frame::from_message(
-                                        sid,
-                                        &Message::StreamData {
-                                            channel: StreamChannel::Stdout,
-                                            eof: false,
-                                            data: vec![b'F'; 256],
-                                        },
-                                    )
-                                    .unwrap(),
-                                )
-                                .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        } else {
-                            let _ = write_frame(
+                if let Message::ExecStart { argv, .. } = frame.decode_message().unwrap() {
+                    if argv.first().map(String::as_str) == Some("flood") {
+                        // Emit 300 chunks without waiting so caller's 256-slot output_rx fills up.
+                        for _ in 0..300 {
+                            if write_frame(
                                 &mut client,
                                 &Frame::from_message(
                                     sid,
                                     &Message::StreamData {
                                         channel: StreamChannel::Stdout,
-                                        eof: true,
-                                        data: b"fast-ok".to_vec(),
+                                        eof: false,
+                                        data: vec![b'F'; 256],
                                     },
                                 )
                                 .unwrap(),
-                            );
-                            let _ = write_frame(
-                                &mut client,
-                                &Frame::from_message(
-                                    sid,
-                                    &Message::ExecExit {
-                                        code: Some(0),
-                                        timed_out: false,
-                                        stdout_truncated: false,
-                                        stderr_truncated: false,
-                                    },
-                                )
-                                .unwrap(),
-                            );
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
                         }
+                    } else {
+                        let _ = write_frame(
+                            &mut client,
+                            &Frame::from_message(
+                                sid,
+                                &Message::StreamData {
+                                    channel: StreamChannel::Stdout,
+                                    eof: true,
+                                    data: b"fast-ok".to_vec(),
+                                },
+                            )
+                            .unwrap(),
+                        );
+                        let _ = write_frame(
+                            &mut client,
+                            &Frame::from_message(
+                                sid,
+                                &Message::ExecExit {
+                                    code: Some(0),
+                                    timed_out: false,
+                                    stdout_truncated: false,
+                                    stderr_truncated: false,
+                                },
+                            )
+                            .unwrap(),
+                        );
                     }
-                    _ => {}
                 }
             }
         });

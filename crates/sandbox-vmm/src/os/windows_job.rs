@@ -492,8 +492,9 @@ pub(crate) fn spawn_in_job_internal(
     cpu_quota_millicores: Option<u32>,
     memory_limit_bytes: Option<u64>,
 ) -> Result<WindowsConfinedProcess, SandboxError> {
-    let wide_program = to_wide_null(spec.program.as_os_str())?;
-    let mut wide_cmdline = quote_windows_command_line(spec.program, spec.args)?;
+    let resolved_program = resolve_windows_application_path(spec.program)?;
+    let wide_program = to_wide_null(resolved_program.as_os_str())?;
+    let mut wide_cmdline = quote_windows_command_line(&resolved_program, spec.args)?;
     let wide_cwd = spec
         .current_dir
         .map(|dir| to_wide_null(dir.as_os_str()))
@@ -559,7 +560,7 @@ pub(crate) fn spawn_in_job_internal(
     };
     if ok == 0 {
         let err = io::Error::last_os_error();
-        return Err(classify_launch_error(spec.program, &err));
+        return Err(classify_launch_error(&resolved_program, &err));
     }
 
     let _thread_handle = OwnedHandle::from_raw(pi.hThread)?;
@@ -576,6 +577,60 @@ pub(crate) fn spawn_in_job_internal(
         capabilities,
         exited: None,
     })
+}
+
+fn resolve_windows_application_path(program: &Path) -> Result<std::path::PathBuf, SandboxError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if program.as_os_str().is_empty() {
+        return Err(SandboxError::InvalidSpec(
+            "process launch program path cannot be empty".to_owned(),
+        ));
+    }
+    let has_sep_or_drive = program
+        .as_os_str()
+        .encode_wide()
+        .any(|u| u == b'\\' as u16 || u == b'/' as u16 || u == b':' as u16);
+    if has_sep_or_drive {
+        return Ok(program.to_path_buf());
+    }
+
+    let mut leaf_names = vec![program.as_os_str().to_os_string()];
+    if program.extension().is_none() {
+        let mut with_exe = program.as_os_str().to_os_string();
+        with_exe.push(".exe");
+        leaf_names.push(with_exe);
+    }
+
+    let mut search_dirs = Vec::new();
+    if let Some(sys_root) = std::env::var_os("SystemRoot") {
+        let sys32 = std::path::PathBuf::from(sys_root).join("System32");
+        if sys32.is_absolute() {
+            search_dirs.push(sys32);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            // Skip relative / `.` PATH entries to prevent Windows CWD binary planting.
+            if dir.is_absolute() {
+                search_dirs.push(dir);
+            }
+        }
+    }
+
+    for dir in search_dirs {
+        for leaf in &leaf_names {
+            let candidate = dir.join(leaf);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(SandboxError::NotFound(format!(
+        "QEMU binary '{}' was not found in System32 or absolute PATH directories",
+        program.display()
+    )))
 }
 
 pub(crate) fn spawn_confined(spec: ProcessLaunchSpec) -> Result<WindowsConfinedProcess, SandboxError> {

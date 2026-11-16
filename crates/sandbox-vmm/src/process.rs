@@ -371,17 +371,17 @@ fn push_windows_arg(out: &mut Vec<u16>, units: &[u16]) {
             backslashes += 1;
         } else if u == b'"' as u16 {
             // Double preceding backslashes and escape the quote itself (`2n + 1`).
-            out.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2 + 1));
+            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
             out.push(b'"' as u16);
             backslashes = 0;
         } else {
-            out.extend(std::iter::repeat(b'\\' as u16).take(backslashes));
+            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
             backslashes = 0;
             out.push(u);
         }
     }
     // Double any trailing backslashes so they do not escape the closing quote.
-    out.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2));
+    out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
     out.push(b'"' as u16);
 }
 

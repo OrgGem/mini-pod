@@ -239,9 +239,11 @@ pub struct LocalRuntimeManager {
     warm_pool: WarmPoolStore,
     in_flight_destroys: Mutex<HashMap<SandboxId, watch::Sender<bool>>>,
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
-    destroy_listeners: Mutex<Vec<Arc<dyn Fn(&SandboxId) + Send + Sync>>>,
+    destroy_listeners: Mutex<Vec<DestroyListener>>,
     next_seq: AtomicU64,
 }
+
+type DestroyListener = Arc<dyn Fn(&SandboxId) + Send + Sync>;
 
 impl Drop for LocalRuntimeManager {
     fn drop(&mut self) {
@@ -353,8 +355,7 @@ impl LocalRuntimeManager {
     }
 
     fn notify_destroy_listeners(&self, id: &SandboxId) {
-        let listeners: Vec<Arc<dyn Fn(&SandboxId) + Send + Sync>> =
-            lock_unpoisoned(&self.destroy_listeners).clone();
+        let listeners: Vec<DestroyListener> = lock_unpoisoned(&self.destroy_listeners).clone();
         for listener in listeners {
             listener(id);
         }

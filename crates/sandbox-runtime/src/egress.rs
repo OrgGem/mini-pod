@@ -2484,7 +2484,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .take()
-                    .ok_or_else(|| io::Error::new(ErrorKind::Other, "already taken"))?;
+                    .ok_or_else(|| io::Error::other("already taken"))?;
                 Ok(Box::pin(s))
             }
         }

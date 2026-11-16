@@ -295,14 +295,7 @@ fn require_qemu_tests() -> bool {
 }
 
 fn parse_hex_32(text: &str) -> [u8; 32] {
-    let trimmed = text.trim();
-    assert_eq!(trimmed.len(), 64, "expected 64 hex chars for Ed25519 key");
-    let mut key = [0u8; 32];
-    for (idx, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
-        let hex_pair = std::str::from_utf8(chunk).expect("utf-8 hex");
-        key[idx] = u8::from_str_radix(hex_pair, 16).expect("valid hex byte");
-    }
-    key
+    sandbox_image::decode_hex_exact::<32>(text.trim()).expect("valid 64-char Ed25519 hex key")
 }
 
 fn discover_phase4_fixtures(test_name: &str) -> Option<Phase4Fixtures> {

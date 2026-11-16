@@ -1,8 +1,8 @@
 //! Anti-tamper bundle tree verification and atomic staging/swap installer.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -116,22 +116,23 @@ pub fn verify_installed_bundle(
     bundle_dir: &Path,
     verifier: &BundleVerifier,
 ) -> Result<InstalledBundle, SandboxError> {
-    for attempt in 0..4 {
-        recover_or_wait_promotion(bundle_dir)?;
-        match verify_installed_bundle_once(bundle_dir, verifier) {
-            Ok(bundle) => return Ok(bundle),
-            Err(SandboxError::NotFound(_))
-                if attempt < 3
-                    && promotion_intent_path(bundle_dir).is_some_and(|p| p.exists()) =>
-            {
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    recover_or_wait_promotion(bundle_dir)?;
-    verify_installed_bundle_once(bundle_dir, verifier)
+    with_verified_installed_bundle_read_locked(bundle_dir, verifier, Ok)
+}
+
+/// Acquires a shared OS lock on `<install_parent>/.lock-<bundle_id>` (healing any interrupted
+/// `.promote-<bundle_id>.v1` swap first), verifies `bundle_dir`, and runs `op` while holding the
+/// shared read lock so concurrent live upgrades cannot swap `bundle_dir` mid-operation.
+pub(crate) fn with_verified_installed_bundle_read_locked<T, F>(
+    bundle_dir: &Path,
+    verifier: &BundleVerifier,
+    op: F,
+) -> Result<T, SandboxError>
+where
+    F: FnOnce(InstalledBundle) -> Result<T, SandboxError>,
+{
+    let _read_guard = acquire_bundle_read_guard(bundle_dir)?;
+    let installed = verify_installed_bundle_once(bundle_dir, verifier)?;
+    op(installed)
 }
 
 fn verify_installed_bundle_once(
@@ -596,20 +597,26 @@ fn atomic_swap_dir(
     bundle_id: &str,
     staging_guard: &mut TempDirGuard,
 ) -> Result<(), SandboxError> {
-    recover_or_wait_promotion(target_dir)?;
+    let parent = target_dir.parent().ok_or_else(|| {
+        SandboxError::Internal("target bundle directory has no parent".to_owned())
+    })?;
+    let lock_path = parent.join(format!(".lock-{bundle_id}"));
+    let _swap_lock = open_bundle_lock_exclusive(&lock_path)?;
+
+    let intent_path = parent.join(format!(".promote-{bundle_id}.v1"));
+    if intent_path.exists() {
+        recover_promotion_under_exclusive_lock(target_dir, &intent_path)?;
+    }
 
     match fs::symlink_metadata(target_dir) {
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            fs::rename(staging_dir, target_dir)
+            rename_with_brief_retry(staging_dir, target_dir)
                 .map_err(|e| map_fs_error(target_dir, "promote staged bundle directory", e))?;
             staging_guard.disarm();
             Ok(())
         }
         Ok(existing_meta) => {
             validate_metadata_no_link(target_dir, &existing_meta, true, false)?;
-            let parent = target_dir.parent().ok_or_else(|| {
-                SandboxError::Internal("target bundle directory has no parent".to_owned())
-            })?;
             let backup_name = format!(".backup-{bundle_id}-{}", next_temp_suffix());
             let backup_dir = parent.join(&backup_name);
             let staging_name = staging_dir
@@ -619,18 +626,10 @@ fn atomic_swap_dir(
                     SandboxError::Internal("staging directory missing UTF-8 filename".to_owned())
                 })?;
 
-            let intent_path = parent.join(format!(".promote-{bundle_id}.v1"));
-            let mut intent_file = open_promotion_intent_locked(&intent_path)?;
             let intent_payload = format!("staging={staging_name}\nbackup={backup_name}\n");
-            intent_file
-                .set_len(0)
-                .and_then(|()| intent_file.seek(SeekFrom::Start(0)))
-                .and_then(|_| intent_file.write_all(intent_payload.as_bytes()))
-                .and_then(|()| intent_file.sync_all())
-                .map_err(|err| map_fs_error(&intent_path, "persist bundle promotion intent", err))?;
+            write_synced_intent_file(&intent_path, intent_payload.as_bytes())?;
 
             if let Err(err) = rename_with_brief_retry(target_dir, &backup_dir) {
-                drop(intent_file);
                 let _ = fs::remove_file(&intent_path);
                 return Err(map_fs_error(
                     target_dir,
@@ -641,7 +640,6 @@ fn atomic_swap_dir(
 
             if let Err(promote_err) = rename_with_brief_retry(staging_dir, target_dir) {
                 let rollback_res = rename_with_brief_retry(&backup_dir, target_dir);
-                drop(intent_file);
                 if rollback_res.is_ok() {
                     let _ = fs::remove_file(&intent_path);
                 }
@@ -661,9 +659,6 @@ fn atomic_swap_dir(
             }
 
             staging_guard.disarm();
-            // Release promotion lock now that `target_dir` points to the new version, waking any
-            // concurrent readers waiting in `recover_or_wait_promotion`.
-            drop(intent_file);
             let _ = fs::remove_file(&intent_path);
 
             remove_dir_all_with_brief_retry(&backup_dir).map_err(|err| {
@@ -679,119 +674,180 @@ fn atomic_swap_dir(
     }
 }
 
-fn promotion_intent_path(target_dir: &Path) -> Option<PathBuf> {
+fn bundle_lock_and_intent_paths(target_dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let parent = target_dir.parent().filter(|p| !p.as_os_str().is_empty())?;
     let name = target_dir.file_name()?.to_str()?;
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return None;
     }
-    Some(parent.join(format!(".promote-{name}.v1")))
+    Some((
+        parent.join(format!(".lock-{name}")),
+        parent.join(format!(".promote-{name}.v1")),
+    ))
 }
 
-fn open_promotion_intent_locked(intent_path: &Path) -> Result<File, SandboxError> {
-    if let Ok(meta) = fs::symlink_metadata(intent_path) {
-        validate_metadata_no_link(intent_path, &meta, false, false)?;
+fn open_bundle_lock_file(lock_path: &Path, create_if_missing: bool) -> Result<Option<File>, SandboxError> {
+    if let Ok(meta) = fs::symlink_metadata(lock_path) {
+        validate_metadata_no_link(lock_path, &meta, false, false)?;
     }
     let mut opts = OpenOptions::new();
-    opts.read(true).write(true).create(true).truncate(false);
+    opts.read(true).write(true).create(create_if_missing).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let file = opts
-        .open(intent_path)
-        .map_err(|err| map_fs_error(intent_path, "open bundle promotion intent", err))?;
+    match opts.open(lock_path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if !create_if_missing && err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => match File::open(lock_path) {
+            Ok(file) => Ok(Some(file)),
+            Err(e) if !create_if_missing && e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(map_fs_error(lock_path, "open bundle lock file", e)),
+        },
+        Err(err) => Err(map_fs_error(lock_path, "open bundle lock file", err)),
+    }
+}
+
+fn open_bundle_lock_exclusive(lock_path: &Path) -> Result<File, SandboxError> {
+    let file = open_bundle_lock_file(lock_path, true)?.ok_or_else(|| {
+        SandboxError::Internal(format!(
+            "bundle lock file '{}' unexpectedly missing after create",
+            lock_path.display()
+        ))
+    })?;
     file.lock()
-        .map_err(|err| map_fs_error(intent_path, "lock bundle promotion intent", err))?;
+        .map_err(|err| map_fs_error(lock_path, "acquire exclusive bundle swap lock", err))?;
     Ok(file)
 }
 
-fn recover_or_wait_promotion(target_dir: &Path) -> Result<(), SandboxError> {
-    let Some(intent_path) = promotion_intent_path(target_dir) else {
-        return Ok(());
+fn acquire_bundle_read_guard(target_dir: &Path) -> Result<Option<File>, SandboxError> {
+    let Some((lock_path, intent_path)) = bundle_lock_and_intent_paths(target_dir) else {
+        return Ok(None);
     };
-    let meta = match fs::symlink_metadata(&intent_path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(map_fs_error(&intent_path, "inspect bundle promotion intent", err)),
+    let need_create = intent_path.exists();
+    let Some(shared_file) = open_bundle_lock_file(&lock_path, need_create)? else {
+        return Ok(None);
     };
-    validate_metadata_no_link(&intent_path, &meta, false, false)?;
+    shared_file
+        .lock_shared()
+        .map_err(|err| map_fs_error(&lock_path, "acquire shared bundle read lock", err))?;
 
-    let mut file = match OpenOptions::new().read(true).write(true).open(&intent_path) {
-        Ok(f) => f,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(map_fs_error(&intent_path, "open bundle promotion intent", err)),
-    };
+    if !intent_path.exists() {
+        return Ok(Some(shared_file));
+    }
 
-    match file.try_lock() {
-        Err(TryLockError::WouldBlock) => {
-            // An active installer holds the lock during its two-step rename; wait for completion.
-            let _ = file.lock_shared();
-            Ok(())
-        }
-        Err(TryLockError::Error(err)) => {
-            Err(map_fs_error(&intent_path, "probe bundle promotion lock", err))
-        }
-        Ok(()) => {
-            let mut text = String::new();
-            let _ = file.read_to_string(&mut text);
-            let mut staging_name: Option<String> = None;
-            let mut backup_name: Option<String> = None;
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("staging=") {
-                    staging_name = Some(rest.trim().to_owned());
-                } else if let Some(rest) = line.strip_prefix("backup=") {
-                    backup_name = Some(rest.trim().to_owned());
-                }
-            }
-
-            if let Some(parent) = target_dir.parent() {
-                let staging_path = staging_name
-                    .as_deref()
-                    .filter(|n| is_safe_sibling_dir_name(n))
-                    .map(|n| parent.join(n));
-                let backup_path = backup_name
-                    .as_deref()
-                    .filter(|n| is_safe_sibling_dir_name(n))
-                    .map(|n| parent.join(n));
-
-                if !target_dir.exists() {
-                    if let Some(ref sp) = staging_path {
-                        if sp.is_dir() {
-                            let _ = rename_with_brief_retry(sp, target_dir);
-                        }
-                    }
-                    if !target_dir.exists() {
-                        if let Some(ref bp) = backup_path {
-                            if bp.is_dir() {
-                                let _ = rename_with_brief_retry(bp, target_dir);
-                            }
-                        }
-                    }
-                }
-
-                if target_dir.exists() {
-                    if let Some(sp) = staging_path {
-                        if sp.exists() {
-                            let _ = remove_dir_all_with_brief_retry(&sp);
-                        }
-                    }
-                    if let Some(bp) = backup_path {
-                        if bp.exists() {
-                            let _ = remove_dir_all_with_brief_retry(&bp);
-                        }
-                    }
-                }
-            }
-
-            drop(file);
-            if target_dir.exists() {
-                let _ = fs::remove_file(&intent_path);
-            }
-            Ok(())
+    // Because `lock_shared()` is held, no active writer owns `lock()`. The leftover intent file
+    // belongs to a crashed promotion; upgrade to an exclusive lock to heal `target_dir`.
+    drop(shared_file);
+    {
+        let _excl = open_bundle_lock_exclusive(&lock_path)?;
+        if intent_path.exists() {
+            recover_promotion_under_exclusive_lock(target_dir, &intent_path)?;
         }
     }
+
+    let healed_shared = open_bundle_lock_file(&lock_path, true)?.ok_or_else(|| {
+        SandboxError::Internal(format!(
+            "bundle lock file '{}' disappeared after recovery",
+            lock_path.display()
+        ))
+    })?;
+    healed_shared
+        .lock_shared()
+        .map_err(|err| map_fs_error(&lock_path, "re-acquire shared bundle read lock", err))?;
+    Ok(Some(healed_shared))
+}
+
+fn write_synced_intent_file(intent_path: &Path, payload: &[u8]) -> Result<(), SandboxError> {
+    if let Ok(meta) = fs::symlink_metadata(intent_path) {
+        validate_metadata_no_link(intent_path, &meta, false, false)?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(intent_path)
+        .map_err(|err| map_fs_error(intent_path, "open bundle promotion intent", err))?;
+    file.write_all(payload)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| map_fs_error(intent_path, "persist bundle promotion intent", err))
+}
+
+fn recover_promotion_under_exclusive_lock(
+    target_dir: &Path,
+    intent_path: &Path,
+) -> Result<(), SandboxError> {
+    let meta = match fs::symlink_metadata(intent_path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(map_fs_error(intent_path, "inspect bundle promotion intent", err)),
+    };
+    validate_metadata_no_link(intent_path, &meta, false, false)?;
+
+    let text = match fs::read_to_string(intent_path) {
+        Ok(t) => t,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(map_fs_error(intent_path, "read bundle promotion intent", err)),
+    };
+
+    let mut staging_name: Option<String> = None;
+    let mut backup_name: Option<String> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("staging=") {
+            staging_name = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("backup=") {
+            backup_name = Some(rest.trim().to_owned());
+        }
+    }
+
+    if let Some(parent) = target_dir.parent() {
+        let staging_path = staging_name
+            .as_deref()
+            .filter(|n| is_safe_sibling_dir_name(n))
+            .map(|n| parent.join(n));
+        let backup_path = backup_name
+            .as_deref()
+            .filter(|n| is_safe_sibling_dir_name(n))
+            .map(|n| parent.join(n));
+
+        if !target_dir.exists() {
+            if let Some(ref sp) = staging_path {
+                if sp.is_dir() {
+                    let _ = rename_with_brief_retry(sp, target_dir);
+                }
+            }
+            if !target_dir.exists() {
+                if let Some(ref bp) = backup_path {
+                    if bp.is_dir() {
+                        let _ = rename_with_brief_retry(bp, target_dir);
+                    }
+                }
+            }
+        }
+
+        if target_dir.exists() {
+            if let Some(sp) = staging_path {
+                if sp.exists() {
+                    let _ = remove_dir_all_with_brief_retry(&sp);
+                }
+            }
+            if let Some(bp) = backup_path {
+                if bp.exists() {
+                    let _ = remove_dir_all_with_brief_retry(&bp);
+                }
+            }
+        }
+    }
+
+    if target_dir.exists() {
+        let _ = fs::remove_file(intent_path);
+    }
+    Ok(())
 }
 
 fn is_safe_sibling_dir_name(name: &str) -> bool {
@@ -1015,11 +1071,18 @@ mod tests {
             .exists());
         verify_installed_bundle(installed_v2.root_dir(), &verifier).unwrap();
 
-        let leftover_entries: Vec<String> = fs::read_dir(&install_root)
+        let mut leftover_entries: Vec<String> = fs::read_dir(&install_root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(leftover_entries, vec!["minipod-mvp-x86_64".to_owned()]);
+        leftover_entries.sort();
+        assert_eq!(
+            leftover_entries,
+            vec![
+                ".lock-minipod-mvp-x86_64".to_owned(),
+                "minipod-mvp-x86_64".to_owned(),
+            ]
+        );
     }
 
     #[test]

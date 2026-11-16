@@ -1,6 +1,6 @@
 # mini-pod
 
-Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with signed Portable Runtime Bundles, owner-only local IPC, an anti-rebinding Host Egress Proxy, an embedded Podman/Docker API compatibility adapter, a Warm Pool, CLI, MCP server, and lightweight async SDK.
+Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with Ed25519-signed Portable Runtime Bundles, owner-only local IPC, an anti-rebinding Host Egress Proxy, an embedded Podman/Docker Engine API compatibility adapter, a pre-booted Warm Pool, CLI (`sandbox-cli`), MCP server (`sandboxd mcp`), and lightweight async Rust SDK (`sandbox-client`).
 
 - **Specification & Architecture Contract:** [BRD.md](BRD.md) (`v2.1`)
 - **Engineering & Security Invariants:** [AGENTS.md](AGENTS.md)
@@ -9,9 +9,25 @@ Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with signed Portable R
 
 ---
 
-## Architecture (4-Layer Clean Workspace)
+## Table of Contents
 
-Dependency arrows point strictly inward from outer composition roots toward domain types and framing:
+1. [Architecture (4-Layer Clean Workspace)](#1-architecture-4-layer-clean-workspace)
+2. [System Requirements & Installation](#2-system-requirements--installation)
+3. [Building Signed Portable Runtime Bundles](#3-building-signed-portable-runtime-bundles)
+4. [Running the Daemon (`sandboxd serve`)](#4-running-the-daemon-sandboxd-serve)
+5. [CLI Usage Guide (`sandbox-cli`)](#5-cli-usage-guide-sandbox-cli)
+6. [Docker API & Testcontainers Integration](#6-docker-api--testcontainers-integration)
+7. [MCP Server Usage (`sandboxd mcp`)](#7-mcp-server-usage-sandboxd-mcp)
+8. [Rust SDK Usage (`sandbox-client`)](#8-rust-sdk-usage-sandbox-client)
+9. [Testing & Verification](#9-testing--verification)
+10. [Benchmark Summary](#10-benchmark-summary-windows-x86_64-whpx)
+11. [License](#11-license)
+
+---
+
+## 1. Architecture (4-Layer Clean Workspace)
+
+Dependency arrows point strictly inward from outer composition roots toward domain types and wire framing:
 
 ```text
 Layer 4 (Composition Roots):   bins/sandboxd  |  bins/sandbox-cli
@@ -32,10 +48,10 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 | Crate / Binary | Layer | Responsibility |
 | --- | --- | --- |
 | [`crates/sandbox-core`](crates/sandbox-core) | 1 | Domain policies (`IsolationMode`, `AccelerationPolicy`, `NetworkPolicy`, `EnforcementLevel`, `ResourceBudget`), `SandboxSpec` validation, `SandboxError`. |
-| [`crates/sandbox-protocol`](crates/sandbox-protocol) | 1 | Length-bounded binary framing, handshake negotiation, prioritized control vs. data lanes, and credit-based backpressure. |
-| [`crates/sandbox-runtime`](crates/sandbox-runtime) | 2 | `RuntimeManager` (`LocalRuntimeManager`): lifecycle, admission control, TTL lease sweeper, crash journal & startup reconciler, Warm Pool, safe tar I/O, and `HostEgressProxy`. |
-| [`crates/sandbox-vmm`](crates/sandbox-vmm) | 3 | Cross-OS QEMU driver (`KVM`/`HVF`/`WHPX` -> `TCG`, never falling back to `SharedKernelAllowed`), Windows Job Object confinement, Unix `setpgid`/cgroup v2, owner-only IPC (`virtio-serial`). |
-| [`crates/sandbox-image`](crates/sandbox-image) | 3 | Ed25519 manifest signature verification, SHA-256 + anti-tamper tree validation, atomic bundle swap, `qemu-img` CoW QCOW2 overlays, and `bundle-pack` signer CLI. |
+| [`crates/sandbox-protocol`](crates/sandbox-protocol) | 1 | Length-bounded binary framing, handshake negotiation, prioritized control vs. data lanes, and per-stream `StreamCredit` backpressure. |
+| [`crates/sandbox-runtime`](crates/sandbox-runtime) | 2 | `RuntimeManager` (`LocalRuntimeManager`): lifecycle, admission control, TTL lease sweeper, exclusive `state.lock`, crash journal & startup reconciler, Warm Pool, safe tar I/O, and `HostEgressProxy`. |
+| [`crates/sandbox-vmm`](crates/sandbox-vmm) | 3 | Cross-OS QEMU driver (`KVM`/`HVF`/`WHPX` -> `TCG`, never falling back to `SharedKernelAllowed`), Windows Job Object confinement + handle whitelist, Unix `setpgid`/cgroup v2, owner-only IPC (`virtio-serial`). |
+| [`crates/sandbox-image`](crates/sandbox-image) | 3 | Ed25519 manifest signature verification, SHA-256 + anti-tamper tree validation, crash-safe versioned bundle promotion, `qemu-img` CoW QCOW2 overlays, and `bundle-pack` signer CLI. |
 | [`crates/sandbox-docker-compat`](crates/sandbox-docker-compat) | 3 | Owner-only IPC (`npipe://` Named Pipe on Windows, `unix://` `0600` socket on Unix) HTTP/1.1 Docker Engine compatibility adapter (`bollard` / `testcontainers` + Ryuk), host port forwarding over virtio, HTTP hijack & half-close, URL/JSON canonicalization, `/libpod/*` block, and raw host bind-mount rejection. |
 | [`crates/sandbox-client`](crates/sandbox-client) | Adapter | Lightweight async `SandboxClient` SDK + `ControlEndpoint` parser + client-side safe tar packing/extraction (no daemon/QEMU/MCP deps). |
 | [`bins/sandboxd`](bins/sandboxd) | 4 | Local daemon (`serve`) over owner-only Named Pipe / Unix socket and JSON-RPC 2.0 `stdio` MCP server (`mcp`). |
@@ -44,27 +60,428 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 
 ---
 
-## Prerequisites
+## 2. System Requirements & Installation
 
-- **Rust toolchain:** Rust `1.89+` (`rustfmt`, `cargo`)
-- **QEMU:** `qemu-system-x86_64` (plus `qemu-system-aarch64` for cross-arch bundle test) and `qemu-img` on `PATH` (or in standard Windows `Program Files\qemu` / `%LOCALAPPDATA%\Programs\qemu`)
-- **Docker (optional, for rebuilding reproducible guest bundles & offline OCI test images):** Linux container runtime supporting `linux/amd64` and `linux/arm64`
+### 2.1 Prerequisites
+
+1. **Rust Toolchain (`1.89+`):**
+   ```bash
+   rustup update stable
+   rustc --version   # must be >= 1.89.0
+   ```
+2. **QEMU (`qemu-system-x86_64` / `qemu-system-aarch64` & `qemu-img`):**
+   - **Windows (`x86_64`):**
+     ```powershell
+     winget install SoftwareFreedomConservancy.QEMU
+     ```
+     Ensure `C:\Program Files\qemu` is in `PATH` (or `mini-pod` will auto-discover it in `C:\Program Files\qemu` and `%LOCALAPPDATA%\Programs\qemu`). Enable **Windows Hypervisor Platform (`WHPX`)** in Windows Features for hardware acceleration (falls back to `TCG` automatically when `AccelerationPolicy::Preferred` is used).
+   - **Linux (`x86_64` / `aarch64`):**
+     ```bash
+     # Ubuntu / Debian
+     sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-utils
+     ```
+     Grant your user read/write access to `/dev/kvm` (`sudo usermod -aG kvm $USER`) for `KVM` hardware acceleration.
+   - **macOS (`x86_64` / `aarch64`):**
+     ```bash
+     brew install qemu
+     ```
+     Uses Apple Hypervisor.framework (`-accel hvf`) with automatic fallback to `TCG`.
+3. **Docker (Optional — only required when building guest bundles from source):**
+   - Needed to run `scripts/build-portable-bundles.ps1` and `scripts/build-test-oci-images.ps1`.
+
+### 2.2 Build & Install Binaries from Source
+
+Clone the repository and build the workspace in release mode:
+
+```bash
+git clone https://github.com/OrgGem/mini-pod.git
+cd mini-pod
+
+# Build daemon (sandboxd), CLI (sandbox-cli), and bundle signer (bundle-pack)
+cargo build --release --bins
+```
+
+Compiled binaries are placed in `target/release/`:
+- `target/release/sandboxd` (`sandboxd.exe` on Windows) — Local control daemon & MCP server
+- `target/release/sandbox-cli` (`sandbox-cli.exe` on Windows) — Command-line client
+- `target/release/bundle-pack` (`bundle-pack.exe` on Windows) — Ed25519 bundle manifest generator & signer
+
+Or install directly into `~/.cargo/bin`:
+
+```bash
+cargo install --path bins/sandboxd
+cargo install --path bins/sandbox-cli
+```
 
 ---
 
-## Build & Test Commands
+## 3. Building Signed Portable Runtime Bundles
 
-### Fast Compile & Unit/Component Tests (No QEMU Required)
+`mini-pod` boots micro-VMs from an Ed25519-signed **Portable Runtime Bundle** containing:
+- `kernel/vmlinuz-virt` — Pinned Alpine `linux-virt` kernel
+- `boot/initramfs.cpio.gz` — Reproducible initramfs with `tiny-init` as `/init`
+- `rootfs/base.qcow2` — Read-only ext4/QCOW2 rootfs with `sandbox-agent` and `podman`/`crun`
+- `bin/tiny-init` & `bin/sandbox-agent` — Static musl guest binaries
+- `manifest.v1` & `manifest.sig` — Canonical manifest and 64-byte Ed25519 signature
+
+### 3.1 Build Reproducible Multi-Arch Bundles (`x86_64` & `aarch64`)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1
+```
+
+By default, this script:
+1. Generates a development Ed25519 keypair in `.cache/keys/dev-bundle.key` and `.cache/keys/dev-bundle.pub` (if not already present).
+2. Builds byte-for-byte reproducible `x86_64` and `aarch64` bundles in `.cache/bundles-src/x86_64` and `.cache/bundles-src/aarch64`.
+
+### 3.2 Custom Keypair & Manual Signing (`bundle-pack`)
+
+To generate your own production Ed25519 keypair and sign a bundle directory:
+
+```bash
+# 1. Generate a 32-byte Ed25519 secret key and 32-byte public key (64 hex chars each)
+cargo run --release -p sandbox-image --bin bundle-pack -- \
+  --generate-keypair ./keys/prod-bundle.key ./keys/prod-bundle.pub
+
+# 2. Pack and sign a bundle directory
+cargo run --release -p sandbox-image --bin bundle-pack -- \
+  --bundle-dir .cache/bundles-src/x86_64 \
+  --bundle-id minipod-linux-x86_64-v1 \
+  --host-os any \
+  --guest-arch x86_64 \
+  --pin "rust_alpine_digest=sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409" \
+  --pin "alpine_digest=sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc" \
+  --pin "source_date_epoch=1704067200" \
+  --entry "kernel=kernel/vmlinuz-virt" \
+  --entry "initrd=boot/initramfs.cpio.gz" \
+  --entry "base_rootfs_qcow2=rootfs/base.qcow2" \
+  --entry "tiny_init=bin/tiny-init" \
+  --entry "guest_agent=bin/sandbox-agent" \
+  --secret-key-file ./keys/prod-bundle.key
+```
+
+---
+
+## 4. Running the Daemon (`sandboxd serve`)
+
+`sandboxd serve` runs the local control daemon over an **owner-only** OS IPC endpoint:
+- **Windows default endpoint:** `\\.\pipe\minipod-sandboxd-<USERNAME>` (Win32 DACL `D:P(A;;GA;;;{USER_SID})` + `PIPE_REJECT_REMOTE_CLIENTS`)
+- **Linux / macOS default endpoint:** `unix://$XDG_RUNTIME_DIR/minipod/ctl.sock` or `unix:///tmp/minipod-<UID>/ctl.sock` (`0600` socket inside a `0700` owner-only directory)
+
+### 4.1 Start `sandboxd serve` on Windows (PowerShell)
+
+```powershell
+.\target\release\sandboxd.exe serve `
+  --bundle-dir .cache\bundles-src\x86_64 `
+  --pub-key-file .cache\keys\dev-bundle.pub `
+  --state-dir "$env:LOCALAPPDATA\minipod\state" `
+  --warm-pool-size 1 `
+  --max-sandboxes 8 `
+  --max-rss-mb 4096 `
+  --max-storage-mb 8192 `
+  --admission-timeout-ms 5000
+```
+
+### 4.2 Start `sandboxd serve` on Linux / macOS (Bash)
+
+```bash
+./target/release/sandboxd serve \
+  --bundle-dir .cache/bundles-src/x86_64 \
+  --pub-key-file .cache/keys/dev-bundle.pub \
+  --state-dir "$HOME/.local/state/minipod" \
+  --warm-pool-size 1 \
+  --max-sandboxes 8 \
+  --max-rss-mb 4096 \
+  --max-storage-mb 8192 \
+  --admission-timeout-ms 5000
+```
+
+### 4.3 `sandboxd` Options & Environment Variables
+
+| Option | Environment Variable | Description |
+| --- | --- | --- |
+| `--bundle-dir <PATH>` | `MINIPOD_BUNDLE_DIR` | Path to the signed Portable Runtime Bundle directory (required). |
+| `--pub-key-file <PATH>` | `MINIPOD_PUB_KEY_FILE` | File containing the 64-character hex Ed25519 public key. |
+| `--pub-key-hex <HEX>` | `MINIPOD_PUB_KEY_HEX` | Inline 64-character hex Ed25519 public key. |
+| `--state-dir <PATH>` | `MINIPOD_STATE_DIR` | Durable state directory for `state.lock`, crash journals (`journals/`), and per-VM overlays (`sandboxes/`). |
+| `--endpoint <URI>` | `MINIPOD_ENDPOINT` | Custom local control endpoint (`\\.\pipe\...` / `npipe://...` on Windows, `unix:///...` on Unix). Plain TCP (`tcp://`, `http://`) is rejected. |
+| `--ready-file <PATH>` | — | Writes an atomic JSON readiness file (`{"endpoint":"...","pid":...}`) once the listener is bound. |
+| `--qemu-bin <PATH>` | `MINIPOD_QEMU_BIN` | Explicit path to `qemu-system-x86_64` or `qemu-system-aarch64`. |
+| `--qemu-img-bin <PATH>` | `MINIPOD_QEMU_IMG_BIN` | Explicit path to `qemu-img`. |
+| `--arch <x86_64\|aarch64>` | `MINIPOD_ARCH` | Guest architecture (defaults to host native architecture). |
+| `--warm-pool-size <N>` | — | Number of pre-booted `Isolated` VMs (`1 vCPU`, `256 MiB` RAM, `512 MiB` RSS cap, `512 MiB` disk) kept ready for `< 500 ms` checkout (default: `0`). |
+| `--max-sandboxes <N>` | — | Maximum concurrent active + warm sandboxes. |
+| `--max-rss-mb <N>` | — | Maximum total Host RSS budget across all sandboxes in MiB. |
+| `--max-storage-mb <N>` | — | Maximum total Host physical storage budget in MiB. |
+| `--admission-timeout-ms <MS>` | — | Time in milliseconds a foreground `spawn` waits in the FIFO admission queue before returning `AdmissionRejected` (default: `0`). |
+
+---
+
+## 5. CLI Usage Guide (`sandbox-cli`)
+
+`sandbox-cli` connects to `sandboxd` over the default owner-only endpoint (or `--endpoint <URI>` / `MINIPOD_ENDPOINT`). Add `--json` to any command for structured JSON output.
+
+### 5.1 Check Daemon Status
+
+```bash
+sandbox-cli status
+sandbox-cli --json status
+```
+
+### 5.2 Spawn a Micro-VM Sandbox
+
+- **Warm Pool Checkout (matches default warm template: `isolated`, `1` vCPU, `256 MiB` RAM, `512 MiB` RSS, `512 MiB` disk):**
+  ```bash
+  sandbox-cli --json spawn --rss-mb 512 --ttl-secs 300
+  ```
+- **Custom Network Policy (`isolated`, `internet`, or repeatable `allow:<domain>:<port>`):**
+  ```bash
+  # Allow outbound HTTPS/HTTP only to github.com:443 and *.npmjs.org:443 via HostEgressProxy
+  sandbox-cli spawn \
+    --isolation vm \
+    --accel preferred \
+    --network allow:github.com:443 \
+    --network allow:*.npmjs.org:443 \
+    --vcpus 2 \
+    --ram-mb 512 \
+    --rss-mb 768 \
+    --cpu-millicores 1000 \
+    --disk-mb 1024 \
+    --storage-mb 2048 \
+    --ttl-secs 600
+  ```
+
+### 5.3 Copy Workspace In, Execute Commands, and Copy Results Out
+
+```bash
+# 1. Copy a host directory or file into the guest VM (safe tar: rejects symlinks, '..', reparse points)
+sandbox-cli copy-in <SANDBOX_ID> ./my-project /workspace/app
+
+# 2. Run a command inside the Guest VM with environment variables, working directory, and budgets
+sandbox-cli exec <SANDBOX_ID> \
+  --cwd /workspace/app \
+  --user 0:0 \
+  --env RUST_BACKTRACE=1 \
+  --deadline-secs 60 \
+  --stdout-budget-bytes 1048576 \
+  --stderr-budget-bytes 262144 \
+  -- /bin/sh -c "uname -a && ls -la /workspace/app"
+
+# 3. Run a command directly inside a running Podman container within the Guest VM
+sandbox-cli exec <SANDBOX_ID> \
+  --container my-container \
+  --cwd /work \
+  -- /bin/sh -c "env && ps aux"
+
+# 4. Copy build artifacts from the guest VM back to the host (staged atomically via temp files)
+sandbox-cli copy-out <SANDBOX_ID> /workspace/app/dist ./host-dist
+```
+
+### 5.4 Renew Lease & Destroy Sandbox (Idempotent)
+
+```bash
+# Extend lease TTL by 600 seconds from now
+sandbox-cli renew <SANDBOX_ID> --ttl-secs 600
+
+# Destroy sandbox and reclaim all host processes, overlays, and journals (idempotent)
+sandbox-cli destroy <SANDBOX_ID>
+```
+
+---
+
+## 6. Docker API & Testcontainers Integration
+
+Each sandbox VM runs an isolated Podman daemon inside the guest reachable exclusively over `virtio-serial`. `sandbox-docker-compat` exposes an owner-only Docker Engine HTTP/1.1 endpoint on the Host:
+
+```bash
+# Standard mode (blocks all host bind mounts including /var/run/docker.sock)
+sandbox-cli docker-endpoint <SANDBOX_ID>
+
+# Testcontainers mode (rewrites /var/run/docker.sock bind mount to /run/podman/podman.sock inside guest for Ryuk)
+sandbox-cli docker-endpoint <SANDBOX_ID> --allow-reaper-socket
+```
+
+Output URI:
+- **Windows:** `npipe:////./pipe/minipod-docker-<PID>-<SEQ>` (protected by owner-only Win32 DACL)
+- **Linux / macOS:** `unix:///.../d.sock` (`0600` socket inside a `0700` directory)
+
+### Using with `DOCKER_HOST`, `bollard`, or `testcontainers`
+
+```powershell
+# PowerShell (Windows)
+$env:DOCKER_HOST = (sandbox-cli docker-endpoint <SANDBOX_ID> --allow-reaper-socket).Trim()
+$env:TESTCONTAINERS_HOST_OVERRIDE = "127.0.0.1"
+```
+
+```bash
+# Bash (Linux / macOS)
+export DOCKER_HOST="$(sandbox-cli docker-endpoint <SANDBOX_ID> --allow-reaper-socket)"
+export TESTCONTAINERS_HOST_OVERRIDE="127.0.0.1"
+```
+
+Security policies enforced automatically by `sandbox-docker-compat`:
+- Publishes container ports exclusively onto Host `127.0.0.1:<ephemeral_port>` and rewrites `/containers/{id}/json` (`inspect`) and `/containers/json` (`list`) so Testcontainers and Docker SDKs connect seamlessly.
+- Supports `101 UPGRADED` HTTP hijack with independent `stdin`/`stdout` half-close (`/exec/{id}/start`, `/containers/{id}/attach`).
+- Blocks `/libpod/*` routes (`403 Forbidden`), canonicalizes URL paths, rejects duplicate or case-smuggled JSON keys, and blocks raw host bind mounts, `Privileged=true`, `CapAdd`, `Devices`, `DeviceCgroupRules`, and host namespace sharing (`400 Bad Request`).
+
+---
+
+## 7. MCP Server Usage (`sandboxd mcp`)
+
+`sandboxd mcp` implements a newline-delimited JSON-RPC 2.0 Model Context Protocol (`2024-11-05`) server over `stdio`. It supports two modes:
+
+### 7.1 Connected Mode (Shares a Running `sandboxd serve` Daemon)
+
+```json
+{
+  "mcpServers": {
+    "mini-pod": {
+      "command": "sandboxd",
+      "args": [
+        "mcp",
+        "--connect",
+        "\\\\.\\pipe\\minipod-sandboxd-Gem"
+      ]
+    }
+  }
+}
+```
+
+### 7.2 Standalone Mode (Manages its Own Embedded Runtime)
+
+```json
+{
+  "mcpServers": {
+    "mini-pod": {
+      "command": "sandboxd",
+      "args": [
+        "mcp",
+        "--bundle-dir",
+        "D:\\Git\\mini-pod\\.cache\\bundles-src\\x86_64",
+        "--pub-key-file",
+        "D:\\Git\\mini-pod\\.cache\\keys\\dev-bundle.pub",
+        "--state-dir",
+        "C:\\Users\\Gem\\AppData\\Local\\minipod\\mcp-state",
+        "--warm-pool-size",
+        "1"
+      ]
+    }
+  }
+}
+```
+
+### Exposed MCP Tools
+
+| Tool Name | Description |
+| --- | --- |
+| `sandbox_status` | Query active sandboxes, warm pool readiness, and host resource reservations. |
+| `sandbox_spawn` | Spawn an isolated or egress-filtered micro-VM with custom CPU/RAM/disk/TTL budgets. |
+| `sandbox_exec` | Execute a command inside the guest VM or a container (`argv`, `cwd`, `env`, `deadline_secs`). |
+| `sandbox_renew_lease` | Renew a sandbox's TTL lease (`sandbox_id`, `ttl_secs`). |
+| `sandbox_copy_in` | Safely pack and copy a host file/directory into the guest (`src_host`, `dst_guest`). |
+| `sandbox_copy_out` | Safely copy and extract a guest file/directory to the host (`src_guest`, `dst_host`). |
+| `sandbox_destroy` | Idempotently destroy a sandbox and verify `AllResourcesCleaned`. |
+
+---
+
+## 8. Rust SDK Usage (`sandbox-client`)
+
+Add `sandbox-client` and `sandbox-core` to your `Cargo.toml` to control `sandboxd` programmatically without pulling in daemon, VMM, or MCP dependencies:
+
+```rust
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::Duration;
+use sandbox_client::{ControlEndpoint, SandboxClient};
+use sandbox_core::{
+    AccelerationPolicy, DestroyStatus, ExecRequest, ExecTarget, IsolationMode, NetworkPolicy,
+    ResourceBudget, SandboxSpec,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Windows Named Pipe or Unix socket ("unix:///tmp/minipod-1000/ctl.sock")
+    let endpoint = ControlEndpoint::parse(r"\\.\pipe\minipod-sandboxd-Gem")?;
+    let client = SandboxClient::new(endpoint);
+
+    // 1. Spawn a micro-VM (matches Warm Pool template when warm-pool-size > 0)
+    let lease = client
+        .spawn(SandboxSpec {
+            isolation: IsolationMode::VmRequired,
+            acceleration: AccelerationPolicy::Preferred,
+            network: NetworkPolicy::Isolated,
+            budget: ResourceBudget {
+                guest_vcpus: 1,
+                host_cpu_quota_Millicores: None,
+                guest_ram_mb: 256,
+                host_rss_budget_mb: Some(512),
+                virtual_disk_mb: 512,
+                host_storage_budget_mb: 1024,
+            },
+            lease_ttl: Duration::from_secs(300),
+        })
+        .await?;
+
+    // 2. Copy host files in, execute a command, and copy results out
+    client
+        .copy_in_path(&lease.id, Path::new("./src"), "/tmp/work_in")
+        .await?;
+
+    let out = client
+        .exec_collect(
+            &lease.id,
+            ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "mkdir -p /tmp/work_out && ls -la /tmp/work_in > /tmp/work_out/listing.txt && cat /tmp/work_out/listing.txt".into(),
+                ],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(15),
+                stdout_budget_bytes: 256 * 1024,
+                stderr_budget_bytes: 64 * 1024,
+            },
+        )
+        .await?;
+    assert_eq!(out.exit.code, Some(0));
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+
+    client
+        .copy_out_to_path(&lease.id, "/tmp/work_out", Path::new("./out"))
+        .await?;
+
+    // 3. Optionally enable the owner-only Docker API endpoint for bollard / testcontainers
+    let docker_uri = client.enable_docker_compat(&lease.id, false).await?;
+    println!("Docker endpoint: {docker_uri}");
+
+    // 4. Idempotent teardown
+    let status = client.destroy(&lease.id).await?;
+    assert_eq!(status, DestroyStatus::AllResourcesCleaned);
+    Ok(())
+}
+```
+
+---
+
+## 9. Testing & Verification
+
+### 9.1 Fast Compile, Clippy & Unit/Component Tests (No QEMU Required)
 
 ```powershell
 # Compile all workspace targets
 cargo check --all-targets
 
-# Run workspace unit + non-QEMU tests (QEMU-backed E2E tests skip cleanly unless MINIPOD_REQUIRE_QEMU_TESTS=1)
+# Lint all workspace targets with warnings denied
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Run all unit and component tests (QEMU-backed E2E tests skip cleanly unless MINIPOD_REQUIRE_QEMU_TESTS=1)
 cargo test --workspace
 ```
 
-### Build Signed Portable Runtime Bundles & Run Full QEMU E2E Suite
+### 9.2 Full Live-QEMU E2E Suite
 
 ```powershell
 # 1. Build reproducible signed x86_64 & aarch64 bundles (.cache/bundles-src + .cache/keys/dev-bundle.pub)
@@ -73,14 +490,14 @@ powershell -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1
 # 2. Build offline OCI test images for Docker compat / Testcontainers E2E (.cache/test-images)
 powershell -ExecutionPolicy Bypass -File scripts/build-test-oci-images.ps1
 
-# 3. Run full workspace tests requiring live QEMU + WHPX/KVM/TCG
+# 3. Run full workspace tests requiring live QEMU + WHPX/KVM/HVF/TCG
 $env:MINIPOD_REQUIRE_QEMU_TESTS = "1"
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 ```
 
 ---
 
-## Benchmark Summary (`windows-x86_64`, `whpx`)
+## 10. Benchmark Summary (`windows-x86_64`, `whpx`)
 
 Measured by `crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs` and recorded in [docs/benchmarks/phase6-windows-x86_64.md](docs/benchmarks/phase6-windows-x86_64.md):
 
@@ -98,6 +515,6 @@ Warm Pool Checkout (`3.50 ms` p50) meets the `<= 500.0 ms` Warm Pool target. Col
 
 ---
 
-## License
+## 11. License
 
 MIT (`Cargo.toml`: `license = "MIT"`).
