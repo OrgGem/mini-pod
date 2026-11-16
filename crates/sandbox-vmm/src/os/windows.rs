@@ -50,7 +50,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use crate::ipc::{validate_pipe_name, validate_socket_path};
 
 /// Win32 `IO_REPARSE_TAG_AF_UNIX` reparse tag assigned to WinSock2 `AF_UNIX` socket files.
-const IO_REPARSE_TAG_AF_UNIX: u32 = 0xA000_0023;
+const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 
 /// WinSock2 `SOCKADDR_UN` layout (`<afunix.h>`): `ADDRESS_FAMILY` + 108-byte `sun_path`.
@@ -1221,6 +1221,10 @@ mod tests {
             );
         }
         drop(listener);
+        // Re-binding without deleting `sock_path` first verifies stale `IO_REPARSE_TAG_AF_UNIX` cleanup.
+        let rebound = IpcListener::bind(&sock_path)
+            .expect("re-bind WinSock AF_UNIX listener over stale AF_UNIX socket reparse point");
+        drop(rebound);
         let _ = fs::remove_file(&sock_path);
 
         // Pre-existing permissive directory (inheriting %TEMP%'s SYSTEM/Admin/Users ACEs) must be rejected.
