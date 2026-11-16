@@ -933,6 +933,75 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
         "unexpected ExecTarget::Container stdout: {direct_stdout:?}"
     );
 
+    // 10b. ExecTarget::Container deadline kills detached container-side process tree (#4).
+    let ctr_deadline_stream = harness
+        .manager
+        .exec_stream(
+            &lease.id,
+            ExecRequest {
+                target: ExecTarget::Container {
+                    id_or_name: cid.clone(),
+                },
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "rm -f /tmp/ctr-escaped && setsid sh -c 'sleep 1; echo survived > /tmp/ctr-escaped' </dev/null >/dev/null 2>&1 & wait".to_owned(),
+                ],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_millis(500),
+                stdout_budget_bytes: 64 * 1024,
+                stderr_budget_bytes: 64 * 1024,
+            },
+        )
+        .await
+        .expect("start deadline-bound ExecTarget::Container");
+    let ctr_deadline_out = ctr_deadline_stream
+        .collect()
+        .await
+        .expect("collect deadline-bound ExecTarget::Container");
+    assert!(
+        ctr_deadline_out.exit.timed_out,
+        "expected timed_out == true on ExecTarget::Container deadline, got {:?}",
+        ctr_deadline_out.exit
+    );
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let ctr_verify_out = harness
+        .manager
+        .exec_stream(
+            &lease.id,
+            ExecRequest {
+                target: ExecTarget::Container {
+                    id_or_name: cid.clone(),
+                },
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "if [ -e /tmp/ctr-escaped ]; then echo ESCAPED; else echo CONTAINED; fi"
+                        .to_owned(),
+                ],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(10),
+                stdout_budget_bytes: 64 * 1024,
+                stderr_budget_bytes: 64 * 1024,
+            },
+        )
+        .await
+        .expect("verify container-side process tree killed")
+        .collect()
+        .await
+        .expect("collect container verification");
+    assert_eq!(ctr_verify_out.exit.code, Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&ctr_verify_out.stdout).trim(),
+        "CONTAINED",
+        "detached container exec process survived deadline kill!"
+    );
+
     // 11. Stop & remove container, verifying Host port forward closes promptly.
     docker
         .stop_container(&cid, Some(StopContainerOptions { t: 2 }))

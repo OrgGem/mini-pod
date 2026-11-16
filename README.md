@@ -36,11 +36,11 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 | [`crates/sandbox-runtime`](crates/sandbox-runtime) | 2 | `RuntimeManager` (`LocalRuntimeManager`): lifecycle, admission control, TTL lease sweeper, crash journal & startup reconciler, Warm Pool, safe tar I/O, and `HostEgressProxy`. |
 | [`crates/sandbox-vmm`](crates/sandbox-vmm) | 3 | Cross-OS QEMU driver (`KVM`/`HVF`/`WHPX` -> `TCG`, never falling back to `SharedKernelAllowed`), Windows Job Object confinement, Unix `setpgid`/cgroup v2, owner-only IPC (`virtio-serial`). |
 | [`crates/sandbox-image`](crates/sandbox-image) | 3 | Ed25519 manifest signature verification, SHA-256 + anti-tamper tree validation, atomic bundle swap, `qemu-img` CoW QCOW2 overlays, and `bundle-pack` signer CLI. |
-| [`crates/sandbox-docker-compat`](crates/sandbox-docker-compat) | 3 | Loopback HTTP/1.1 Docker Engine compatibility adapter (`bollard` / `testcontainers` + Ryuk), host port forwarding over virtio, HTTP hijack & half-close, raw host bind-mount rejection. |
+| [`crates/sandbox-docker-compat`](crates/sandbox-docker-compat) | 3 | Owner-only IPC (`npipe://` Named Pipe on Windows, `unix://` `0600` socket on Unix) HTTP/1.1 Docker Engine compatibility adapter (`bollard` / `testcontainers` + Ryuk), host port forwarding over virtio, HTTP hijack & half-close, URL/JSON canonicalization, `/libpod/*` block, and raw host bind-mount rejection. |
 | [`crates/sandbox-client`](crates/sandbox-client) | Adapter | Lightweight async `SandboxClient` SDK + `ControlEndpoint` parser + client-side safe tar packing/extraction (no daemon/QEMU/MCP deps). |
 | [`bins/sandboxd`](bins/sandboxd) | 4 | Local daemon (`serve`) over owner-only Named Pipe / Unix socket and JSON-RPC 2.0 `stdio` MCP server (`mcp`). |
 | [`bins/sandbox-cli`](bins/sandbox-cli) | 4 | CLI client (`status`, `spawn`, `exec`, `renew`, `copy-in`, `copy-out`, `docker-endpoint`, `destroy`). |
-| [`guest/tiny-init`](guest/tiny-init) & [`guest/sandbox-agent`](guest/sandbox-agent) | Guest | PID 1 read-only rootfs + overlay setup, zombie reaping, execution supervisor (process-group/cgroup kill on deadline or output budget), and Podman Unix socket relay. |
+| [`guest/tiny-init`](guest/tiny-init) & [`guest/sandbox-agent`](guest/sandbox-agent) | Guest | PID 1 read-only rootfs + overlay setup, zombie reaping, execution supervisor (per-exec cgroup v2 `cgroup.kill` + container exec process-tree termination on deadline or output budget), and Podman Unix socket relay. |
 
 ---
 

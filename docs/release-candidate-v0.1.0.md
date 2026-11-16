@@ -1,6 +1,6 @@
-# mini-pod v0.1.0-rc1 — Release Candidate Verification & Security Guide
+# mini-pod v0.1.0-rc2 — Release Candidate Verification & Security Guide
 
-- **Version:** `0.1.0` (`v0.1.0-rc1`)
+- **Version:** `0.1.0` (`v0.1.0-rc2`)
 - **Architecture Contract:** [BRD.md](../BRD.md) (`v2.1`, QEMU-First MVP)
 - **Primary Reference Benchmark:** [docs/benchmarks/phase6-windows-x86_64.md](benchmarks/phase6-windows-x86_64.md)
 
@@ -10,10 +10,10 @@
 
 | Platform / Target | Accelerator / Mode | Verification Status | Verified Scope & Notes |
 | --- | --- | --- | --- |
-| **Windows `x86_64`** | QEMU + `WHPX` (fallback `TCG`) | **Verified (Live QEMU E2E)** | Full Phase 1–7 live QEMU suite executed on Windows host with `WHPX`: signed bundle verification, Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, CPU/RAM limits, handle whitelist), owner-SID Named Pipe DACL (`ERROR_ACCESS_DENIED` to restricted non-owner token), `sandbox-docker-compat` (`bollard` + `testcontainers` + Ryuk), `HostEgressProxy`, Warm Pool + 4-metric benchmark, `sandboxd` + `sandbox-cli` + `mcp` + crash-recovery drill. |
-| **Linux `x86_64`** | QEMU + `KVM` (fallback `TCG`) / `SharedKernelAllowed` (explicit opt-in) | **Partially Verified (Container musl + Unit/IPC)** | Cross-compiled & tested in pinned `rust:alpine` musl container: guest `tiny-init` / `sandbox-agent`, `0700`/`0600` Unix socket ownership, root `fork` + `setuid(65534)` kernel `EACCES` check (`CrossUserIpcCheck::KernelRejectedAccess`), cgroup v2 & `/proc/<pid>/stat` parser tests. Live Linux `KVM` boot was **not** executed on this Windows host. |
+| **Windows `x86_64`** | QEMU + `WHPX` (fallback `TCG`) | **Verified (Live QEMU E2E)** | Full Phase 1–8 live QEMU suite executed on Windows host with `WHPX`: signed bundle verification, exclusive `state.lock`, Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, CPU/RAM limits, handle whitelist, confined `qemu -accel help` & `qemu-img` helpers), owner-SID Named Pipe DACLs on both `sandboxd` and `DockerCompatServer` (`ERROR_ACCESS_DENIED` to restricted non-owner token), `sandbox-docker-compat` (`bollard` + `testcontainers` + Ryuk), `HostEgressProxy`, Warm Pool + 4-metric benchmark, `sandboxd` + `sandbox-cli` + `mcp` + crash-recovery drill. |
+| **Linux `x86_64`** | QEMU + `KVM` (fallback `TCG`) / `SharedKernelAllowed` (explicit opt-in) | **Partially Verified (Container musl + Unit/IPC)** | Cross-compiled & tested in pinned `rust:alpine` musl container: guest `tiny-init` / `sandbox-agent`, per-exec cgroup v2 `cgroup.kill` + `setsid` containment, `0700`/`0600` Unix socket ownership on control & Docker IPC, root `fork` + `setuid(65534)` kernel `EACCES` check (`CrossUserIpcCheck::KernelRejectedAccess`), cgroup v2 & `/proc/<pid>/stat` parser tests. Live Linux `KVM` boot was **not** executed on this Windows host. |
 | **Linux `aarch64`** | QEMU + `KVM` / `TCG` | **Verified (Bundle + Cross-Arch QEMU TCG Boot)** | Reproducible signed `aarch64` Portable Runtime Bundle built via `scripts/build-portable-bundles.ps1` and booted end-to-end under `qemu-system-aarch64` (`-accel tcg`) in Phase 2 (`signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64`). Live ARM64 KVM host tests not run on this Windows host. |
-| **macOS (`x86_64` / `aarch64`)** | QEMU + `HVF` (fallback `TCG`) | **Unexecuted on Host (Code Paths Implemented)** | Unix `0700`/`0600` IPC, `setpgid(0, 0)` process-group confinement, and `-accel hvf` -> `-accel tcg` selection are implemented; live execution on macOS hardware was **not** performed. |
+| **macOS (`x86_64` / `aarch64`)** | QEMU + `HVF` (fallback `TCG`) | **Unexecuted on Host (Code Paths Implemented)** | Unix `0700`/`0600` IPC, `proc_pidinfo(PROC_PIDTBSDINFO)` microsecond `start_token` verification (`expected_start_token == 0` rejected), `setpgid(0, 0)` process-group confinement, and `-accel hvf` -> `-accel tcg` selection are implemented; live execution on macOS hardware was **not** performed. |
 | **Windows `ARM64`** | — | **Deferred Post-MVP** | Explicitly out of scope for MVP (`BRD.md` Section 4.2 & Section 6). |
 
 ---
@@ -25,24 +25,25 @@
 - **`SharedKernelAllowed` requires explicit opt-in on Linux only:** `SandboxSpec::validate_for_host_os` rejects `SharedKernelAllowed` on Windows and macOS (`SandboxError::UnsupportedIsolationMode`), and `QemuVmDriver` rejects `SharedKernelAllowed` unconditionally (`SandboxError::UnsupportedIsolationMode`).
 - **Windows Enterprise Lockdown (AppLocker / WDAC / EDR):** If host security policy blocks launching `qemu-system-*` or `qemu-img`, `classify_launch_error` surfaces `SandboxError::BinaryExecutionBlocked` with a diagnostic message rather than attempting workarounds.
 
-### 2.2 Local Control IPC & Authentication
-- **Owner-only OS IPC:**
-  - **Windows:** `sandboxd` binds Named Pipes with `PIPE_REJECT_REMOTE_CLIENTS` and a protected owner-only DACL `D:P(A;;GA;;;{USER_SID})` (`create_owner_only_async_named_pipe`), verified by `verify_non_owner_named_pipe_denied` against a restricted token with the owner SID disabled (`ERROR_ACCESS_DENIED`).
-  - **Unix:** `sandboxd` binds `AF_UNIX` sockets with `0600` mode inside an owner-only non-symlink `0700` directory (`ensure_owner_only_dir`), verified against non-owner UIDs (`65534:65534`) via `verify_non_owner_unix_socket_denied` (`EACCES`).
+### 2.2 Local Control & Docker Compatibility IPC Authentication
+- **Owner-only OS IPC across both `sandboxd` and `DockerCompatServer`:**
+  - **Windows:** Both `sandboxd` control listeners and `enable_docker_compat` (`npipe:////./pipe/minipod-docker-...`) bind Named Pipes with `PIPE_REJECT_REMOTE_CLIENTS` and a protected owner-only DACL `D:P(A;;GA;;;{USER_SID})` (`create_owner_only_async_named_pipe`), verified by `verify_non_owner_named_pipe_denied` against a restricted token with the owner SID disabled (`ERROR_ACCESS_DENIED`).
+  - **Unix:** Both `sandboxd` control listeners and `enable_docker_compat` (`unix:///...`) bind `AF_UNIX` sockets with `0600` mode inside an owner-only non-symlink `0700` directory (`ensure_owner_only_dir`), verified against non-owner UIDs (`65534:65534`) via `verify_non_owner_unix_socket_denied` (`EACCES`).
+- **No Unauthenticated Loopback Docker Listener & Hardened Policy Gate:** `DockerCompatServer` does not expose unauthenticated TCP in non-test builds, blocks Podman-native `/libpod/*` endpoints (`403 Forbidden`), canonicalizes duplicate slashes and percent-encoded segments (`//containers//%63reate`), rejects duplicate or case-colliding JSON keys (`"hostconfig"`, `"binds"`, `"privileged"`), and rejects host bind mounts, `Devices`, `DeviceCgroupRules`, `CapAdd`, and `SecurityOpt=unconfined`/`disable`.
 - **Plaintext Network Control Rejected:** `ControlEndpoint::parse`, `sandboxd` (`--tcp`, `--endpoint`), and `sandbox-cli` (`--endpoint`) reject `tcp://`, `http://`, `https://`, `ws://`, `wss://`, `tls://`, and remote UNC pipe paths (`\\server\pipe\...`) with `SandboxError::PolicyViolation`.
 
 ### 2.3 Host Egress Proxy & Anti-DNS-Rebinding (`NetworkPolicy`)
 - **`Isolated` (default):** Guest VM boots with `-nic none` (only `lo`, no external network interface or routes).
-- **`InternetOnly` / `DomainAllowList`:** Guest boots with `-nic none`; all container/guest HTTP/HTTPS traffic is forced over `virtio-serial` through `HostEgressProxy`. Direct guest DNS queries and raw UDP/QUIC egress are impossible.
+- **`InternetOnly` / `DomainAllowList`:** Guest boots with `-nic none`; all container/guest HTTP/HTTPS traffic is forced over `virtio-serial` through `HostEgressProxy` with bounded concurrency (`64` concurrent guest egress streams), a `15s` request-head timeout, a `10s` upstream TCP dial timeout, and a `120s` idle relay timeout. Direct guest DNS queries and raw UDP/QUIC egress are impossible.
 - **Anti-Rebinding & IP Filtering (`crates/sandbox-runtime/src/egress.rs`):**
   - Blocks private/special IPv4 ranges (`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, multicast/reserved) and IPv6 ranges (`::/128`, `::1/128`, `::ffff:0:0/96` IPv4-mapped, `64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo, `fc00::/7` ULA, `fe80::/10` link-local, `ff00::/8` multicast).
   - Resolves DNS exclusively on the Host, checks every returned IP against `is_forbidden_ip`, dials TCP **directly to the verified IP** (never re-resolving on connect), and re-validates every HTTP `3xx` redirect target.
 - **Honest Limit (No TLS MITM Inspection):** `HostEgressProxy` tunnels HTTPS via `HTTP CONNECT` without decrypting TLS payloads. If an operator allowlists a domain that hosts arbitrary uploads, webhooks, or tunneling APIs, `DomainAllowList` enforces destination domain/port and IP safety but cannot inspect encrypted request bodies inside the TLS session.
 
 ### 2.4 Safe Tar Workspace Copy I/O & Supply Chain
-- **Safe Tar (`sandbox-runtime/src/safe_tar.rs`, `sandbox-client/src/safe_tar.rs`, `guest/sandbox-agent/src/copy_tar.rs`):** Rejects `..` path traversal, absolute paths, Windows drive prefixes and reserved device names (`CON`, `NUL`, `COM1`, etc.), symlinks, hardlinks, FIFOs/devices, and Windows reparse points/junctions (`0x0400`), enforcing byte and entry budgets (`max_copy_bytes`, `max_copy_entries`).
-- **Signed Portable Runtime Bundles (`crates/sandbox-image`):** Verifies Ed25519 signature (`verify_strict` over raw `manifest.v1` bytes **before** UTF-8 decoding or parsing), validates directory hygiene (rejects symlinks, reparse points, hardlinks, and any undeclared extra files such as sideloaded DLLs), verifies SHA-256 + byte lengths, and atomically swaps bundles into place.
-  - *Note:* The repository dev fixtures (`.cache/bundles-src/*`) are signed with `.cache/keys/dev-bundle.key` and verified with `--pub-key-file .cache/keys/dev-bundle.pub` because `EMBEDDED_BUNDLE_PUBLIC_KEY` is a placeholder key for release CI injection.
+- **Safe Tar (`sandbox-runtime/src/safe_tar.rs`, `sandbox-client/src/safe_tar.rs`, `guest/sandbox-agent/src/copy_tar.rs`):** Rejects `..` path traversal, absolute paths, Windows drive prefixes and reserved device names (`CON`, `NUL`, `COM1`, etc.), symlinks, hardlinks, FIFOs/devices, and Windows reparse points/junctions (`0x0400`), enforcing byte and entry budgets (`max_copy_bytes`, `max_copy_entries`). Every extracted file is staged into a fresh `create_new(true)` sibling temporary file (`.minipod-tmp-*`) and atomically renamed into place only after full payload validation, preventing NTFS hardlink write-through and truncated-archive data loss.
+- **Signed Portable Runtime Bundles (`crates/sandbox-image`):** Verifies Ed25519 signature (`verify_strict` over raw `manifest.v1` bytes **before** UTF-8 decoding or parsing), validates directory hygiene (rejects symlinks, reparse points, hardlinks, and any undeclared extra files such as sideloaded DLLs), verifies SHA-256 + byte lengths, and promotes bundles via crash-safe `.promote-<id>.v1` journals and shared reader locks.
+  - *Bundle & Test Fixture Scope:* `scripts/build-portable-bundles.ps1` packages and Ed25519-signs the reproducible Linux guest artifacts (`kernel/vmlinuz-virt`, `boot/initramfs.cpio.gz`, `rootfs/base.qcow2`, `bin/tiny-init`, `bin/sandbox-agent`), while host `qemu-system-*` and `qemu-img` binaries are discovered from operator-installed host paths (or explicit `--qemu-bin`/`--qemu-img-bin`) and executed strictly inside Win32 Job Object confinement (`ConfinedProcess` / `run_confined_command_bounded`). Repository dev fixtures (`.cache/bundles-src/*`) are signed with `.cache/keys/dev-bundle.key` (`--pub-key-file .cache/keys/dev-bundle.pub`), and `scripts/build-test-oci-images.ps1` builds a minimal offline Ryuk protocol-compatible reaper image (`testcontainers/ryuk:0.11.0`) for air-gapped `Isolated` VM E2E testing.
 
 ### 2.5 Resource Accounting & `EnforcementLevel` Matrix (`CapabilityReport`)
 
@@ -50,11 +51,11 @@
 | --- | --- | --- | --- | --- |
 | `cpu_quota` | `HardLimit` when `host_cpu_quota_Millicores` set (Job Object `CpuRateControlInformation`), else `BestEffort` | `HardLimit` when delegated cgroup v2 `cpu.max` writable; `Unsupported` if set without delegation; `BestEffort` if unset | `Unsupported` if set, else `BestEffort` | `LocalRuntimeManager` never claims `HardLimit` when OS enforcement is unavailable. |
 | `host_rss` | `HardLimit` when `host_rss_budget_mb` set (`JOB_OBJECT_LIMIT_JOB_MEMORY`), else `BestEffort` | `HardLimit` when delegated cgroup v2 `memory.max` writable; `Unsupported` if set without delegation; `BestEffort` if unset | `Unsupported` if set, else `BestEffort` | Combined with `AdmissionController` host RSS reservations + `WorkingSetSize` / `/proc/<pid>/statm` sampling; never relies on guest ballooning. |
-| `host_storage` | `HardLimit` when `virtual_disk_mb + 16 MiB <= host_storage_budget_mb` (else `BestEffort`) | Same | Same | Enforced via physical `sandboxes/<id>` + qcow2 measurement on `spawn`, `copy_in`, and periodic budget sweeps. |
+| `host_storage` | `BestEffort` | `BestEffort` | `BestEffort` | Guest virtual disk (`virtual_disk_mb`) is fixed at ext4/qcow2 creation and QEMU `qemu-stderr.log` is capped at `512 KiB`, while physical `sandboxes/<id>` directory accounting runs on `spawn`, `copy_in`, and periodic budget sweeps rather than synchronous OS filesystem quotas. |
 | `egress_filter` | `HardLimit` (`Isolated`, `InternetOnly`, `DomainAllowList`); `Unsupported` (`Unrestricted`) | Same | Same | Guest runs with `-nic none`; non-isolated traffic traverses `HostEgressProxy`. |
 
 ### 2.6 Post-MVP Deferrals (`BRD.md` Section 4.1, 4.2, 6)
-The following capabilities are **intentionally deferred post-MVP** and are not shipped in `v0.1.0-rc1`:
+The following capabilities are **intentionally deferred post-MVP** and are not shipped in `v0.1.0-rc2`:
 1. External VM State/Memory Snapshot restore (`snapshot_restore` = `DeferredPostMvp`; QEMU `savevm`/`loadvm` across CoW overlays is explicitly rejected).
 2. Native macOS `Virtualization.framework` / `vmnet` backend.
 3. Windows `ARM64` host builds.
@@ -120,7 +121,7 @@ sandbox-cli copy-in <SANDBOX_ID> .\workspace /tmp/work
 sandbox-cli exec <SANDBOX_ID> -- /bin/sh -c "ls -la /tmp/work"
 sandbox-cli copy-out <SANDBOX_ID> /tmp/work .\out
 
-# Enable Docker-compatible HTTP loopback endpoint (e.g. DOCKER_HOST)
+# Enable owner-only Docker-compatible IPC endpoint (`npipe://` on Windows, `unix://` on Unix)
 sandbox-cli docker-endpoint <SANDBOX_ID>
 
 # Idempotent cleanup

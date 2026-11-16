@@ -129,14 +129,14 @@ struct TestRuntimeHarness {
     manager: Arc<LocalRuntimeManager>,
 }
 
-fn build_manager_for_installed_bundle(
+fn try_build_manager_for_installed_bundle(
     arch: GuestArch,
     bundle_root: &Path,
     public_key: [u8; 32],
     qemu_bin: &Path,
     qemu_img_bin: &Path,
     state_dir: &Path,
-) -> Arc<LocalRuntimeManager> {
+) -> Result<Arc<LocalRuntimeManager>, SandboxError> {
     let verifier = BundleVerifier::with_public_key(public_key).expect("verifier from pubkey");
     let overlay = BundleOverlayStore::with_command_runner(
         bundle_root.to_path_buf(),
@@ -174,10 +174,26 @@ fn build_manager_for_installed_bundle(
         warm_pool: WarmPoolConfig::default(),
     };
 
-    Arc::new(
-        LocalRuntimeManager::new(config, Arc::new(overlay), Arc::new(driver))
-            .expect("build LocalRuntimeManager"),
+    LocalRuntimeManager::new(config, Arc::new(overlay), Arc::new(driver)).map(Arc::new)
+}
+
+fn build_manager_for_installed_bundle(
+    arch: GuestArch,
+    bundle_root: &Path,
+    public_key: [u8; 32],
+    qemu_bin: &Path,
+    qemu_img_bin: &Path,
+    state_dir: &Path,
+) -> Arc<LocalRuntimeManager> {
+    try_build_manager_for_installed_bundle(
+        arch,
+        bundle_root,
+        public_key,
+        qemu_bin,
+        qemu_img_bin,
+        state_dir,
     )
+    .expect("build LocalRuntimeManager")
 }
 
 fn build_test_runtime(fixtures: &TestFixtures, prefix: &str) -> TestRuntimeHarness {
@@ -696,14 +712,39 @@ async fn e2e_crash_recovery_orphan_kill_and_cleanup() {
             })
             .expect("persist Active orphan journal");
 
-        // Fresh manager simulates restart recovery over the persisted state_dir.
-        let fresh_mgr = build_manager_for_installed_bundle(
+        // While the first manager still holds `state.lock`, a concurrent runtime must be rejected.
+        let TestRuntimeHarness {
+            _temp: _keep_temp,
+            state_dir,
+            _installed: installed,
+            manager,
+        } = harness;
+        let locked_err = match try_build_manager_for_installed_bundle(
             fixtures.arch,
-            harness._installed.root_dir(),
+            installed.root_dir(),
             fixtures.public_key,
             &fixtures.qemu_bin,
             &fixtures.qemu_img_bin,
-            &harness.state_dir,
+            &state_dir,
+        ) {
+            Ok(_) => panic!("second runtime on locked state_dir must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(locked_err, SandboxError::PolicyViolation(_)),
+            "expected PolicyViolation while first runtime holds state.lock, got {locked_err:?}"
+        );
+
+        // Drop previous manager to release `state.lock` and simulate restart recovery.
+        drop(manager);
+
+        let fresh_mgr = build_manager_for_installed_bundle(
+            fixtures.arch,
+            installed.root_dir(),
+            fixtures.public_key,
+            &fixtures.qemu_bin,
+            &fixtures.qemu_img_bin,
+            &state_dir,
         );
         let report = fresh_mgr
             .reconcile_startup()
@@ -866,4 +907,144 @@ async fn run_simulated_daemon_helper() {
 
     // Hold runtime alive without calling destroy() until parent kills this process.
     std::thread::sleep(Duration::from_secs(300));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_audit_regressions_state_lock_setsid_deadline_and_stalled_stream() {
+    let Some(fixtures) = discover_fixtures("audit_regressions") else {
+        return;
+    };
+    let harness = build_test_runtime(&fixtures, "mp-p8-audit");
+    let mgr = &harness.manager;
+
+    let lease = mgr
+        .spawn(default_spec(Duration::from_secs(120)))
+        .await
+        .expect("spawn sandbox for audit regression probes");
+
+    // 1. Probe #1: Second runtime on shared `state_dir` is rejected before reconciliation,
+    //    leaving the first runtime's live QEMU VM completely intact.
+    let second_res = try_build_manager_for_installed_bundle(
+        fixtures.arch,
+        harness._installed.root_dir(),
+        fixtures.public_key,
+        &fixtures.qemu_bin,
+        &fixtures.qemu_img_bin,
+        &harness.state_dir,
+    );
+    assert!(
+        matches!(second_res, Err(SandboxError::PolicyViolation(_))),
+        "expected PolicyViolation for concurrent state_dir runtime, got: {}",
+        match second_res {
+            Ok(_) => "Ok(LocalRuntimeManager)".to_owned(),
+            Err(err) => format!("{err:?}"),
+        }
+    );
+
+    let alive_after_lock = run_shell(
+        mgr,
+        &lease.id,
+        "/bin/echo vm1-intact-after-state-lock-reject",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("first runtime VM must remain alive after second runtime rejection");
+    assert_eq!(alive_after_lock.exit.code, Some(0));
+    assert_eq!(
+        alive_after_lock.stdout,
+        b"vm1-intact-after-state-lock-reject\n"
+    );
+
+    // 2. Probe #4: `setsid` detached background process cannot outlive `deadline` inside Guest.
+    let detached = run_shell(
+        mgr,
+        &lease.id,
+        "rm -f /tmp/supervisor-escaped && setsid sh -c 'sleep 1; echo survived > /tmp/supervisor-escaped' </dev/null >/dev/null 2>&1 & wait",
+        Duration::from_millis(300),
+    )
+    .await
+    .expect("run setsid deadline probe");
+    assert!(
+        detached.exit.timed_out,
+        "expected timed_out == true for setsid deadline probe, got {:?}",
+        detached.exit
+    );
+    assert!(detached.exit.code.is_none());
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let escaped_check = run_shell(
+        mgr,
+        &lease.id,
+        "if [ -e /tmp/supervisor-escaped ]; then echo ESCAPED; else echo CONTAINED; fi",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("verify setsid child did not write /tmp/supervisor-escaped");
+    assert_eq!(escaped_check.exit.code, Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&escaped_check.stdout).trim(),
+        "CONTAINED",
+        "setsid detached child survived deadline kill!"
+    );
+
+    // 3. Probe #6a: `ExecStream::wait_exit()` drains unread output without deadlocking when
+    //    stdout exceeds the 256 KiB stream credit window (`512 KiB` unread).
+    let mut unread_exit_stream = mgr
+        .exec_stream(
+            &lease.id,
+            shell_request(
+                "dd if=/dev/zero bs=4096 count=128 2>/dev/null | tr '\\0' B",
+                Duration::from_secs(15),
+                2 * 1024 * 1024,
+                64 * 1024,
+            ),
+        )
+        .await
+        .expect("start unread wait_exit stream");
+    let wait_only_status = tokio::time::timeout(
+        Duration::from_secs(10),
+        unread_exit_stream.wait_exit(),
+    )
+    .await
+    .expect("wait_exit() hung when caller did not drain next_output()")
+    .expect("wait_exit() returned transport error");
+    assert_eq!(wait_only_status.code, Some(0));
+
+    // 4. Probe #6b: A stalled `ExecStream` whose caller never reads `next_output()` (`1 MiB`
+    //    stdout saturating stream credit) must NOT block a concurrent `exec_stream` or `destroy()`.
+    let stalled_stream = mgr
+        .exec_stream(
+            &lease.id,
+            shell_request(
+                "dd if=/dev/zero bs=4096 count=256 2>/dev/null | tr '\\0' A",
+                Duration::from_secs(30),
+                4 * 1024 * 1024,
+                64 * 1024,
+            ),
+        )
+        .await
+        .expect("start stalled exec_stream");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let concurrent_ok = tokio::time::timeout(
+        Duration::from_secs(8),
+        run_shell(
+            mgr,
+            &lease.id,
+            "echo healthy-while-sibling-stalled",
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("concurrent exec_stream hung behind stalled sibling stream")
+    .expect("concurrent exec_stream failed");
+    assert_eq!(concurrent_ok.exit.code, Some(0));
+    assert_eq!(concurrent_ok.stdout, b"healthy-while-sibling-stalled\n");
+
+    let destroy_status = tokio::time::timeout(Duration::from_secs(10), mgr.destroy(&lease.id))
+        .await
+        .expect("destroy() hung while an unread ExecStream was backpressured")
+        .expect("destroy() failed");
+    assert_eq!(destroy_status, DestroyStatus::AllResourcesCleaned);
+    drop(stalled_stream);
 }
