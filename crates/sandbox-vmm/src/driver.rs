@@ -22,7 +22,7 @@ use sandbox_runtime::{
     TunnelStreamHandle, VmBootConfig, VmBootOutcome, VmRuntimePort, VmSessionPort,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::accel::{
     discover_qemu_binary_for_arch, probe_available_accelerators_for_arch, Accelerator,
@@ -505,6 +505,9 @@ pub struct QemuVmSession {
     writer_thread: Mutex<Option<JoinHandle<()>>>,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
+    pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>>,
+    network_cfg_lock: AsyncMutex<()>,
     transport_closed: Arc<AtomicBool>,
     alive: AtomicBool,
     next_stream_id: AtomicU32,
@@ -545,22 +548,34 @@ impl QemuVmSession {
         let outbound = Arc::new(OutboundQueue::new());
         let ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let egress_tx = Arc::new(Mutex::new(egress_tx));
+        let pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>> =
+            Arc::new(Mutex::new(None));
         let transport_closed = Arc::new(AtomicBool::new(false));
         let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
         let writer_outbound = Arc::clone(&outbound);
         let writer_ops = Arc::clone(&ops);
+        let writer_pending_ack = Arc::clone(&pending_network_ack);
         let writer_closed = Arc::clone(&transport_closed);
         let writer_thread = thread::Builder::new()
             .name(format!("minipod-vmm-tx-{pid}"))
             .spawn(move || {
-                run_writer_loop(write_half, writer_outbound, writer_ops, writer_closed);
+                run_writer_loop(
+                    write_half,
+                    writer_outbound,
+                    writer_ops,
+                    writer_pending_ack,
+                    writer_closed,
+                );
             })
             .map_err(|err| SandboxError::Internal(format!("spawn VMM writer thread: {err}")))?;
 
         let reader_outbound = Arc::clone(&outbound);
         let reader_ops = Arc::clone(&ops);
+        let reader_pending_ack = Arc::clone(&pending_network_ack);
         let reader_closed = Arc::clone(&transport_closed);
+        let reader_egress_tx = Arc::clone(&egress_tx);
         let reader_thread = thread::Builder::new()
             .name(format!("minipod-vmm-rx-{pid}"))
             .spawn(move || {
@@ -568,8 +583,9 @@ impl QemuVmSession {
                     read_half,
                     reader_outbound,
                     reader_ops,
+                    reader_pending_ack,
                     reader_closed,
-                    egress_tx,
+                    reader_egress_tx,
                     tokio_handle,
                 );
             })
@@ -587,6 +603,9 @@ impl QemuVmSession {
             writer_thread: Mutex::new(Some(writer_thread)),
             outbound,
             ops,
+            egress_tx,
+            pending_network_ack,
+            network_cfg_lock: AsyncMutex::new(()),
             transport_closed,
             alive: AtomicBool::new(true),
             next_stream_id: AtomicU32::new(1),
@@ -657,7 +676,11 @@ impl QemuVmSession {
             let _ = handle.join();
         }
         drop(lock_unpoisoned(&self.endpoint).take());
-        fail_all_pending_ops(&self.ops, "QEMU VM session terminated");
+        fail_all_pending_ops(
+            &self.ops,
+            &self.pending_network_ack,
+            "QEMU VM session terminated",
+        );
     }
 }
 
@@ -854,6 +877,71 @@ impl VmSessionPort for QemuVmSession {
         Ok(tunnel_stream)
     }
 
+    async fn enable_egress_proxy(
+        &self,
+        proxy_port: u16,
+    ) -> Result<mpsc::Receiver<TunnelStream>, SandboxError> {
+        if proxy_port == 0 {
+            return Err(SandboxError::InvalidSpec(
+                "egress proxy_port must be greater than zero".to_owned(),
+            ));
+        }
+        self.ensure_transport_ready()?;
+
+        let _cfg_guard = self.network_cfg_lock.lock().await;
+        self.ensure_transport_ready()?;
+
+        let (tx, rx) = mpsc::channel(EGRESS_ACCEPT_CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        {
+            let mut egress_guard = lock_unpoisoned(&self.egress_tx);
+            if egress_guard.is_some() {
+                return Err(SandboxError::InvalidSpec(
+                    "egress proxy is already enabled on this session".to_owned(),
+                ));
+            }
+            *egress_guard = Some(tx);
+        }
+        *lock_unpoisoned(&self.pending_network_ack) = Some(ack_tx);
+        let mut rollback = NetworkConfigureGuard {
+            egress_tx: &self.egress_tx,
+            pending_network_ack: &self.pending_network_ack,
+            armed: true,
+        };
+
+        self.ensure_transport_ready()?;
+        self.enqueue_message(
+            StreamId(0),
+            &Message::ConfigureNetwork {
+                enable_egress_proxy: true,
+                proxy_port,
+            },
+        )?;
+
+        let ack_res = match tokio::time::timeout(self.io_timeout, ack_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(SandboxError::Transport(
+                "QEMU IPC transport closed before guest ConfigureNetworkAck".to_owned(),
+            )),
+            Err(_) => Err(SandboxError::Transport(format!(
+                "timed out after {}ms waiting for guest ConfigureNetworkAck",
+                self.io_timeout.as_millis()
+            ))),
+        };
+
+        match ack_res {
+            Ok(0) => Err(SandboxError::Transport(
+                "guest egress proxy listener reported unbound port 0".to_owned(),
+            )),
+            Ok(_actual_port) => {
+                rollback.armed = false;
+                *lock_unpoisoned(&self.pending_network_ack) = None;
+                Ok(rx)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn copy_in_tar(
         &self,
         dst_guest: &str,
@@ -1036,6 +1124,7 @@ impl VmSessionPort for QemuVmSession {
         let reader = lock_unpoisoned(&self.reader_thread).take();
         let endpoint = lock_unpoisoned(&self.endpoint).take();
         let ops = Arc::clone(&self.ops);
+        let pending_network_ack = Arc::clone(&self.pending_network_ack);
 
         tokio::task::spawn_blocking(move || {
             if let Some(half) = shutdown_half {
@@ -1049,7 +1138,7 @@ impl VmSessionPort for QemuVmSession {
                 let _ = handle.join();
             }
             drop(endpoint);
-            fail_all_pending_ops(&ops, "QEMU process killed");
+            fail_all_pending_ops(&ops, &pending_network_ack, "QEMU process killed");
         })
         .await
         .map_err(|err| SandboxError::Internal(format!("force_kill cleanup failed: {err}")))?;
@@ -1072,6 +1161,21 @@ impl Drop for TunnelConnectGuard<'_> {
             if let Ok(frame) = Frame::from_message(self.stream_id, &Message::StreamClose) {
                 let _ = self.outbound.enqueue(frame);
             }
+        }
+    }
+}
+
+struct NetworkConfigureGuard<'a> {
+    egress_tx: &'a Mutex<Option<mpsc::Sender<TunnelStream>>>,
+    pending_network_ack: &'a Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>,
+    armed: bool,
+}
+
+impl Drop for NetworkConfigureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            *lock_unpoisoned(self.pending_network_ack) = None;
+            *lock_unpoisoned(self.egress_tx) = None;
         }
     }
 }
@@ -1305,6 +1409,7 @@ fn run_writer_loop(
     mut write_half: IpcWriteHalf,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>>,
     transport_closed: Arc<AtomicBool>,
 ) {
     while let Some(frame) = outbound.pop_blocking() {
@@ -1313,7 +1418,7 @@ fn run_writer_loop(
             transport_closed.store(true, Ordering::Release);
             outbound.close(Some(msg.clone()));
             let _ = write_half.shutdown();
-            fail_all_pending_ops(&ops, &msg);
+            fail_all_pending_ops(&ops, &pending_network_ack, &msg);
             return;
         }
     }
@@ -1323,8 +1428,9 @@ fn run_reader_loop(
     mut read_half: IpcReadHalf,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>>,
     transport_closed: Arc<AtomicBool>,
-    egress_tx: Option<mpsc::Sender<TunnelStream>>,
+    egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
     tokio_handle: Option<tokio::runtime::Handle>,
 ) {
     loop {
@@ -1334,7 +1440,7 @@ fn run_reader_loop(
                 let msg = format!("reading protocol frame failed: {err}");
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some(msg.clone()));
-                fail_all_pending_ops(&ops, &msg);
+                fail_all_pending_ops(&ops, &pending_network_ack, &msg);
                 return;
             }
         };
@@ -1346,7 +1452,7 @@ fn run_reader_loop(
                 let reason = format!("decoding protocol frame failed: {err}");
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some(reason.clone()));
-                fail_all_pending_ops(&ops, &reason);
+                fail_all_pending_ops(&ops, &pending_network_ack, &reason);
                 return;
             }
         };
@@ -1533,6 +1639,12 @@ fn run_reader_loop(
             Message::EgressOpen => {
                 handle_egress_open(stream_id, &egress_tx, &tokio_handle, &outbound, &ops);
             }
+            Message::ConfigureNetworkAck { proxy_port } if stream_id == StreamId(0) => {
+                let ack_tx = lock_unpoisoned(&pending_network_ack).take();
+                if let Some(tx) = ack_tx {
+                    let _ = tx.send(Ok(proxy_port));
+                }
+            }
             Message::Ping { seq } => {
                 if let Ok(frame) = Frame::from_message(stream_id, &Message::Pong { seq }) {
                     let _ = outbound.enqueue(frame);
@@ -1541,7 +1653,7 @@ fn run_reader_loop(
             Message::Shutdown => {
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some("guest VM shut down".to_owned()));
-                fail_all_pending_ops(&ops, "guest VM shut down");
+                fail_all_pending_ops(&ops, &pending_network_ack, "guest VM shut down");
                 return;
             }
             Message::StreamCredit { .. } | Message::Pong { .. } => {}
@@ -1552,7 +1664,7 @@ fn run_reader_loop(
                 );
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some(reason.clone()));
-                fail_all_pending_ops(&ops, &reason);
+                fail_all_pending_ops(&ops, &pending_network_ack, &reason);
                 return;
             }
         }
@@ -1561,7 +1673,7 @@ fn run_reader_loop(
 
 fn handle_egress_open(
     stream_id: StreamId,
-    egress_tx: &Option<mpsc::Sender<TunnelStream>>,
+    egress_tx: &Mutex<Option<mpsc::Sender<TunnelStream>>>,
     tokio_handle: &Option<tokio::runtime::Handle>,
     outbound: &Arc<OutboundQueue>,
     ops: &Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
@@ -1579,7 +1691,8 @@ fn handle_egress_open(
         return;
     }
 
-    let (Some(tx), Some(rt)) = (egress_tx.as_ref(), tokio_handle.as_ref()) else {
+    let maybe_tx = lock_unpoisoned(egress_tx).clone();
+    let (Some(tx), Some(rt)) = (maybe_tx, tokio_handle.as_ref()) else {
         reject("host egress proxy is disabled for this sandbox".to_owned());
         return;
     };
@@ -1625,7 +1738,16 @@ fn handle_egress_open(
     }
 }
 
-fn fail_all_pending_ops(ops: &Mutex<HashMap<StreamId, StreamHandler>>, reason: &str) {
+fn fail_all_pending_ops(
+    ops: &Mutex<HashMap<StreamId, StreamHandler>>,
+    pending_network_ack: &Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>,
+    reason: &str,
+) {
+    let ack_tx = lock_unpoisoned(pending_network_ack).take();
+    if let Some(tx) = ack_tx {
+        let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
+    }
+
     let drained: Vec<StreamHandler> = {
         let mut map = lock_unpoisoned(ops);
         map.drain().map(|(_, handler)| handler).collect()
@@ -2594,5 +2716,294 @@ mod tests {
         ));
 
         guest.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_enable_egress_proxy_activates_egress_open_and_rejects_duplicate_or_port_zero()
+    {
+        use sandbox_protocol::GUEST_STREAM_ID_BIT;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-dyn-egress").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let (pre_rejected_tx, pre_rejected_rx) = oneshot::channel();
+        let (guest_done_tx, guest_done_rx) = oneshot::channel();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            // 1. Before enable_egress_proxy, guest EgressOpen must be rejected as disabled.
+            let pre_sid = StreamId(GUEST_STREAM_ID_BIT | 1);
+            write_frame(
+                &mut client,
+                &Frame::from_message(pre_sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+            let pre_reply = read_frame(&mut client).unwrap();
+            assert_eq!(pre_reply.header.stream_id, pre_sid);
+            assert!(matches!(
+                pre_reply.decode_message().unwrap(),
+                Message::ConnectError { message } if message.contains("disabled")
+            ));
+            let _ = pre_rejected_tx.send(());
+
+            // 2. Receive ConfigureNetwork on StreamId(0), reply ConfigureNetworkAck, then immediately open EgressOpen.
+            let cfg_frame = read_frame(&mut client).unwrap();
+            assert_eq!(cfg_frame.header.stream_id, StreamId(0));
+            assert_eq!(
+                cfg_frame.decode_message().unwrap(),
+                Message::ConfigureNetwork {
+                    enable_egress_proxy: true,
+                    proxy_port: 3128,
+                }
+            );
+            write_frame(
+                &mut client,
+                &Frame::from_message(
+                    StreamId(0),
+                    &Message::ConfigureNetworkAck { proxy_port: 3128 },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            let egress_sid = StreamId(GUEST_STREAM_ID_BIT | 2);
+            write_frame(
+                &mut client,
+                &Frame::from_message(egress_sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+
+            let ack = read_frame(&mut client).unwrap();
+            assert_eq!(ack.header.stream_id, egress_sid);
+            assert_eq!(ack.decode_message().unwrap(), Message::ConnectAck);
+
+            // Exchange full-duplex + half-close bytes.
+            write_frame(
+                &mut client,
+                &Frame::from_message(
+                    egress_sid,
+                    &Message::StreamData {
+                        channel: StreamChannel::Stdout,
+                        eof: true,
+                        data: b"GET http://warm.test/ HTTP/1.1\r\n\r\n".to_vec(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            let mut resp = Vec::new();
+            loop {
+                let f = read_frame(&mut client).unwrap();
+                match f.decode_message().unwrap() {
+                    Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof,
+                        data,
+                    } if f.header.stream_id == egress_sid => {
+                        resp.extend_from_slice(&data);
+                        if eof {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected frame on guest side: {other:?}"),
+                }
+            }
+            let _ = guest_done_tx.send(resp);
+
+            while let Ok(frame) = read_frame(&mut client) {
+                if matches!(frame.decode_message(), Ok(Message::Shutdown)) {
+                    let _ = write_frame(
+                        &mut client,
+                        &Frame::from_message(StreamId(0), &Message::Shutdown).unwrap(),
+                    );
+                    break;
+                }
+            }
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::from_test_stream(host_stream, Duration::from_secs(2)).unwrap();
+
+        // Port 0 rejected immediately before talking to guest.
+        assert!(matches!(
+            session.enable_egress_proxy(0).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), pre_rejected_rx)
+            .await
+            .expect("guest observes initial disabled EgressOpen rejection")
+            .unwrap();
+
+        let mut egress_rx = session.enable_egress_proxy(3128).await.unwrap();
+
+        // Enabling twice on the same session returns InvalidSpec.
+        assert!(matches!(
+            session.enable_egress_proxy(3128).await,
+            Err(SandboxError::InvalidSpec(msg)) if msg.contains("already enabled")
+        ));
+
+        let mut egress_stream = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+            .await
+            .expect("egress_rx receives guest stream")
+            .expect("egress_rx open");
+        assert_eq!(
+            egress_stream.stream_id(),
+            StreamId(GUEST_STREAM_ID_BIT | 2)
+        );
+
+        let mut got_req = Vec::new();
+        egress_stream.read_to_end(&mut got_req).await.unwrap();
+        assert_eq!(got_req, b"GET http://warm.test/ HTTP/1.1\r\n\r\n");
+
+        egress_stream
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\nwarm-ok")
+            .await
+            .unwrap();
+        egress_stream.shutdown().await.unwrap();
+        drop(egress_stream);
+
+        let guest_resp = tokio::time::timeout(Duration::from_secs(2), guest_done_rx)
+            .await
+            .expect("guest receives response")
+            .unwrap();
+        assert_eq!(guest_resp, b"HTTP/1.1 200 OK\r\n\r\nwarm-ok");
+
+        assert!(session
+            .graceful_shutdown(Duration::from_millis(500))
+            .await
+            .unwrap());
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn enable_egress_proxy_rejects_ack_port_zero_and_cleans_up_on_transport_close() {
+        use sandbox_protocol::GUEST_STREAM_ID_BIT;
+
+        // 1. Guest returns ConfigureNetworkAck { proxy_port: 0 } -> Transport error + full rollback,
+        //    so subsequent EgressOpen is still rejected and a retry succeeds cleanly.
+        let listener = AgentIpcEndpoint::bind_temp("drv-dyn-zero").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let (zero_checked_tx, zero_checked_rx) = oneshot::channel();
+        let (egress_rejected_tx, egress_rejected_rx) = oneshot::channel();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            let cfg1 = read_frame(&mut client).unwrap();
+            assert_eq!(cfg1.header.stream_id, StreamId(0));
+            assert_eq!(
+                cfg1.decode_message().unwrap(),
+                Message::ConfigureNetwork {
+                    enable_egress_proxy: true,
+                    proxy_port: 3128,
+                }
+            );
+            write_frame(
+                &mut client,
+                &Frame::from_message(
+                    StreamId(0),
+                    &Message::ConfigureNetworkAck { proxy_port: 0 },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Wait for host to confirm rollback before sending EgressOpen.
+            let _ = zero_checked_rx.blocking_recv();
+            let sid = StreamId(GUEST_STREAM_ID_BIT | 1);
+            write_frame(
+                &mut client,
+                &Frame::from_message(sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+            let rej = read_frame(&mut client).unwrap();
+            assert!(matches!(
+                rej.decode_message().unwrap(),
+                Message::ConnectError { message } if message.contains("disabled")
+            ));
+            let _ = egress_rejected_tx.send(());
+
+            // Subsequent retry succeeds cleanly.
+            let cfg2 = read_frame(&mut client).unwrap();
+            assert_eq!(
+                cfg2.decode_message().unwrap(),
+                Message::ConfigureNetwork {
+                    enable_egress_proxy: true,
+                    proxy_port: 3129,
+                }
+            );
+            write_frame(
+                &mut client,
+                &Frame::from_message(
+                    StreamId(0),
+                    &Message::ConfigureNetworkAck { proxy_port: 3129 },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            while let Ok(frame) = read_frame(&mut client) {
+                if matches!(frame.decode_message(), Ok(Message::Shutdown)) {
+                    let _ = write_frame(
+                        &mut client,
+                        &Frame::from_message(StreamId(0), &Message::Shutdown).unwrap(),
+                    );
+                    break;
+                }
+            }
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::from_test_stream(host_stream, Duration::from_secs(2)).unwrap();
+
+        let err = session.enable_egress_proxy(3128).await.unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(msg) if msg.contains("port 0")));
+        assert!(lock_unpoisoned(&session.egress_tx).is_none());
+        assert!(lock_unpoisoned(&session.pending_network_ack).is_none());
+        let _ = zero_checked_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), egress_rejected_rx)
+            .await
+            .expect("guest receives disabled EgressOpen rejection after rollback")
+            .unwrap();
+
+        let _rx = session.enable_egress_proxy(3129).await.unwrap();
+        assert!(session
+            .graceful_shutdown(Duration::from_millis(500))
+            .await
+            .unwrap());
+        guest_thread.join().unwrap();
+
+        // 2. Transport closes while enable_egress_proxy awaits ConfigureNetworkAck -> returns promptly
+        //    with Transport error (without waiting for the 5s io_timeout) and cleans up state.
+        let listener2 = AgentIpcEndpoint::bind_temp("drv-dyn-close").unwrap();
+        let sock_path2 = listener2.socket_path().to_path_buf();
+        let guest_thread2 = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path2).unwrap();
+            let cfg = read_frame(&mut client).unwrap();
+            assert!(matches!(
+                cfg.decode_message().unwrap(),
+                Message::ConfigureNetwork { .. }
+            ));
+            // Drop client immediately to close transport before sending ConfigureNetworkAck.
+        });
+
+        let host_stream2 = listener2.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session2 =
+            QemuVmSession::from_test_stream(host_stream2, Duration::from_secs(5)).unwrap();
+
+        let err2 = tokio::time::timeout(
+            Duration::from_secs(1),
+            session2.enable_egress_proxy(3128),
+        )
+        .await
+        .expect("transport close must fail pending enable_egress_proxy immediately")
+        .unwrap_err();
+        assert!(matches!(err2, SandboxError::Transport(_)));
+        assert!(lock_unpoisoned(&session2.egress_tx).is_none());
+        assert!(lock_unpoisoned(&session2.pending_network_ack).is_none());
+
+        guest_thread2.join().unwrap();
     }
 }

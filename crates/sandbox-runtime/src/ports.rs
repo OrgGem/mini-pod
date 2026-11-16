@@ -56,6 +56,10 @@ pub trait VmSessionPort: Send + Sync {
     fn current_rss_bytes(&self) -> Option<u64>;
     async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError>;
     async fn open_tunnel(&self, target: StreamTargetWire) -> Result<TunnelStream, SandboxError>;
+    async fn enable_egress_proxy(
+        &self,
+        proxy_port: u16,
+    ) -> Result<tokio::sync::mpsc::Receiver<TunnelStream>, SandboxError>;
     async fn copy_in_tar(
         &self,
         dst_guest: &str,

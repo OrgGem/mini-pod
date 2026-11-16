@@ -21,6 +21,7 @@ const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(5);
 /// Durable sandbox lifecycle phase persisted across daemon crashes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalLifecycleState {
+    Warm,
     Spawning,
     Active,
     Destroying,
@@ -29,6 +30,7 @@ pub enum JournalLifecycleState {
 impl JournalLifecycleState {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Warm => "warm",
             Self::Spawning => "spawning",
             Self::Active => "active",
             Self::Destroying => "destroying",
@@ -37,6 +39,7 @@ impl JournalLifecycleState {
 
     fn parse(raw: &str) -> Result<Self, SandboxError> {
         match raw {
+            "warm" => Ok(Self::Warm),
             "spawning" => Ok(Self::Spawning),
             "active" => Ok(Self::Active),
             "destroying" => Ok(Self::Destroying),
@@ -827,5 +830,31 @@ mod tests {
         releaser.await.unwrap();
         assert_eq!(status_after, DestroyStatus::AllResourcesCleaned);
         assert!(!locked_file_path.exists());
+    }
+
+    #[test]
+    fn journal_store_roundtrips_warm_lifecycle_state() {
+        let tmp = TestTempDir::new("journal-warm");
+        let store = JournalStore::new(tmp.path().join("journals")).unwrap();
+
+        let rec = JournalRecord {
+            sandbox_id: SandboxId::new("warm-01"),
+            state: JournalLifecycleState::Warm,
+            pid: Some(5150),
+            start_token: Some(77_777),
+            artifact_paths: vec![tmp.path().join("warm-overlay.qcow2")],
+            expires_at_unix_ms: 1_700_000_123_456,
+        };
+
+        store.write_record(&rec).unwrap();
+
+        let encoded = fs::read_to_string(store.root_dir().join("warm-01.journal")).unwrap();
+        assert!(
+            encoded.contains("state=warm\n"),
+            "expected state=warm in journal file, got:\n{encoded}"
+        );
+
+        assert_eq!(store.load_record(&rec.sandbox_id).unwrap(), Some(rec.clone()));
+        assert_eq!(store.load_records().unwrap(), vec![rec]);
     }
 }

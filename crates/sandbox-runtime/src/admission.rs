@@ -297,6 +297,33 @@ impl AdmissionController {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn has_waiters(&self) -> bool {
+        let state = lock_unpoisoned(&self.inner.state);
+        !state.waiters.is_empty()
+    }
+
+    /// Non-blocking admission check for background Warm Pool replenishment.
+    ///
+    /// Foreground FIFO waiters always preempt background reservations so queued user spawns
+    /// acquire released capacity first.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_acquire_background(&self, spec: &SandboxSpec) -> Option<AdmissionPermit> {
+        let demand = ResourceDemand::from_spec(spec);
+        if self.inner.check_individual_cap(demand).is_err() {
+            return None;
+        }
+        let mut state = lock_unpoisoned(&self.inner.state);
+        if !state.waiters.is_empty() || self.inner.can_admit(&state, demand).is_err() {
+            return None;
+        }
+        state.reserve(demand);
+        Some(AdmissionPermit {
+            inner: Arc::clone(&self.inner),
+            demand,
+        })
+    }
+
     pub(crate) async fn acquire(&self, spec: &SandboxSpec) -> Result<AdmissionPermit, SandboxError> {
         let demand = ResourceDemand::from_spec(spec);
         self.inner.check_individual_cap(demand)?;
@@ -656,5 +683,74 @@ mod tests {
         drop(p3);
         assert_eq!(ctrl.usage(), AdmissionUsage::default());
         assert_eq!(ctrl_short.usage(), AdmissionUsage::default());
+    }
+
+    #[tokio::test]
+    async fn background_admission_succeeds_with_headroom_rejects_saturation_and_preempts_for_waiters()
+    {
+        let ctrl = AdmissionController::new(
+            AdmissionLimits {
+                max_concurrent_sandboxes: Some(2),
+                max_total_host_rss_mb: Some(512),
+                max_total_host_storage_mb: Some(1024),
+                max_total_host_cpu_millicores: Some(2000),
+                admission_queue_timeout: Duration::from_secs(2),
+                max_admission_queue_depth: 8,
+            },
+            Arc::new(|| 0),
+        );
+
+        assert!(!ctrl.has_waiters());
+
+        // Individual cap exceeded -> None.
+        let oversized = test_spec(1, Some(500), 512, Some(768), 256);
+        assert!(ctrl.try_acquire_background(&oversized).is_none());
+
+        // Headroom available and no waiters -> background acquisition succeeds.
+        let half_spec = test_spec(1, Some(1000), 256, Some(256), 512);
+        let bg1 = ctrl
+            .try_acquire_background(&half_spec)
+            .expect("background permit 1 should succeed");
+        assert_eq!(ctrl.usage().active_sandboxes, 1);
+
+        let bg2 = ctrl
+            .try_acquire_background(&half_spec)
+            .expect("background permit 2 should succeed");
+        assert_eq!(ctrl.usage().active_sandboxes, 2);
+
+        // Saturated by max_concurrent_sandboxes -> None.
+        let small_spec = test_spec(1, Some(250), 128, Some(128), 128);
+        assert!(ctrl.try_acquire_background(&small_spec).is_none());
+
+        // Free one slot: now 256 MiB RSS remain, so 300 MiB foreground request must queue,
+        // while 128 MiB background demand would fit on capacity alone.
+        drop(bg2);
+        let fg_spec = test_spec(1, Some(500), 256, Some(300), 256);
+        let ctrl_fg = ctrl.clone();
+        let fg_waiter = tokio::spawn(async move { ctrl_fg.acquire(&fg_spec).await });
+        tokio::task::yield_now().await;
+
+        assert!(ctrl.has_waiters());
+        assert!(
+            ctrl.try_acquire_background(&small_spec).is_none(),
+            "foreground FIFO waiter must preempt background replenishment even when small headroom exists"
+        );
+
+        // Release bg1; while fg_waiter is still queued in waiters, background acquisition still returns None.
+        drop(bg1);
+        assert!(ctrl.has_waiters());
+        assert!(ctrl.try_acquire_background(&small_spec).is_none());
+
+        let fg_permit = fg_waiter.await.unwrap().unwrap();
+        assert!(!ctrl.has_waiters());
+        assert_eq!(ctrl.usage().active_sandboxes, 1);
+        assert_eq!(ctrl.usage().reserved_host_rss_mb, 300);
+
+        drop(fg_permit);
+        let bg3 = ctrl
+            .try_acquire_background(&small_spec)
+            .expect("background permit should succeed once foreground waiters drain");
+        drop(bg3);
+        assert_eq!(ctrl.usage(), AdmissionUsage::default());
     }
 }

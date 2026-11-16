@@ -1384,6 +1384,8 @@ mod tests {
         force_kill_calls: Mutex<usize>,
         copied_in: Mutex<Vec<(String, Vec<u8>)>>,
         copy_out_archive: Mutex<Vec<u8>>,
+        egress_enabled_port: Mutex<Option<u16>>,
+        egress_tx: Mutex<Option<tokio::sync::mpsc::Sender<TunnelStream>>>,
     }
 
     struct MockVmSession {
@@ -1460,6 +1462,34 @@ mod tests {
                 let _ = handle.write_half.shutdown().await;
             });
             Ok(stream)
+        }
+
+        async fn enable_egress_proxy(
+            &self,
+            proxy_port: u16,
+        ) -> Result<tokio::sync::mpsc::Receiver<TunnelStream>, SandboxError> {
+            if proxy_port == 0 {
+                return Err(SandboxError::InvalidSpec(
+                    "egress proxy_port must be greater than zero".to_owned(),
+                ));
+            }
+            if !self.is_alive() {
+                return Err(SandboxError::Transport(
+                    "mock VM session is no longer alive".to_owned(),
+                ));
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            {
+                let mut port_guard = lock_unpoisoned(&self.state.egress_enabled_port);
+                if port_guard.is_some() {
+                    return Err(SandboxError::InvalidSpec(
+                        "egress proxy is already enabled on this session".to_owned(),
+                    ));
+                }
+                *port_guard = Some(proxy_port);
+            }
+            *lock_unpoisoned(&self.state.egress_tx) = Some(tx);
+            Ok(rx)
         }
 
         async fn copy_in_tar(
@@ -1556,6 +1586,12 @@ mod tests {
             }
             let sock_path = config.work_dir.join("a.sock");
             fs::write(&sock_path, b"sock").unwrap();
+            let (egress_tx, egress_rx) = if enable_egress {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             let sess_state = Arc::new(MockSessionState {
                 alive: AtomicBool::new(true),
                 rss_bytes: AtomicU64::new(64 * 1024 * 1024),
@@ -1564,13 +1600,9 @@ mod tests {
                 force_kill_calls: Mutex::new(0),
                 copied_in: Mutex::new(Vec::new()),
                 copy_out_archive: Mutex::new(Vec::new()),
+                egress_enabled_port: Mutex::new(enable_egress.then_some(3128)),
+                egress_tx: Mutex::new(egress_tx.clone()),
             });
-            let (egress_tx, egress_rx) = if enable_egress {
-                let (tx, rx) = tokio::sync::mpsc::channel(16);
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
             {
                 let mut st = lock_unpoisoned(&self.state);
                 st.sessions.push(Arc::clone(&sess_state));
