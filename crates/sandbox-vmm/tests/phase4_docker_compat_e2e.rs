@@ -30,6 +30,7 @@ use sandbox_image::{
 };
 use sandbox_runtime::{
     AdmissionLimits, LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig, SandboxTunnelPort,
+    WarmPoolConfig,
 };
 use sandbox_vmm::{
     discover_qemu_binary_for_arch, discover_qemu_img_binary, QemuDriverConfig, QemuVmDriver,
@@ -235,6 +236,7 @@ fn build_phase4_runtime(fixtures: &Phase4Fixtures, prefix: &str) -> Phase4Harnes
         cleanup_max_attempts: 8,
         cleanup_initial_delay: Duration::from_millis(50),
         admission: AdmissionLimits::default(),
+        warm_pool: WarmPoolConfig::default(),
     };
 
     let manager = Arc::new(

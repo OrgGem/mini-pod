@@ -297,17 +297,27 @@ impl AdmissionController {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn has_waiters(&self) -> bool {
         let state = lock_unpoisoned(&self.inner.state);
         !state.waiters.is_empty()
+    }
+
+    pub(crate) fn check_individual_cap(&self, spec: &SandboxSpec) -> Result<(), SandboxError> {
+        self.inner
+            .check_individual_cap(ResourceDemand::from_spec(spec))
+    }
+
+    /// Read-only check whether admitting `spec` right now would exceed configured ceilings.
+    pub(crate) fn would_exceed_with(&self, spec: &SandboxSpec) -> bool {
+        let demand = ResourceDemand::from_spec(spec);
+        let state = lock_unpoisoned(&self.inner.state);
+        self.inner.can_admit(&state, demand).is_err()
     }
 
     /// Non-blocking admission check for background Warm Pool replenishment.
     ///
     /// Foreground FIFO waiters always preempt background reservations so queued user spawns
     /// acquire released capacity first.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_acquire_background(&self, spec: &SandboxSpec) -> Option<AdmissionPermit> {
         let demand = ResourceDemand::from_spec(spec);
         if self.inner.check_individual_cap(demand).is_err() {
@@ -752,5 +762,45 @@ mod tests {
             .expect("background permit should succeed once foreground waiters drain");
         drop(bg3);
         assert_eq!(ctrl.usage(), AdmissionUsage::default());
+    }
+
+    #[tokio::test]
+    async fn would_exceed_with_tracks_static_and_live_rss_without_enqueuing_waiters() {
+        let observed_rss = Arc::new(AtomicU64::new(0));
+        let observed_ref = Arc::clone(&observed_rss);
+        let ctrl = AdmissionController::new(
+            AdmissionLimits {
+                max_concurrent_sandboxes: Some(2),
+                max_total_host_rss_mb: Some(512),
+                max_total_host_storage_mb: Some(1024),
+                max_total_host_cpu_millicores: Some(2000),
+                admission_queue_timeout: Duration::from_secs(1),
+                max_admission_queue_depth: 4,
+            },
+            Arc::new(move || observed_ref.load(Ordering::Acquire)),
+        );
+
+        let spec = test_spec(1, Some(1000), 256, Some(256), 512);
+        assert!(!ctrl.would_exceed_with(&spec));
+        assert!(!ctrl.has_waiters());
+
+        let p1 = ctrl.acquire(&spec).await.unwrap();
+        assert!(!ctrl.would_exceed_with(&spec));
+
+        // Live RSS spike above reserved (400 + 256 > 512) triggers would_exceed_with without queueing.
+        observed_rss.store(400, Ordering::Release);
+        assert!(ctrl.would_exceed_with(&spec));
+        assert!(!ctrl.has_waiters());
+
+        observed_rss.store(256, Ordering::Release);
+        let p2 = ctrl.acquire(&spec).await.unwrap();
+        // Concurrent sandbox cap (2) reached.
+        let tiny = test_spec(1, Some(100), 64, Some(64), 64);
+        assert!(ctrl.would_exceed_with(&tiny));
+        assert!(!ctrl.has_waiters());
+
+        drop(p1);
+        drop(p2);
+        assert!(!ctrl.would_exceed_with(&spec));
     }
 }

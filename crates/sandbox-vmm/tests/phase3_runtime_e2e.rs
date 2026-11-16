@@ -18,7 +18,7 @@ use sandbox_image::{
 };
 use sandbox_runtime::{
     AdmissionLimits, CollectedExecOutput, JournalLifecycleState, JournalRecord, JournalStore,
-    LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig,
+    LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig, WarmPoolConfig,
 };
 use sandbox_vmm::{
     discover_qemu_binary_for_arch, discover_qemu_img_binary, kill_verified_orphan_process,
@@ -158,6 +158,7 @@ fn build_manager_for_installed_bundle(
         cleanup_max_attempts: 8,
         cleanup_initial_delay: Duration::from_millis(50),
         admission: AdmissionLimits::default(),
+        warm_pool: WarmPoolConfig::default(),
     };
 
     Arc::new(

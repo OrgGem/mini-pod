@@ -29,7 +29,7 @@ use sandbox_image::{
 use sandbox_runtime::{
     is_forbidden_ip, AdmissionLimits, AdmissionUsage, BoxedUpstreamStream, CollectedExecOutput,
     HostDnsResolver, LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig, SandboxTunnelPort,
-    UpstreamDialer,
+    UpstreamDialer, WarmPoolConfig,
 };
 use sandbox_vmm::{
     discover_qemu_binary_for_arch, discover_qemu_img_binary, QemuDriverConfig, QemuVmDriver,
@@ -209,6 +209,7 @@ fn build_phase5_runtime(
         cleanup_max_attempts: 8,
         cleanup_initial_delay: Duration::from_millis(50),
         admission,
+        warm_pool: WarmPoolConfig::default(),
     };
 
     let manager = match (dns_resolver, dialer) {

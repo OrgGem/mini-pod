@@ -31,10 +31,15 @@ use crate::safe_tar::{
     ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar,
 };
 use crate::tunnel::TunnelStream;
+use crate::warm_pool::{
+    CheckoutPop, ReplenisherHandle, WarmEntry, WarmPoolConfig, WarmPoolKey, WarmPoolStats,
+    WarmPoolStore,
+};
 use crate::RuntimeManager;
 
 const MAX_GUEST_PATH_BYTES: usize = 4096;
 const QCOW2_STORAGE_HEADROOM_MB: u64 = 16;
+const EGRESS_PROXY_PORT: u16 = 3128;
 
 /// Configuration for [`LocalRuntimeManager`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +52,7 @@ pub struct RuntimeManagerConfig {
     pub cleanup_max_attempts: usize,
     pub cleanup_initial_delay: Duration,
     pub admission: AdmissionLimits,
+    pub warm_pool: WarmPoolConfig,
 }
 
 impl Default for RuntimeManagerConfig {
@@ -60,6 +66,7 @@ impl Default for RuntimeManagerConfig {
             cleanup_max_attempts: 8,
             cleanup_initial_delay: Duration::from_millis(50),
             admission: AdmissionLimits::default(),
+            warm_pool: WarmPoolConfig::default(),
         }
     }
 }
@@ -103,6 +110,7 @@ impl RuntimeManagerConfig {
             ));
         }
         self.admission.validate()?;
+        self.warm_pool.validate()?;
         Ok(())
     }
 }
@@ -219,6 +227,7 @@ pub struct LocalRuntimeManager {
     dialer: Arc<dyn UpstreamDialer>,
     admission: AdmissionController,
     active: Arc<Mutex<HashMap<SandboxId, ActiveSandbox>>>,
+    warm_pool: WarmPoolStore,
     in_flight_destroys: Mutex<HashMap<SandboxId, watch::Sender<bool>>>,
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
     next_seq: AtomicU64,
@@ -226,10 +235,16 @@ pub struct LocalRuntimeManager {
 
 impl Drop for LocalRuntimeManager {
     fn drop(&mut self) {
-        let mut guard = lock_unpoisoned(&self.sweeper_abort);
-        if let Some(handle) = guard.take() {
-            handle.abort();
+        {
+            let mut guard = lock_unpoisoned(&self.sweeper_abort);
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
         }
+        self.warm_pool.abort_replenisher();
+        let drained = self.warm_pool.clear_ready_for_drop();
+        // Drop entries outside warm_pool lock so AdmissionPermit::drop preserves strict lock ordering.
+        drop(drained);
     }
 }
 
@@ -265,14 +280,18 @@ impl LocalRuntimeManager {
         ensure_safe_dir_path(&sandboxes_dir, true)?;
 
         let active = Arc::new(Mutex::new(HashMap::<SandboxId, ActiveSandbox>::new()));
+        let warm_pool = WarmPoolStore::new();
         let active_for_rss = Arc::clone(&active);
+        let warm_pool_for_rss = warm_pool.clone();
         let observed_rss_fn = Arc::new(move || -> u64 {
             let entries: Vec<(Arc<dyn VmSessionPort>, u64)> = {
                 let guard = lock_unpoisoned(&active_for_rss);
-                guard
+                let mut collected: Vec<(Arc<dyn VmSessionPort>, u64)> = guard
                     .values()
                     .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb))
-                    .collect()
+                    .collect();
+                warm_pool_for_rss.collect_rss_samples(&mut collected);
+                collected
             };
             entries
                 .into_iter()
@@ -297,6 +316,7 @@ impl LocalRuntimeManager {
             dialer,
             admission,
             active,
+            warm_pool,
             in_flight_destroys: Mutex::new(HashMap::new()),
             sweeper_abort: Mutex::new(None),
             next_seq: AtomicU64::new(1),
@@ -310,6 +330,11 @@ impl LocalRuntimeManager {
     /// Returns a snapshot of current host admission reservations and effective live RSS.
     pub fn current_admission_usage(&self) -> AdmissionUsage {
         self.admission.usage()
+    }
+
+    /// Returns a snapshot of current Warm Pool gauges and lifecycle counters.
+    pub fn warm_pool_stats(&self) -> WarmPoolStats {
+        self.warm_pool.stats()
     }
 
     /// Samples the live host resident set size (`RSS` / working set) in bytes for an active sandbox.
@@ -346,6 +371,230 @@ impl LocalRuntimeManager {
         handle
     }
 
+    /// Pre-warms idle VMs in [`NetworkPolicy::Isolated`] mode up to `warm_pool.target_size`
+    /// while admission headroom exists and no foreground waiters are queued, returning the ready count.
+    pub async fn warm_up(&self) -> Result<usize, SandboxError> {
+        let target_size = self.config.warm_pool.target_size;
+        let Some(ref template_spec) = self.config.warm_pool.template_spec else {
+            return Ok(0);
+        };
+        if target_size == 0 {
+            return Ok(0);
+        }
+
+        let mut boot_spec = template_spec.clone();
+        boot_spec.network = NetworkPolicy::Isolated;
+        let key = WarmPoolKey::from_spec(&boot_spec);
+
+        loop {
+            if self.warm_pool.is_draining() || self.admission.has_waiters() {
+                break;
+            }
+            let Some(permit) = self.admission.try_acquire_background(&boot_spec) else {
+                break;
+            };
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
+            let Some(guard) = self
+                .warm_pool
+                .try_begin_replenish(target_size, sandbox_id.clone())
+            else {
+                drop(permit);
+                break;
+            };
+            if self.admission.has_waiters() {
+                drop(guard);
+                drop(permit);
+                break;
+            }
+
+            let warm_expires_ms = expires_at_unix_ms(boot_spec.lease_ttl);
+            let booted = match self
+                .boot_sandbox_with_journal(
+                    sandbox_id.clone(),
+                    &boot_spec,
+                    JournalLifecycleState::Warm,
+                    warm_expires_ms,
+                )
+                .await
+            {
+                Ok(booted) => booted,
+                Err(err) => {
+                    drop(guard);
+                    drop(permit);
+                    return Err(err);
+                }
+            };
+            drop(booted.egress_rx);
+
+            let entry = WarmEntry {
+                sandbox_id,
+                key: key.clone(),
+                session: booted.session,
+                work_dir: booted.work_dir,
+                prepared: booted.prepared,
+                artifact_paths: booted.artifact_paths,
+                boot_capabilities: booted.capabilities,
+                booted_at: Instant::now(),
+                reserved_rss_mb: permit.demand().rss_mb,
+                permit,
+            };
+
+            if self.warm_pool.is_draining() || self.admission.has_waiters() {
+                drop(guard);
+                self.dispose_warm_entry(entry).await;
+                break;
+            }
+            if let Some(rejected) = self
+                .warm_pool
+                .park_from_replenish(guard, entry, target_size)
+            {
+                self.dispose_warm_entry(rejected).await;
+                break;
+            }
+        }
+
+        Ok(self.warm_pool.ready_len())
+    }
+
+    /// Starts the background Warm Pool replenisher & `max_idle_age` rotator; aborted when
+    /// [`LocalRuntimeManager`] drops or when [`Self::drain_warm_pool`] shuts it down.
+    pub fn spawn_warm_pool_replenisher(self: &Arc<Self>) -> JoinHandle<()> {
+        struct DoneGuard(watch::Sender<bool>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                let _ = self.0.send(true);
+            }
+        }
+
+        let weak = Arc::downgrade(self);
+        let max_idle_age = self.config.warm_pool.max_idle_age;
+        let retry_delay = self.config.warm_pool.replenish_retry_delay;
+        let expiry_tick =
+            Duration::from_secs(1).min((max_idle_age / 2).max(Duration::from_millis(1)));
+        let notify = Arc::clone(self.warm_pool.replenish_notify());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (done_tx, done_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            let _done_guard = DoneGuard(done_tx);
+            let mut interval = tokio::time::interval(expiry_tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                let Some(mgr) = weak.upgrade() else {
+                    break;
+                };
+
+                let _ = mgr.evict_expired_warm_vms().await;
+
+                let wait_retry = !mgr.warm_pool.is_draining()
+                    && !mgr.admission.has_waiters()
+                    && mgr.config.warm_pool.target_size > 0
+                    && mgr.warm_up().await.is_err();
+                drop(mgr);
+
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+
+                if wait_retry {
+                    tokio::select! {
+                        biased;
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = notify.notified() => {}
+                        _ = interval.tick() => {}
+                    }
+                }
+            }
+        });
+
+        self.warm_pool.replace_replenisher(ReplenisherHandle {
+            abort_handle: handle.abort_handle(),
+            shutdown_tx,
+            done_rx,
+        });
+        handle
+    }
+
+    /// Stops any active replenisher and one-way destroys every idle warm VM in the pool.
+    pub async fn drain_warm_pool(&self) -> Result<usize, SandboxError> {
+        struct DrainReset<'a>(&'a WarmPoolStore);
+        impl Drop for DrainReset<'_> {
+            fn drop(&mut self) {
+                self.0.set_draining(false);
+            }
+        }
+
+        self.warm_pool.set_draining(true);
+        let _drain_reset = DrainReset(&self.warm_pool);
+
+        if let Some(mut handle) = self.warm_pool.take_replenisher() {
+            let _ = handle.shutdown_tx.send(true);
+            let wait_limit = self
+                .config
+                .graceful_shutdown_timeout
+                .max(Duration::from_millis(500));
+            if tokio::time::timeout(wait_limit, handle.done_rx.wait_for(|done| *done))
+                .await
+                .is_err()
+            {
+                handle.abort_handle.abort();
+                let _ = handle.done_rx.wait_for(|done| *done).await;
+            }
+        }
+
+        self.warm_pool.wait_for_no_replenishing().await;
+
+        let entries = self.warm_pool.drain_ready();
+        let mut drained = 0usize;
+        let mut first_err: Option<SandboxError> = None;
+        for entry in entries {
+            match self.dispose_warm_entry_checked(entry).await {
+                Ok(()) => drained += 1,
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(drained),
+        }
+    }
+
+    async fn evict_expired_warm_vms(&self) -> usize {
+        let expired = self
+            .warm_pool
+            .drain_expired(self.config.warm_pool.max_idle_age);
+        let count = expired.len();
+        for entry in expired {
+            self.dispose_warm_entry(entry).await;
+        }
+        count
+    }
+
     /// Reconciles persisted crash-recovery journals on daemon startup, killing verified orphans
     /// and cleaning remaining sandbox artifacts.
     pub async fn reconcile_startup(&self) -> Result<ReconciliationReport, SandboxError> {
@@ -356,6 +605,7 @@ impl LocalRuntimeManager {
             let is_live = {
                 let active = lock_unpoisoned(&self.active);
                 active.contains_key(&record.sandbox_id)
+                    || self.warm_pool.contains_live_id(&record.sandbox_id)
             };
             if is_live {
                 continue;
@@ -601,6 +851,381 @@ impl LocalRuntimeManager {
     ) -> Result<Arc<dyn VmSessionPort>, SandboxError> {
         self.get_active_op_target(id).map(|(session, _, _)| session)
     }
+}
+
+struct BootedSandbox {
+    session: Arc<dyn VmSessionPort>,
+    work_dir: PathBuf,
+    prepared: PreparedOverlay,
+    artifact_paths: Vec<PathBuf>,
+    capabilities: CapabilityReport,
+    egress_rx: Option<tokio::sync::mpsc::Receiver<TunnelStream>>,
+}
+
+enum CheckoutAttempt {
+    Success(SandboxLease),
+    FallbackCold,
+    Err(SandboxError),
+}
+
+struct TransitioningCheckoutGuard<'a> {
+    warm_pool: &'a WarmPoolStore,
+    entry: Option<WarmEntry>,
+}
+
+impl Drop for TransitioningCheckoutGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.warm_pool.abort_checkout(&entry.sandbox_id, true);
+            // Drop `entry` outside warm_pool lock so session tears down before permit releases.
+            drop(entry);
+        }
+    }
+}
+
+impl LocalRuntimeManager {
+    async fn boot_sandbox_with_journal(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxSpec,
+        target_state: JournalLifecycleState,
+        target_expires_ms: u64,
+    ) -> Result<BootedSandbox, SandboxError> {
+        let work_dir = self.sandboxes_dir.join(sandbox_id.as_str());
+        let work_dir_for_create = work_dir.clone();
+        tokio::task::spawn_blocking(move || ensure_safe_dir_path(&work_dir_for_create, true))
+            .await
+            .map_err(|err| {
+                SandboxError::Internal(format!("create sandbox work_dir task failed: {err}"))
+            })??;
+
+        let initial_expires_ms = expires_at_unix_ms(spec.lease_ttl);
+        if let Err(err) = self
+            .write_journal_async(JournalRecord {
+                sandbox_id: sandbox_id.clone(),
+                state: JournalLifecycleState::Spawning,
+                pid: None,
+                start_token: None,
+                artifact_paths: vec![work_dir.clone()],
+                expires_at_unix_ms: initial_expires_ms,
+            })
+            .await
+        {
+            let _ = cleanup_artifacts_with_backoff(
+                std::slice::from_ref(&work_dir),
+                self.config.cleanup_max_attempts,
+                self.config.cleanup_initial_delay,
+            )
+            .await;
+            return Err(err);
+        }
+
+        let prepared = match self
+            .overlay
+            .prepare_overlay(&sandbox_id, spec, &work_dir)
+            .await
+        {
+            Ok(overlay) => overlay,
+            Err(err) => {
+                self.rollback_spawn(&sandbox_id, None, vec![work_dir], initial_expires_ms)
+                    .await;
+                return Err(err);
+            }
+        };
+
+        let spawn_artifacts = merge_artifact_paths(
+            &[],
+            std::slice::from_ref(&prepared.overlay_path),
+            &work_dir,
+        );
+        if let Err(err) = self
+            .write_journal_async(JournalRecord {
+                sandbox_id: sandbox_id.clone(),
+                state: JournalLifecycleState::Spawning,
+                pid: None,
+                start_token: None,
+                artifact_paths: spawn_artifacts.clone(),
+                expires_at_unix_ms: initial_expires_ms,
+            })
+            .await
+        {
+            self.rollback_spawn(
+                &sandbox_id,
+                Some(&prepared.overlay_path),
+                spawn_artifacts,
+                initial_expires_ms,
+            )
+            .await;
+            return Err(err);
+        }
+
+        let boot_cfg = VmBootConfig {
+            sandbox_id: sandbox_id.clone(),
+            spec: spec.clone(),
+            overlay: prepared.clone(),
+            work_dir: work_dir.clone(),
+        };
+        let boot = match self.vm_runtime.boot_vm(boot_cfg).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.rollback_spawn(
+                    &sandbox_id,
+                    Some(&prepared.overlay_path),
+                    spawn_artifacts,
+                    initial_expires_ms,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        let session: Arc<dyn VmSessionPort> = Arc::from(boot.session);
+        let all_artifacts = merge_artifact_paths(
+            &boot.artifact_paths,
+            std::slice::from_ref(&prepared.overlay_path),
+            &work_dir,
+        );
+
+        if let Err(err) = self
+            .write_journal_async(JournalRecord {
+                sandbox_id: sandbox_id.clone(),
+                state: target_state,
+                pid: Some(boot.pid),
+                start_token: Some(boot.start_token),
+                artifact_paths: all_artifacts.clone(),
+                expires_at_unix_ms: target_expires_ms,
+            })
+            .await
+        {
+            drop(boot.egress_rx);
+            let graceful = session
+                .graceful_shutdown(self.config.graceful_shutdown_timeout)
+                .await
+                .unwrap_or(false);
+            if !graceful && session.is_alive() {
+                let _ = session.force_kill().await;
+            }
+            drop(session);
+            self.rollback_spawn(
+                &sandbox_id,
+                Some(&prepared.overlay_path),
+                all_artifacts,
+                target_expires_ms,
+            )
+            .await;
+            return Err(err);
+        }
+
+        Ok(BootedSandbox {
+            session,
+            work_dir,
+            prepared,
+            artifact_paths: all_artifacts,
+            capabilities: boot.capabilities,
+            egress_rx: boot.egress_rx,
+        })
+    }
+
+    async fn try_checkout_warm_entry(
+        &self,
+        entry: WarmEntry,
+        spec: &SandboxSpec,
+    ) -> CheckoutAttempt {
+        let mut guard = TransitioningCheckoutGuard {
+            warm_pool: &self.warm_pool,
+            entry: Some(entry),
+        };
+
+        let egress_rx = if spec.network != NetworkPolicy::Isolated {
+            let res = {
+                let candidate = guard.entry.as_ref().expect("warm entry present");
+                candidate
+                    .session
+                    .enable_egress_proxy(EGRESS_PROXY_PORT)
+                    .await
+            };
+            match res {
+                Ok(rx) => Some(rx),
+                Err(_) => {
+                    let dirty = guard.entry.take().expect("warm entry present");
+                    self.dispose_checked_out_warm_entry(dirty).await;
+                    return CheckoutAttempt::FallbackCold;
+                }
+            }
+        } else {
+            None
+        };
+
+        let expires_at = Instant::now() + spec.lease_ttl;
+        let active_expires_ms = expires_at_unix_ms(spec.lease_ttl);
+        let journal_res = {
+            let candidate = guard.entry.as_ref().expect("warm entry present");
+            self.write_journal_async(JournalRecord {
+                sandbox_id: candidate.sandbox_id.clone(),
+                state: JournalLifecycleState::Active,
+                pid: Some(candidate.session.pid()),
+                start_token: Some(candidate.session.start_token()),
+                artifact_paths: candidate.artifact_paths.clone(),
+                expires_at_unix_ms: active_expires_ms,
+            })
+            .await
+        };
+        if let Err(err) = journal_res {
+            drop(egress_rx);
+            let dirty = guard.entry.take().expect("warm entry present");
+            self.dispose_checked_out_warm_entry(dirty).await;
+            return CheckoutAttempt::Err(err);
+        }
+
+        let warm = guard.entry.take().expect("warm entry present");
+        let booted = BootedSandbox {
+            session: warm.session,
+            work_dir: warm.work_dir,
+            prepared: warm.prepared,
+            artifact_paths: warm.artifact_paths,
+            capabilities: warm.boot_capabilities,
+            egress_rx,
+        };
+        let lease = self.register_active_sandbox(
+            warm.sandbox_id,
+            spec,
+            booted,
+            expires_at,
+            warm.permit,
+            true,
+        );
+        CheckoutAttempt::Success(lease)
+    }
+
+    fn register_active_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        spec: &SandboxSpec,
+        booted: BootedSandbox,
+        expires_at: Instant,
+        permit: AdmissionPermit,
+        commit_warm_checkout: bool,
+    ) -> SandboxLease {
+        let egress_proxy = booted.egress_rx.map(|rx| {
+            let proxy = Arc::new(HostEgressProxy::new(
+                spec.network.clone(),
+                Arc::clone(&self.dns_resolver),
+                Arc::clone(&self.dialer),
+            ));
+            spawn_egress_acceptor(proxy, rx)
+        });
+        let capabilities = build_lease_capabilities(spec, &booted.prepared, booted.capabilities);
+        let reserved_rss_mb = permit.demand().rss_mb;
+        let replaced = {
+            let mut active = lock_unpoisoned(&self.active);
+            let prev = active.insert(
+                sandbox_id.clone(),
+                ActiveSandbox {
+                    session: booted.session,
+                    work_dir: booted.work_dir,
+                    overlay_path: booted.prepared.overlay_path,
+                    artifact_paths: booted.artifact_paths,
+                    expires_at,
+                    reserved_rss_mb,
+                    host_rss_budget_mb: spec.budget.host_rss_budget_mb,
+                    host_storage_budget_mb: spec.budget.host_storage_budget_mb,
+                    egress_proxy,
+                    permit,
+                },
+            );
+            if commit_warm_checkout {
+                // Commit inside `active` lock (preserving `active -> warm_pool`) so RSS sampling
+                // never double-counts or under-counts across the Warm -> Active handoff.
+                self.warm_pool.commit_checkout(&sandbox_id);
+            }
+            prev
+        };
+        drop(replaced);
+
+        SandboxLease {
+            id: sandbox_id,
+            ttl: spec.lease_ttl,
+            capabilities,
+        }
+    }
+
+    async fn dispose_warm_entry(&self, entry: WarmEntry) {
+        let _ = self.dispose_warm_entry_inner(entry, false).await;
+    }
+
+    async fn dispose_warm_entry_checked(&self, entry: WarmEntry) -> Result<(), SandboxError> {
+        self.dispose_warm_entry_inner(entry, false).await
+    }
+
+    async fn dispose_checked_out_warm_entry(&self, entry: WarmEntry) {
+        let _ = self.dispose_warm_entry_inner(entry, true).await;
+    }
+
+    async fn dispose_warm_entry_inner(
+        &self,
+        entry: WarmEntry,
+        abort_transitioning_dirty: bool,
+    ) -> Result<(), SandboxError> {
+        let WarmEntry {
+            sandbox_id,
+            key: _,
+            session,
+            work_dir,
+            prepared,
+            artifact_paths,
+            boot_capabilities: _,
+            booted_at: _,
+            reserved_rss_mb: _,
+            permit,
+        } = entry;
+
+        let mut merged = merge_artifact_paths(
+            &artifact_paths,
+            std::slice::from_ref(&prepared.overlay_path),
+            &work_dir,
+        );
+        push_unique_path(&mut merged, &prepared.overlay_path);
+        let expires_ms = unix_now_ms();
+
+        let _ = self
+            .write_journal_async(JournalRecord {
+                sandbox_id: sandbox_id.clone(),
+                state: JournalLifecycleState::Destroying,
+                pid: Some(session.pid()),
+                start_token: Some(session.start_token()),
+                artifact_paths: merged.clone(),
+                expires_at_unix_ms: expires_ms,
+            })
+            .await;
+
+        let graceful_ok = session
+            .graceful_shutdown(self.config.graceful_shutdown_timeout)
+            .await
+            .unwrap_or(false);
+        let kill_res = if !graceful_ok && session.is_alive() {
+            session.force_kill().await
+        } else {
+            Ok(())
+        };
+        drop(session);
+
+        if kill_res.is_ok() {
+            self.remove_overlay_artifacts(&merged).await;
+            self.rollback_spawn(
+                &sandbox_id,
+                Some(&prepared.overlay_path),
+                merged,
+                expires_ms,
+            )
+            .await;
+        }
+
+        if abort_transitioning_dirty {
+            self.warm_pool.abort_checkout(&sandbox_id, true);
+        }
+        drop(permit);
+        kill_res
+    }
 
     async fn rollback_spawn(
         &self,
@@ -696,173 +1321,71 @@ impl RuntimeManager for LocalRuntimeManager {
             )));
         }
 
+        // Fast path: check out a compatible warm VM when no foreground waiters are queued.
+        if !self.admission.has_waiters() {
+            let key = WarmPoolKey::from_spec(&spec);
+            loop {
+                match self
+                    .warm_pool
+                    .pop_for_checkout(&key, self.config.warm_pool.max_idle_age)
+                {
+                    CheckoutPop::None => break,
+                    CheckoutPop::ExpiredOrDead(stale) => {
+                        self.dispose_warm_entry(stale).await;
+                        if self.admission.has_waiters() {
+                            break;
+                        }
+                    }
+                    CheckoutPop::Candidate(entry) => {
+                        match self.try_checkout_warm_entry(entry, &spec).await {
+                            CheckoutAttempt::Success(lease) => {
+                                self.warm_pool.notify_replenisher();
+                                return Ok(lease);
+                            }
+                            CheckoutAttempt::FallbackCold => {
+                                self.warm_pool.notify_replenisher();
+                                break;
+                            }
+                            CheckoutAttempt::Err(err) => {
+                                self.warm_pool.notify_replenisher();
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cold path: reject impossible specs before evicting healthy warm VMs.
+        self.admission.check_individual_cap(&spec)?;
+
+        while self.admission.would_exceed_with(&spec) {
+            let Some(evicted) = self.warm_pool.pop_one_for_eviction() else {
+                break;
+            };
+            self.dispose_warm_entry(evicted).await;
+        }
+
         let permit = self.admission.acquire(&spec).await?;
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
-        let work_dir = self.sandboxes_dir.join(sandbox_id.as_str());
-
-        let work_dir_for_create = work_dir.clone();
-        tokio::task::spawn_blocking(move || ensure_safe_dir_path(&work_dir_for_create, true))
-            .await
-            .map_err(|err| {
-                SandboxError::Internal(format!("create sandbox work_dir task failed: {err}"))
-            })??;
-
-        let initial_expires_ms = expires_at_unix_ms(spec.lease_ttl);
-        if let Err(err) = self
-            .write_journal_async(JournalRecord {
-                sandbox_id: sandbox_id.clone(),
-                state: JournalLifecycleState::Spawning,
-                pid: None,
-                start_token: None,
-                artifact_paths: vec![work_dir.clone()],
-                expires_at_unix_ms: initial_expires_ms,
-            })
-            .await
-        {
-            let _ = cleanup_artifacts_with_backoff(
-                std::slice::from_ref(&work_dir),
-                self.config.cleanup_max_attempts,
-                self.config.cleanup_initial_delay,
-            )
-            .await;
-            return Err(err);
-        }
-
-        let prepared = match self
-            .overlay
-            .prepare_overlay(&sandbox_id, &spec, &work_dir)
-            .await
-        {
-            Ok(overlay) => overlay,
-            Err(err) => {
-                self.rollback_spawn(&sandbox_id, None, vec![work_dir], initial_expires_ms)
-                    .await;
-                return Err(err);
-            }
-        };
-
-        let spawn_artifacts = merge_artifact_paths(
-            &[],
-            std::slice::from_ref(&prepared.overlay_path),
-            &work_dir,
-        );
-        if let Err(err) = self
-            .write_journal_async(JournalRecord {
-                sandbox_id: sandbox_id.clone(),
-                state: JournalLifecycleState::Spawning,
-                pid: None,
-                start_token: None,
-                artifact_paths: spawn_artifacts.clone(),
-                expires_at_unix_ms: initial_expires_ms,
-            })
-            .await
-        {
-            self.rollback_spawn(
-                &sandbox_id,
-                Some(&prepared.overlay_path),
-                spawn_artifacts,
-                initial_expires_ms,
-            )
-            .await;
-            return Err(err);
-        }
-
-        let boot_cfg = VmBootConfig {
-            sandbox_id: sandbox_id.clone(),
-            spec: spec.clone(),
-            overlay: prepared.clone(),
-            work_dir: work_dir.clone(),
-        };
-        let boot = match self.vm_runtime.boot_vm(boot_cfg).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                self.rollback_spawn(
-                    &sandbox_id,
-                    Some(&prepared.overlay_path),
-                    spawn_artifacts,
-                    initial_expires_ms,
-                )
-                .await;
-                return Err(err);
-            }
-        };
-
-        let session: Arc<dyn VmSessionPort> = Arc::from(boot.session);
-        let all_artifacts = merge_artifact_paths(
-            &boot.artifact_paths,
-            std::slice::from_ref(&prepared.overlay_path),
-            &work_dir,
-        );
         let expires_at = Instant::now() + spec.lease_ttl;
         let active_expires_ms = expires_at_unix_ms(spec.lease_ttl);
 
-        if let Err(err) = self
-            .write_journal_async(JournalRecord {
-                sandbox_id: sandbox_id.clone(),
-                state: JournalLifecycleState::Active,
-                pid: Some(boot.pid),
-                start_token: Some(boot.start_token),
-                artifact_paths: all_artifacts.clone(),
-                expires_at_unix_ms: active_expires_ms,
-            })
-            .await
-        {
-            drop(boot.egress_rx);
-            let graceful = session
-                .graceful_shutdown(self.config.graceful_shutdown_timeout)
-                .await
-                .unwrap_or(false);
-            if !graceful && session.is_alive() {
-                let _ = session.force_kill().await;
-            }
-            drop(session);
-            self.rollback_spawn(
-                &sandbox_id,
-                Some(&prepared.overlay_path),
-                all_artifacts,
+        let booted = self
+            .boot_sandbox_with_journal(
+                sandbox_id.clone(),
+                &spec,
+                JournalLifecycleState::Active,
                 active_expires_ms,
             )
-            .await;
-            return Err(err);
-        }
+            .await?;
 
-        let egress_proxy = boot.egress_rx.map(|rx| {
-            let proxy = Arc::new(HostEgressProxy::new(
-                spec.network.clone(),
-                Arc::clone(&self.dns_resolver),
-                Arc::clone(&self.dialer),
-            ));
-            spawn_egress_acceptor(proxy, rx)
-        });
-        let capabilities = build_lease_capabilities(&spec, &prepared, boot.capabilities);
-        let reserved_rss_mb = permit.demand().rss_mb;
-        let replaced = {
-            let mut active = lock_unpoisoned(&self.active);
-            active.insert(
-                sandbox_id.clone(),
-                ActiveSandbox {
-                    session,
-                    work_dir,
-                    overlay_path: prepared.overlay_path,
-                    artifact_paths: all_artifacts,
-                    expires_at,
-                    reserved_rss_mb,
-                    host_rss_budget_mb: spec.budget.host_rss_budget_mb,
-                    host_storage_budget_mb: spec.budget.host_storage_budget_mb,
-                    egress_proxy,
-                    permit,
-                },
-            )
-        };
-        drop(replaced);
-
-        Ok(SandboxLease {
-            id: sandbox_id,
-            ttl: spec.lease_ttl,
-            capabilities,
-        })
+        let lease =
+            self.register_active_sandbox(sandbox_id, &spec, booted, expires_at, permit, false);
+        self.warm_pool.record_cold_spawn();
+        Ok(lease)
     }
 
     async fn renew_lease(&self, id: &SandboxId, ttl: Duration) -> Result<(), SandboxError> {
@@ -1009,6 +1532,17 @@ impl RuntimeManager for LocalRuntimeManager {
     }
 
     async fn destroy(&self, id: &SandboxId) -> Result<DestroyStatus, SandboxError> {
+        struct DestroyPermitAndNotify<'a> {
+            permit: Option<AdmissionPermit>,
+            warm_pool: &'a WarmPoolStore,
+        }
+        impl Drop for DestroyPermitAndNotify<'_> {
+            fn drop(&mut self) {
+                drop(self.permit.take());
+                self.warm_pool.notify_replenisher();
+            }
+        }
+
         let _slot = self.acquire_destroy_slot(id).await;
 
         let removed_active = {
@@ -1026,7 +1560,12 @@ impl RuntimeManager for LocalRuntimeManager {
             .map(|rec| rec.expires_at_unix_ms)
             .unwrap_or_else(unix_now_ms);
 
-        let (overlay_path_opt, artifacts, _permit_guard) = if let Some(entry) = removed_active {
+        let (overlay_path_opt, artifacts, _permit_and_notify) = if let Some(entry) =
+            removed_active
+        {
+            // Strict one-way disposal: dirty sandboxes are never recycled back into `warm_pool`.
+            self.warm_pool.record_disposed_dirty();
+
             let ActiveSandbox {
                 session,
                 work_dir: _,
@@ -1039,6 +1578,11 @@ impl RuntimeManager for LocalRuntimeManager {
                 egress_proxy,
                 permit,
             } = entry;
+
+            let permit_guard = DestroyPermitAndNotify {
+                permit: Some(permit),
+                warm_pool: &self.warm_pool,
+            };
 
             let journal_paths = journal_rec
                 .as_ref()
@@ -1074,7 +1618,7 @@ impl RuntimeManager for LocalRuntimeManager {
             if let Some(proxy) = egress_proxy {
                 proxy.shutdown().await;
             }
-            (Some(overlay_path), merged, Some(permit))
+            (Some(overlay_path), merged, Some(permit_guard))
         } else if let Some(rec) = journal_rec {
             if let (Some(pid), Some(start_token)) = (rec.pid, rec.start_token) {
                 match self.vm_runtime.kill_orphan_process(pid, start_token).await {
@@ -1120,7 +1664,7 @@ impl RuntimeManager for LocalRuntimeManager {
                 })
             }
         };
-        drop(_permit_guard);
+        drop(_permit_and_notify);
         result
     }
 }
@@ -1316,6 +1860,7 @@ mod tests {
             cleanup_max_attempts: 4,
             cleanup_initial_delay: Duration::from_millis(2),
             admission: AdmissionLimits::default(),
+            warm_pool: WarmPoolConfig::default(),
         }
     }
 
@@ -1379,6 +1924,7 @@ mod tests {
     struct MockSessionState {
         alive: AtomicBool,
         rss_bytes: AtomicU64,
+        fail_enable_egress: AtomicBool,
         graceful_succeeds: bool,
         graceful_calls: Mutex<usize>,
         force_kill_calls: Mutex<usize>,
@@ -1476,6 +2022,11 @@ mod tests {
             if !self.is_alive() {
                 return Err(SandboxError::Transport(
                     "mock VM session is no longer alive".to_owned(),
+                ));
+            }
+            if self.state.fail_enable_egress.load(Ordering::Acquire) {
+                return Err(SandboxError::Transport(
+                    "simulated egress activation failure".to_owned(),
                 ));
             }
             let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1595,6 +2146,7 @@ mod tests {
             let sess_state = Arc::new(MockSessionState {
                 alive: AtomicBool::new(true),
                 rss_bytes: AtomicU64::new(64 * 1024 * 1024),
+                fail_enable_egress: AtomicBool::new(false),
                 graceful_succeeds: graceful,
                 graceful_calls: Mutex::new(0),
                 force_kill_calls: Mutex::new(0),
@@ -2667,5 +3219,600 @@ mod tests {
         .expect("stalled proxy task must abort promptly on destroy")
         .unwrap();
         assert!(after_destroy.is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_pool_prewarms_writes_warm_journals_rejects_shared_kernel_and_counts_rss() {
+        let tmp = TestTempDir::new("mgr-wp-prewarm");
+        let state_dir = tmp.path().join("state");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+
+        let mut shared_spec = valid_spec(Duration::from_secs(60));
+        shared_spec.isolation = IsolationMode::SharedKernelAllowed;
+        let mut bad_cfg = base_config(state_dir.clone());
+        bad_cfg.warm_pool = WarmPoolConfig {
+            target_size: 1,
+            template_spec: Some(shared_spec),
+            ..Default::default()
+        };
+        assert!(matches!(
+            LocalRuntimeManager::new(bad_cfg, overlay.clone(), vm.clone()),
+            Err(SandboxError::UnsupportedIsolationMode(_))
+        ));
+
+        let mut cfg = base_config(state_dir.clone());
+        let mut tmpl = valid_spec(Duration::from_secs(60));
+        tmpl.budget.guest_ram_mb = 128;
+        tmpl.budget.host_rss_budget_mb = Some(256);
+        cfg.admission = AdmissionLimits {
+            max_total_host_rss_mb: Some(600),
+            ..Default::default()
+        };
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 2,
+            template_spec: Some(tmpl),
+            ..Default::default()
+        };
+
+        let mgr = LocalRuntimeManager::new(cfg, overlay.clone(), vm.clone()).unwrap();
+
+        // Boot failure during warm_up rolls back cleanly without leaking permits, journals, or dirs.
+        lock_unpoisoned(&vm.state).fail_boot = true;
+        assert!(matches!(
+            mgr.warm_up().await,
+            Err(SandboxError::AccelerationUnavailable(_))
+        ));
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 0);
+        assert_eq!(mgr.warm_pool_stats().replenishing_vms, 0);
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+        assert!(mgr.journal.load_records().unwrap().is_empty());
+        assert_eq!(fs::read_dir(state_dir.join("sandboxes")).unwrap().count(), 0);
+
+        lock_unpoisoned(&vm.state).fail_boot = false;
+        let ready = mgr.warm_up().await.unwrap();
+        assert_eq!(ready, 2);
+        let stats = mgr.warm_pool_stats();
+        assert_eq!(stats.ready_vms, 2);
+        assert_eq!(stats.replenishing_vms, 0);
+
+        // Journal records on disk must be in `Warm` state with PID and start_token.
+        let records = mgr.journal.load_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|r| r.state == JournalLifecycleState::Warm && r.pid.is_some()));
+
+        // Idle warm VMs reserve capacity and contribute live RSS to effective_host_rss_mb.
+        let usage = mgr.current_admission_usage();
+        assert_eq!(usage.active_sandboxes, 2);
+        assert_eq!(usage.reserved_host_rss_mb, 512);
+        assert_eq!(usage.effective_host_rss_mb, 512);
+
+        {
+            let st = lock_unpoisoned(&vm.state);
+            st.sessions[0]
+                .rss_bytes
+                .store(400 * 1024 * 1024, Ordering::Release);
+        }
+        // 400 MiB (warm #0 live) + 256 MiB (warm #1 reserved) = 656 MiB > 600 MiB!
+        assert_eq!(mgr.current_admission_usage().effective_host_rss_mb, 656);
+        let mut extra = valid_spec(Duration::from_secs(30));
+        extra.budget.guest_ram_mb = 64;
+        extra.budget.host_rss_budget_mb = Some(64);
+        assert!(mgr.admission.would_exceed_with(&extra));
+
+        // Evicting warm #0 alone brings total RSS to 256 MiB, letting `extra` (64 MiB) fit cleanly!
+        let extra_lease = mgr.spawn(extra.clone()).await.unwrap();
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 1);
+        assert_eq!(mgr.warm_pool_stats().total_evictions, 1);
+
+        // If the active sandbox spikes to 560 MiB, evicting warm #1 still leaves 560 + 64 > 600 -> rejected.
+        {
+            let st = lock_unpoisoned(&vm.state);
+            st.sessions[2]
+                .rss_bytes
+                .store(560 * 1024 * 1024, Ordering::Release);
+        }
+        assert!(matches!(
+            mgr.spawn(extra).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 0);
+        assert_eq!(mgr.warm_pool_stats().total_evictions, 2);
+        mgr.destroy(&extra_lease.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_pool_fast_checkout_serves_isolated_and_dynamic_domain_allowlist_egress() {
+        use std::io;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::egress::BoxedUpstreamStream;
+
+        struct AllowDns;
+        #[async_trait::async_trait]
+        impl HostDnsResolver for AllowDns {
+            async fn resolve(&self, _host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                    port,
+                )])
+            }
+        }
+
+        struct AllowDialer {
+            dialed: Mutex<Vec<SocketAddr>>,
+        }
+        #[async_trait::async_trait]
+        impl UpstreamDialer for AllowDialer {
+            async fn connect(&self, addr: SocketAddr) -> io::Result<BoxedUpstreamStream> {
+                lock_unpoisoned(&self.dialed).push(addr);
+                let (proxy_side, mut server_side) = tokio::io::duplex(4096);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = server_side.read(&mut buf).await {
+                        if n > 0 {
+                            let _ = server_side.write_all(&buf[..n]).await;
+                        }
+                    }
+                    let _ = server_side.shutdown().await;
+                });
+                Ok(Box::pin(proxy_side))
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-wp-checkout-egress");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let dialer = Arc::new(AllowDialer {
+            dialed: Mutex::new(Vec::new()),
+        });
+
+        let tmpl = valid_spec(Duration::from_secs(60));
+        let mut cfg = base_config(tmp.path().to_path_buf());
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 3,
+            template_spec: Some(tmpl),
+            ..Default::default()
+        };
+
+        let mgr = LocalRuntimeManager::with_egress_hooks(
+            cfg,
+            overlay,
+            vm.clone(),
+            Arc::new(AllowDns),
+            dialer.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(mgr.warm_up().await.unwrap(), 3);
+
+        // 1. Checkout for Isolated network (with distinct lease_ttl): reuses warm VM #0 without egress.
+        let iso_lease = mgr.spawn(valid_spec(Duration::from_secs(120))).await.unwrap();
+        assert_eq!(iso_lease.capabilities.egress_filter, EnforcementLevel::HardLimit);
+        assert_eq!(mgr.warm_pool_stats().total_checkouts, 1);
+        assert_eq!(mgr.warm_pool_stats().total_cold_spawns, 0);
+        assert_eq!(
+            mgr.journal.load_record(&iso_lease.id).unwrap().unwrap().state,
+            JournalLifecycleState::Active
+        );
+        {
+            let st = lock_unpoisoned(&vm.state);
+            assert_eq!(*lock_unpoisoned(&st.sessions[0].egress_enabled_port), None);
+        }
+
+        // 2. Checkout for DomainAllowList: dynamically calls enable_egress_proxy(3128) and wires HostEgressProxy!
+        let mut allow_spec = valid_spec(Duration::from_secs(45));
+        allow_spec.network = NetworkPolicy::DomainAllowList {
+            rules: vec![EgressRule {
+                domain: "api.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        let net_lease = mgr.spawn(allow_spec.clone()).await.unwrap();
+        assert_eq!(net_lease.capabilities.egress_filter, EnforcementLevel::HardLimit);
+        assert_eq!(mgr.warm_pool_stats().total_checkouts, 2);
+        assert_eq!(mgr.warm_pool_stats().total_cold_spawns, 0);
+
+        let egress_tx = {
+            let st = lock_unpoisoned(&vm.state);
+            assert_eq!(
+                *lock_unpoisoned(&st.sessions[1].egress_enabled_port),
+                Some(3128)
+            );
+            let tx = lock_unpoisoned(&st.sessions[1].egress_tx).clone().unwrap();
+            tx
+        };
+
+        let (stream_ok, mut handle_ok) = TunnelStream::channel(StreamId(20));
+        egress_tx.send(stream_ok).await.unwrap();
+        handle_ok
+            .write_half
+            .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 64];
+        let n = handle_ok.read_half.read(&mut head).await.unwrap();
+        assert!(String::from_utf8_lossy(&head[..n]).starts_with("HTTP/1.1 200 Connection Established"));
+        handle_ok.write_half.write_all(b"hi").await.unwrap();
+        handle_ok.write_half.shutdown().await.unwrap();
+        let mut echo = Vec::new();
+        handle_ok.read_half.read_to_end(&mut echo).await.unwrap();
+        assert_eq!(echo, b"hi");
+
+        let (stream_deny, mut handle_deny) = TunnelStream::channel(StreamId(21));
+        egress_tx.send(stream_deny).await.unwrap();
+        handle_deny
+            .write_half
+            .write_all(b"CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+        handle_deny.write_half.shutdown().await.unwrap();
+        let mut deny_resp = Vec::new();
+        handle_deny.read_half.read_to_end(&mut deny_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&deny_resp).starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(lock_unpoisoned(&dialer.dialed).len(), 1);
+
+        // 3. Flaky warm VM failing enable_egress_proxy(3128) is disposed one-way as dirty and falls back cleanly.
+        {
+            let st = lock_unpoisoned(&vm.state);
+            st.sessions[2]
+                .fail_enable_egress
+                .store(true, Ordering::Release);
+        }
+        let fallback_lease = mgr.spawn(allow_spec).await.unwrap();
+        let stats = mgr.warm_pool_stats();
+        assert_eq!(stats.ready_vms, 0);
+        assert_eq!(stats.total_checkouts, 2);
+        assert_eq!(stats.total_disposed_dirty, 1);
+        assert_eq!(stats.total_cold_spawns, 1);
+
+        mgr.destroy(&iso_lease.id).await.unwrap();
+        mgr.destroy(&net_lease.id).await.unwrap();
+        mgr.destroy(&fallback_lease.id).await.unwrap();
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+        assert!(mgr.journal.load_records().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_pool_strict_one_way_disposal_never_recycles_used_vms() {
+        let tmp = TestTempDir::new("mgr-wp-oneway");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().to_path_buf());
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 1,
+            template_spec: Some(valid_spec(Duration::from_secs(60))),
+            ..Default::default()
+        };
+        let mgr = LocalRuntimeManager::new(cfg, overlay, vm.clone()).unwrap();
+
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+        let lease1 = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        assert_eq!(mgr.warm_pool_stats().total_checkouts, 1);
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 0);
+
+        let stream = mgr
+            .exec_stream(
+                &lease1.id,
+                ExecRequest {
+                    target: ExecTarget::Guest,
+                    argv: vec!["id".into()],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    user: None,
+                    deadline: Duration::from_secs(5),
+                    stdout_budget_bytes: 1024,
+                    stderr_budget_bytes: 1024,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.collect().await.unwrap().exit.code, Some(0));
+
+        assert_eq!(
+            mgr.destroy(&lease1.id).await.unwrap(),
+            DestroyStatus::AllResourcesCleaned
+        );
+        // Second idempotent destroy must NOT double-increment total_disposed_dirty.
+        assert_eq!(
+            mgr.destroy(&lease1.id).await.unwrap(),
+            DestroyStatus::AllResourcesCleaned
+        );
+
+        let stats = mgr.warm_pool_stats();
+        assert_eq!(stats.ready_vms, 0);
+        assert_eq!(stats.total_disposed_dirty, 1);
+        assert!(!lock_unpoisoned(&vm.state).sessions[0]
+            .alive
+            .load(Ordering::Acquire));
+
+        // Subsequent spawn cannot reuse the destroyed VM; it must cold-spawn a fresh one.
+        let lease2 = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        assert_ne!(lease2.id, lease1.id);
+        assert_eq!(mgr.warm_pool_stats().total_cold_spawns, 1);
+        mgr.destroy(&lease2.id).await.unwrap();
+        assert_eq!(mgr.warm_pool_stats().total_disposed_dirty, 2);
+
+        // If an idle warm VM dies before checkout, spawn evicts it cleanly and falls back to cold boot.
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+        {
+            let st = lock_unpoisoned(&vm.state);
+            st.sessions.last().unwrap().alive.store(false, Ordering::Release);
+        }
+        let lease3 = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        let stats_after = mgr.warm_pool_stats();
+        assert_eq!(stats_after.total_evictions, 1);
+        assert_eq!(stats_after.total_cold_spawns, 2);
+        assert_eq!(stats_after.ready_vms, 0);
+        mgr.destroy(&lease3.id).await.unwrap();
+        assert!(mgr.journal.load_records().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn warm_pool_evicts_idle_vms_for_mismatched_spec_under_tight_admission() {
+        let tmp = TestTempDir::new("mgr-wp-evict");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+
+        let mut tmpl = valid_spec(Duration::from_secs(60));
+        tmpl.budget.guest_ram_mb = 128;
+        tmpl.budget.host_rss_budget_mb = Some(256);
+        tmpl.budget.host_storage_budget_mb = 512;
+        tmpl.budget.virtual_disk_mb = 256;
+
+        let mut cfg = base_config(tmp.path().to_path_buf());
+        cfg.admission = AdmissionLimits {
+            max_concurrent_sandboxes: Some(2),
+            max_total_host_rss_mb: Some(512),
+            ..Default::default()
+        };
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 2,
+            template_spec: Some(tmpl),
+            ..Default::default()
+        };
+        let mgr = LocalRuntimeManager::new(cfg, overlay, vm.clone()).unwrap();
+        assert_eq!(mgr.warm_up().await.unwrap(), 2);
+
+        // Request exceeding single-sandbox cap (600 > 512) rejects immediately WITHOUT evicting pool.
+        let mut impossible = valid_spec(Duration::from_secs(30));
+        impossible.budget.guest_ram_mb = 512;
+        impossible.budget.host_rss_budget_mb = Some(600);
+        assert!(matches!(
+            mgr.spawn(impossible).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 2);
+        assert_eq!(mgr.warm_pool_stats().total_evictions, 0);
+
+        // Mismatched spec needing 384 MiB evicts both 256 MiB warm VMs so admission succeeds.
+        let mut mismatched = valid_spec(Duration::from_secs(30));
+        mismatched.budget.guest_ram_mb = 384;
+        mismatched.budget.host_rss_budget_mb = Some(384);
+        let lease = mgr.spawn(mismatched).await.unwrap();
+
+        let stats = mgr.warm_pool_stats();
+        assert_eq!(stats.ready_vms, 0);
+        assert_eq!(stats.total_evictions, 2);
+        assert_eq!(stats.total_cold_spawns, 1);
+        assert_eq!(mgr.current_admission_usage().active_sandboxes, 1);
+
+        mgr.destroy(&lease.id).await.unwrap();
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+    }
+
+    #[tokio::test]
+    async fn warm_pool_overload_burst_prioritizes_foreground_waiters_and_never_breaches_rss() {
+        let tmp = TestTempDir::new("mgr-wp-burst");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+
+        let mut tmpl = valid_spec(Duration::from_secs(60));
+        tmpl.budget.guest_ram_mb = 256;
+        tmpl.budget.host_rss_budget_mb = Some(512);
+
+        let mut cfg = base_config(tmp.path().to_path_buf());
+        cfg.admission = AdmissionLimits {
+            max_concurrent_sandboxes: Some(2),
+            max_total_host_rss_mb: Some(1024),
+            admission_queue_timeout: Duration::from_secs(3),
+            max_admission_queue_depth: 2,
+            ..Default::default()
+        };
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 2,
+            template_spec: Some(tmpl.clone()),
+            max_idle_age: Duration::from_secs(60),
+            replenish_retry_delay: Duration::from_millis(10),
+        };
+
+        let mgr = Arc::new(LocalRuntimeManager::new(cfg, overlay, vm).unwrap());
+        let _replenisher = mgr.spawn_warm_pool_replenisher();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mgr.warm_pool_stats().ready_vms < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial warm pool fill");
+
+        // Burst 5 concurrent spawns: 2 warm checkouts, 2 queued waiters, 1 immediate queue-depth reject.
+        let l1 = mgr.spawn(tmpl.clone()).await.unwrap();
+        let l2 = mgr.spawn(tmpl.clone()).await.unwrap();
+        assert_eq!(mgr.warm_pool_stats().total_checkouts, 2);
+        assert!(mgr.current_admission_usage().effective_host_rss_mb <= 1024);
+
+        let m_w1 = Arc::clone(&mgr);
+        let s_w1 = tmpl.clone();
+        let w1 = tokio::spawn(async move { m_w1.spawn(s_w1).await });
+        tokio::task::yield_now().await;
+
+        let m_w2 = Arc::clone(&mgr);
+        let s_w2 = tmpl.clone();
+        let w2 = tokio::spawn(async move { m_w2.spawn(s_w2).await });
+        tokio::task::yield_now().await;
+
+        // 5th concurrent caller exceeds max_admission_queue_depth (2).
+        assert!(matches!(
+            mgr.spawn(tmpl).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+        assert!(mgr.admission.has_waiters());
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 0);
+        assert_eq!(mgr.warm_pool_stats().replenishing_vms, 0);
+
+        // Destroying active leases must grant capacity to foreground waiters BEFORE replenisher re-warms!
+        mgr.destroy(&l1.id).await.unwrap();
+        mgr.destroy(&l2.id).await.unwrap();
+
+        let l3 = w1.await.unwrap().unwrap();
+        let l4 = w2.await.unwrap().unwrap();
+        assert_eq!(mgr.warm_pool_stats().total_cold_spawns, 2);
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 0);
+        assert!(mgr.current_admission_usage().effective_host_rss_mb <= 1024);
+
+        // Once foreground waiters finish and active leases drain, replenisher refills back to target_size.
+        mgr.destroy(&l3.id).await.unwrap();
+        mgr.destroy(&l4.id).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mgr.warm_pool_stats().ready_vms < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replenisher must refill after foreground load drains");
+
+        assert_eq!(mgr.drain_warm_pool().await.unwrap(), 2);
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+    }
+
+    #[tokio::test]
+    async fn warm_pool_rotates_max_idle_age_drains_cleanly_and_aborts_on_drop() {
+        let tmp = TestTempDir::new("mgr-wp-rotate-drain");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().to_path_buf());
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 1,
+            template_spec: Some(valid_spec(Duration::from_secs(60))),
+            max_idle_age: Duration::from_millis(45),
+            replenish_retry_delay: Duration::from_millis(10),
+        };
+
+        let mgr = Arc::new(LocalRuntimeManager::new(cfg, overlay, vm.clone()).unwrap());
+        let replenisher = mgr.spawn_warm_pool_replenisher();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mgr.warm_pool_stats().ready_vms < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial warm boot");
+
+        // Wait past max_idle_age so the background ticker rotates the stale warm VM.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mgr.warm_pool_stats().total_evictions < 1 || mgr.warm_pool_stats().ready_vms < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("max_idle_age rotation");
+
+        {
+            let st = lock_unpoisoned(&vm.state);
+            assert!(st.sessions.len() >= 2);
+            assert!(!st.sessions[0].alive.load(Ordering::Acquire));
+            assert!(st.sessions.last().unwrap().alive.load(Ordering::Acquire));
+        }
+
+        // drain_warm_pool stops replenisher and destroys all idle warm VMs cleanly.
+        let drained = mgr.drain_warm_pool().await.unwrap();
+        assert_eq!(drained, 1);
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 0);
+        assert_eq!(mgr.warm_pool_stats().replenishing_vms, 0);
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+        assert!(mgr.journal.load_records().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_millis(200), replenisher)
+            .await
+            .expect("replenisher exits on drain")
+            .expect("replenisher joins cleanly");
+
+        // Dropping Arc<LocalRuntimeManager> aborts a newly spawned replenisher cleanly.
+        let replenisher2 = mgr.spawn_warm_pool_replenisher();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mgr.warm_pool_stats().ready_vms < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("re-warm after drain");
+
+        drop(mgr);
+        let join_res = tokio::time::timeout(Duration::from_millis(200), replenisher2)
+            .await
+            .expect("replenisher aborts promptly on manager drop");
+        assert!(join_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_reconciler_reaps_crashed_warm_journals_and_skips_live_warm_vms() {
+        let tmp = TestTempDir::new("mgr-wp-reconcile");
+        let state_dir = tmp.path().join("state");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(state_dir.clone());
+        cfg.warm_pool = WarmPoolConfig {
+            target_size: 1,
+            template_spec: Some(valid_spec(Duration::from_secs(60))),
+            ..Default::default()
+        };
+
+        let mgr = LocalRuntimeManager::new(cfg, overlay.clone(), vm.clone()).unwrap();
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+
+        // Simulate a crash-leftover Warm journal record from a dead daemon instance.
+        let orphan_work = state_dir.join("sandboxes").join("mp-warm-orphan");
+        fs::create_dir_all(&orphan_work).unwrap();
+        let orphan_overlay = orphan_work.join("overlay.qcow2");
+        fs::write(&orphan_overlay, b"warm-q").unwrap();
+        {
+            let mut st = lock_unpoisoned(&vm.state);
+            st.live_orphans.insert((5555, 6666));
+        }
+        mgr.journal
+            .write_record(&JournalRecord {
+                sandbox_id: SandboxId::new("mp-warm-orphan"),
+                state: JournalLifecycleState::Warm,
+                pid: Some(5555),
+                start_token: Some(6666),
+                artifact_paths: vec![orphan_overlay.clone(), orphan_work.clone()],
+                expires_at_unix_ms: 999,
+            })
+            .unwrap();
+
+        let report = mgr.reconcile_startup().await.unwrap();
+        assert_eq!(
+            report,
+            ReconciliationReport {
+                records_seen: 1,
+                orphans_killed: 1,
+                cleaned: 1,
+                remaining: 0,
+            }
+        );
+        assert!(!orphan_work.exists());
+        assert!(overlay.removed_paths().contains(&orphan_overlay));
+
+        // Live warm VM must remain untouched and immediately available for checkout.
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 1);
+        let lease = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        assert_eq!(mgr.warm_pool_stats().total_checkouts, 1);
+        mgr.destroy(&lease.id).await.unwrap();
     }
 }

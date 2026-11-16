@@ -10,6 +10,7 @@ pub mod manager;
 pub mod ports;
 pub mod safe_tar;
 pub mod tunnel;
+pub mod warm_pool;
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -39,6 +40,7 @@ pub use ports::{
 };
 pub use safe_tar::{extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar};
 pub use tunnel::{TunnelStream, TunnelStreamHandle};
+pub use warm_pool::{WarmPoolConfig, WarmPoolKey, WarmPoolStats};
 
 #[async_trait::async_trait]
 pub trait RuntimeManager: Send + Sync {
