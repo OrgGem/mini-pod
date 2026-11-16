@@ -153,8 +153,8 @@ impl DockerCompatServer {
     }
 
     /// Returns the active Docker compatibility security policy.
-    pub fn policy(&self) -> DockerCompatPolicy {
-        self.policy
+    pub fn policy(&self) -> &DockerCompatPolicy {
+        &self.policy
     }
 
     /// Returns the sandbox identifier bound to this server.
@@ -1807,6 +1807,7 @@ mod tests {
             SandboxId::new("sbx-docker-e2e"),
             DockerCompatPolicy {
                 reaper_socket: ReaperSocketPolicy::MapGuestPodmanSocket,
+                ..Default::default()
             },
         ));
 

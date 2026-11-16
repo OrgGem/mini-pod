@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use sandbox_protocol::{ExecTargetWire, Message, StreamChannel, StreamId};
 
+use crate::egress_listener::{container_proxy_url, guest_proxy_url, inject_default_proxy_env};
 use crate::podman::{PodmanServiceManager, PODMAN_BIN, PODMAN_XDG_RUNTIME_DIR};
 use crate::OutboundQueue;
 #[cfg(unix)]
@@ -30,6 +31,7 @@ pub(crate) struct ExecSpec {
     pub deadline_ms: u64,
     pub stdout_budget_bytes: u64,
     pub stderr_budget_bytes: u64,
+    pub proxy_port: Option<u16>,
 }
 
 pub(crate) enum StdinItem {
@@ -242,6 +244,21 @@ pub(crate) fn validate_container_target(id_or_name: &str) -> Result<(), String> 
     Ok(())
 }
 
+pub(crate) fn resolve_exec_env(
+    target: &ExecTargetWire,
+    user_env: &BTreeMap<String, String>,
+    proxy_port: Option<u16>,
+) -> BTreeMap<String, String> {
+    let Some(port) = proxy_port.filter(|&p| p > 0) else {
+        return user_env.clone();
+    };
+    let proxy_url = match target {
+        ExecTargetWire::Guest => guest_proxy_url(port),
+        ExecTargetWire::Container { .. } => container_proxy_url(port),
+    };
+    inject_default_proxy_env(user_env, &proxy_url)
+}
+
 fn build_container_exec_args(id_or_name: &str, spec: &ExecSpec) -> Result<Vec<String>, String> {
     validate_container_target(id_or_name)?;
     if spec.argv.is_empty() {
@@ -263,7 +280,8 @@ fn build_container_exec_args(id_or_name: &str, spec: &ExecSpec) -> Result<Vec<St
         args.push("--user".to_owned());
         args.push(user.clone());
     }
-    for (key, val) in &spec.env {
+    let effective_env = resolve_exec_env(&spec.target, &spec.env, spec.proxy_port);
+    for (key, val) in &effective_env {
         if key.is_empty() || key.contains('=') || key.contains('\0') {
             return Err(format!("invalid container exec env key '{key}'"));
         }
@@ -389,9 +407,10 @@ fn run_exec_inner(
             #[cfg(unix)]
             user,
         } => {
+            let effective_env = resolve_exec_env(&spec.target, &spec.env, spec.proxy_port);
             let mut c = Command::new(program);
             c.args(args)
-                .envs(&spec.env)
+                .envs(&effective_env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -956,6 +975,7 @@ mod tests {
             deadline_ms: 5_000,
             stdout_budget_bytes: 4096,
             stderr_budget_bytes: 4096,
+            proxy_port: None,
         }
     }
 
@@ -1028,5 +1048,53 @@ mod tests {
         let mut bad_env_val = sample_container_spec();
         bad_env_val.env.insert("OK".to_owned(), "a\0b".to_owned());
         assert!(build_container_exec_args("c1", &bad_env_val).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_env_injects_proxy_defaults_and_preserves_overrides() {
+        let mut user_env = BTreeMap::new();
+        user_env.insert("HTTP_PROXY".to_owned(), "http://custom-proxy:9999".to_owned());
+        user_env.insert("http_proxy".to_owned(), String::new());
+        user_env.insert("APP_MODE".to_owned(), "prod".to_owned());
+
+        // Disabled proxy leaves user env untouched.
+        assert_eq!(
+            resolve_exec_env(&ExecTargetWire::Guest, &user_env, None),
+            user_env
+        );
+
+        // Guest target injects http://127.0.0.1:<port> for missing keys.
+        let guest_env = resolve_exec_env(&ExecTargetWire::Guest, &user_env, Some(3128));
+        assert_eq!(guest_env.get("HTTP_PROXY").map(String::as_str), Some("http://custom-proxy:9999"));
+        assert_eq!(guest_env.get("http_proxy").map(String::as_str), Some(""));
+        assert_eq!(guest_env.get("APP_MODE").map(String::as_str), Some("prod"));
+        assert_eq!(guest_env.get("HTTPS_PROXY").map(String::as_str), Some("http://127.0.0.1:3128"));
+        assert_eq!(guest_env.get("ALL_PROXY").map(String::as_str), Some("http://127.0.0.1:3128"));
+        assert_eq!(guest_env.get("https_proxy").map(String::as_str), Some("http://127.0.0.1:3128"));
+        assert_eq!(guest_env.get("all_proxy").map(String::as_str), Some("http://127.0.0.1:3128"));
+        assert_eq!(
+            guest_env.get("NO_PROXY").map(String::as_str),
+            Some(crate::egress_listener::DEFAULT_NO_PROXY)
+        );
+        assert_eq!(
+            guest_env.get("no_proxy").map(String::as_str),
+            Some(crate::egress_listener::DEFAULT_NO_PROXY)
+        );
+
+        // Container target injects http://10.88.0.1:<port> for bridged netavark containers.
+        let mut container_spec = sample_container_spec();
+        container_spec.env = user_env;
+        container_spec.proxy_port = Some(3128);
+        let args = build_container_exec_args("web_1.app-0", &container_spec).unwrap();
+        assert!(args.contains(&"HTTP_PROXY=http://custom-proxy:9999".to_owned()));
+        assert!(args.contains(&"http_proxy=".to_owned()));
+        assert!(args.contains(&"HTTPS_PROXY=http://10.88.0.1:3128".to_owned()));
+        assert!(args.contains(&"ALL_PROXY=http://10.88.0.1:3128".to_owned()));
+        assert!(args.contains(&"https_proxy=http://10.88.0.1:3128".to_owned()));
+        assert!(args.contains(&"all_proxy=http://10.88.0.1:3128".to_owned()));
+        assert!(args.contains(&format!(
+            "NO_PROXY={}",
+            crate::egress_listener::DEFAULT_NO_PROXY
+        )));
     }
 }

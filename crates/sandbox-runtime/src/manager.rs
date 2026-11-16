@@ -1234,6 +1234,7 @@ mod tests {
                     host_storage: EnforcementLevel::Unsupported,
                     egress_filter: EnforcementLevel::HardLimit,
                 },
+                egress_rx: None,
             })
         }
 

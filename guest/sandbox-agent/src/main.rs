@@ -2,6 +2,7 @@
 //! Guest RPC daemon: streaming virtio-serial agent, Execution Supervisor, and safe tar copy.
 
 mod copy_tar;
+mod egress_listener;
 mod podman;
 mod supervisor;
 #[cfg(unix)]
@@ -22,6 +23,7 @@ use sandbox_protocol::{
 };
 
 use crate::copy_tar::{run_copy_in, run_copy_out, ActiveCopyIn};
+use crate::egress_listener::EgressProxyManager;
 use crate::podman::PodmanServiceManager;
 use crate::supervisor::{run_exec, ActiveExec, ExecSpec};
 use crate::tunnel::{run_tunnel, validate_connect_request, ActiveTunnel};
@@ -290,7 +292,7 @@ impl OutboundQueue {
         self.cv.notify_all();
     }
 
-    fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 
@@ -377,6 +379,10 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
         Arc::new(Mutex::new(HashMap::new()));
     let active_tunnels: Arc<Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let egress_proxy = Arc::new(EgressProxyManager::new(
+        outbound.clone(),
+        active_tunnels.clone(),
+    ));
 
     let session_result = thread::scope(|scope| {
         let writer_outbound = outbound.clone();
@@ -460,6 +466,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         deadline_ms,
                         stdout_budget_bytes,
                         stderr_budget_bytes,
+                        proxy_port: egress_proxy.active_proxy_port(),
                     };
                     let worker_outbound = outbound.clone();
                     let worker_execs = active_execs.clone();
@@ -639,7 +646,55 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         handle.close(&outbound);
                     }
                 }
-                Message::ConnectAck | Message::ConnectError { .. } => {}
+                Message::ConfigureNetwork {
+                    enable_egress_proxy,
+                    proxy_port,
+                } => {
+                    if stream_id != StreamId(0) {
+                        session_res = Err(ProtocolError::InvalidPayload(format!(
+                            "ConfigureNetwork must arrive on stream 0, got {stream_id}"
+                        )));
+                        break;
+                    }
+                    match egress_proxy.configure(enable_egress_proxy, proxy_port) {
+                        Ok(bound_port) => {
+                            podman.set_proxy_port((bound_port > 0).then_some(bound_port));
+                            if let Err(err) = outbound.push_message(
+                                StreamId(0),
+                                &Message::ConfigureNetworkAck {
+                                    proxy_port: bound_port,
+                                },
+                            ) {
+                                session_res = Err(err);
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            session_res = Err(err);
+                            break;
+                        }
+                    }
+                }
+                Message::ConnectAck => {
+                    let tunnel = active_tunnels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&stream_id)
+                        .cloned();
+                    if let Some(handle) = tunnel {
+                        handle.resolve_connect(Ok(()));
+                    }
+                }
+                Message::ConnectError { message } => {
+                    let tunnel = active_tunnels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&stream_id);
+                    if let Some(handle) = tunnel {
+                        handle.resolve_connect(Err(message));
+                        handle.close(&outbound);
+                    }
+                }
                 other => {
                     session_res = Err(ProtocolError::InvalidPayload(format!(
                         "unsupported host-to-guest message {:?}",
@@ -649,6 +704,8 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                 }
             }
         }
+
+        egress_proxy.shutdown();
 
         if shutdown_requested || session_res.is_err() || outbound.is_closed() {
             cancel_all_active(&active_execs, &active_copy_ins, &active_tunnels, &outbound);
@@ -2262,6 +2319,116 @@ mod tests {
         assert_eq!(pong.decode_message().unwrap(), Message::Pong { seq: 77 });
 
         server.join().unwrap();
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn serve_session_configures_egress_listener_relays_egress_open_and_injects_exec_proxy_env() {
+        use sandbox_protocol::{is_guest_stream_id, GUEST_STREAM_ID_BIT};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+
+        let probe = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let proxy_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        send_message(
+            &mut host_tx,
+            StreamId(0),
+            &Message::ConfigureNetwork {
+                enable_egress_proxy: true,
+                proxy_port,
+            },
+        )
+        .unwrap();
+
+        let ack = read_frame(&mut host_rx).unwrap();
+        assert_eq!(ack.header.stream_id, StreamId(0));
+        assert_eq!(
+            ack.decode_message().unwrap(),
+            Message::ConfigureNetworkAck { proxy_port }
+        );
+
+        // Guest process sees automatic proxy env injection pointing to 127.0.0.1:<proxy_port>.
+        #[cfg(windows)]
+        let print_env_cmd = shell_cmd("echo %HTTP_PROXY%^|%NO_PROXY%");
+        #[cfg(unix)]
+        let print_env_cmd = shell_cmd("printf '%s|%s' \"$HTTP_PROXY\" \"$NO_PROXY\"");
+
+        send_message(&mut host_tx, StreamId(1), &guest_exec_start(print_env_cmd)).unwrap();
+        let (stdout, _stderr, _, _, exit_msg) = collect_exec_response(&mut host_rx, StreamId(1));
+        assert!(matches!(exit_msg, Message::ExecExit { code: Some(0), .. }));
+        let env_out = String::from_utf8_lossy(&stdout);
+        assert!(
+            env_out.contains(&format!("http://127.0.0.1:{proxy_port}|localhost,127.0.0.1,::1,10.88.0.1")),
+            "unexpected env output: {env_out:?}"
+        );
+
+        // Connect to the guest proxy port and verify EgressOpen -> ConnectAck -> duplex relay.
+        let mut guest_client = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+        let open_frame = read_frame(&mut host_rx).unwrap();
+        let guest_sid = open_frame.header.stream_id;
+        assert!(is_guest_stream_id(guest_sid));
+        assert_eq!(guest_sid, StreamId(GUEST_STREAM_ID_BIT | 1));
+        assert_eq!(open_frame.decode_message().unwrap(), Message::EgressOpen);
+
+        send_message(&mut host_tx, guest_sid, &Message::ConnectAck).unwrap();
+
+        guest_client.write_all(b"GET http://example.com/ HTTP/1.1\r\n\r\n").unwrap();
+        guest_client.shutdown(Shutdown::Write).unwrap();
+
+        let mut forwarded = Vec::new();
+        loop {
+            let f = read_frame(&mut host_rx).unwrap();
+            assert_eq!(f.header.stream_id, guest_sid);
+            match f.decode_message().unwrap() {
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    eof,
+                    data,
+                } => {
+                    forwarded.extend_from_slice(&data);
+                    if eof {
+                        break;
+                    }
+                }
+                other => panic!("unexpected egress frame: {other:?}"),
+            }
+        }
+        assert_eq!(forwarded, b"GET http://example.com/ HTTP/1.1\r\n\r\n");
+
+        send_message(
+            &mut host_tx,
+            guest_sid,
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: true,
+                data: b"HTTP/1.1 200 OK\r\n\r\nok".to_vec(),
+            },
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        guest_client.read_to_end(&mut resp).unwrap();
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\n\r\nok");
+
+        // Disable network proxy cleanly and confirm ConfigureNetworkAck { proxy_port: 0 }.
+        send_message(
+            &mut host_tx,
+            StreamId(0),
+            &Message::ConfigureNetwork {
+                enable_egress_proxy: false,
+                proxy_port: 0,
+            },
+        )
+        .unwrap();
+        let disabled_ack = read_frame(&mut host_rx).unwrap();
+        assert_eq!(disabled_ack.header.stream_id, StreamId(0));
+        assert_eq!(
+            disabled_ack.decode_message().unwrap(),
+            Message::ConfigureNetworkAck { proxy_port: 0 }
+        );
+
         shutdown_test_session(host_rx, host_tx, agent);
     }
 }

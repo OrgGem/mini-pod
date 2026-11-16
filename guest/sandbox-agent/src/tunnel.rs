@@ -24,10 +24,11 @@ pub(crate) enum TunnelInput {
 struct TunnelState {
     closed: bool,
     stdin_tx: Option<mpsc::Sender<TunnelInput>>,
+    connect_tx: Option<mpsc::Sender<Result<(), String>>>,
     abort_socket: Option<TunnelSocket>,
 }
 
-/// Active host-to-guest tunnel handle supporting concurrent input, abort, and shutdown.
+/// Active tunnel handle (host- or guest-initiated) supporting concurrent input, abort, and shutdown.
 pub(crate) struct ActiveTunnel {
     stream_id: StreamId,
     state: Mutex<TunnelState>,
@@ -41,10 +42,45 @@ impl ActiveTunnel {
             state: Mutex::new(TunnelState {
                 closed: false,
                 stdin_tx: Some(stdin_tx),
+                connect_tx: None,
                 abort_socket: None,
             }),
         });
         (handle, stdin_rx)
+    }
+
+    pub(crate) fn new_outbound(
+        stream_id: StreamId,
+    ) -> (
+        Arc<Self>,
+        mpsc::Receiver<TunnelInput>,
+        mpsc::Receiver<Result<(), String>>,
+    ) {
+        let (stdin_tx, stdin_rx) = mpsc::channel();
+        let (connect_tx, connect_rx) = mpsc::channel();
+        let handle = Arc::new(Self {
+            stream_id,
+            state: Mutex::new(TunnelState {
+                closed: false,
+                stdin_tx: Some(stdin_tx),
+                connect_tx: Some(connect_tx),
+                abort_socket: None,
+            }),
+        });
+        (handle, stdin_rx, connect_rx)
+    }
+
+    pub(crate) fn resolve_connect(&self, result: Result<(), String>) {
+        let tx = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed {
+                return;
+            }
+            guard.connect_tx.take()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(result);
+        }
     }
 
     pub(crate) fn push_stdin(&self, data: Vec<u8>, eof: bool) {
@@ -68,12 +104,13 @@ impl ActiveTunnel {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 
-    /// Aborts the tunnel immediately, closing its stdin channel and shutting down the socket.
+    /// Aborts the tunnel immediately, closing its stdin/connect channels and shutting down the socket.
     pub(crate) fn close(&self, outbound: &OutboundQueue) {
         let sock = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.closed = true;
             guard.stdin_tx.take();
+            guard.connect_tx.take();
             guard.abort_socket.take()
         };
         outbound.abort_stream(self.stream_id);
@@ -82,7 +119,7 @@ impl ActiveTunnel {
         }
     }
 
-    fn set_abort_socket(&self, sock: TunnelSocket) -> Result<(), TunnelSocket> {
+    pub(crate) fn set_abort_socket(&self, sock: TunnelSocket) -> Result<(), TunnelSocket> {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if guard.closed {
             return Err(sock);
@@ -91,16 +128,14 @@ impl ActiveTunnel {
         Ok(())
     }
 
-    fn close_stdin_only(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .stdin_tx
-            .take();
+    pub(crate) fn close_stdin_only(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.stdin_tx.take();
+        guard.connect_tx.take();
     }
 }
 
-enum TunnelSocket {
+pub(crate) enum TunnelSocket {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
@@ -225,7 +260,7 @@ fn run_tunnel_inner(
             );
         }
     };
-    let mut writer_sock = match sock.try_clone() {
+    let writer_sock = match sock.try_clone() {
         Ok(cloned) => cloned,
         Err(err) => {
             outbound.clear_stream(stream_id);
@@ -246,7 +281,20 @@ fn run_tunnel_inner(
 
     outbound.push_message(stream_id, &Message::ConnectAck)?;
 
-    let mut reader_sock = sock;
+    relay_tunnel_socket(stream_id, sock, writer_sock, handle, stdin_rx, outbound)
+}
+
+/// Relays bidirectional traffic between `reader_sock`/`writer_sock` and the multiplexed
+/// `virtio-serial` stream (`StreamChannel::Stdout` outbound, `StreamChannel::Stdin` inbound)
+/// while preserving independent half-close in both directions.
+pub(crate) fn relay_tunnel_socket(
+    stream_id: StreamId,
+    mut reader_sock: TunnelSocket,
+    mut writer_sock: TunnelSocket,
+    handle: &Arc<ActiveTunnel>,
+    stdin_rx: mpsc::Receiver<TunnelInput>,
+    outbound: &OutboundQueue,
+) -> Result<(), ProtocolError> {
     thread::scope(|scope| {
         let writer_handle = Arc::clone(handle);
         let writer_thread = scope.spawn(move || {
@@ -347,6 +395,7 @@ fn pump_tunnel_reader(
                 }
                 outbound.send_stream_data(stream_id, StreamChannel::Stdout, &buf[..n])?;
             }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
                 if handle.is_closed() {
                     outbound.clear_stream(stream_id);

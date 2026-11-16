@@ -79,6 +79,7 @@ pub struct VmBootOutcome {
     pub artifact_paths: Vec<PathBuf>,
     pub hardware_accelerated: bool,
     pub capabilities: CapabilityReport,
+    pub egress_rx: Option<tokio::sync::mpsc::Receiver<TunnelStream>>,
 }
 
 impl fmt::Debug for VmBootOutcome {
@@ -89,6 +90,7 @@ impl fmt::Debug for VmBootOutcome {
             .field("artifact_paths", &self.artifact_paths)
             .field("hardware_accelerated", &self.hardware_accelerated)
             .field("capabilities", &self.capabilities)
+            .field("has_egress_rx", &self.egress_rx.is_some())
             .finish_non_exhaustive()
     }
 }

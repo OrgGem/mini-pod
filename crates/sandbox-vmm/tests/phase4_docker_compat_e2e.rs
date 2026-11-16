@@ -390,6 +390,7 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
         lease.id.clone(),
         DockerCompatPolicy {
             reaper_socket: ReaperSocketPolicy::MapGuestPodmanSocket,
+            ..Default::default()
         },
     ));
     let server = compat
@@ -781,6 +782,7 @@ async fn e2e_testcontainers_full_lifecycle_and_ryuk_reaper() {
         lease.id.clone(),
         DockerCompatPolicy {
             reaper_socket: ReaperSocketPolicy::MapGuestPodmanSocket,
+            ..Default::default()
         },
     ));
     let server = compat

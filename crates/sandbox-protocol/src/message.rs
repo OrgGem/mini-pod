@@ -131,6 +131,15 @@ pub enum Message {
     },
     /// Aborts or closes both directions of an active tunnel stream immediately on [`Lane::Control`].
     StreamClose,
+    /// Configures the guest egress proxy listener (`StreamId(0)`, [`Lane::Control`]).
+    ConfigureNetwork {
+        enable_egress_proxy: bool,
+        proxy_port: u16,
+    },
+    /// Confirms guest network configuration and reports the actual bound port (`0` when disabled).
+    ConfigureNetworkAck { proxy_port: u16 },
+    /// Announces a newly accepted guest egress proxy TCP connection on a guest-allocated `StreamId`.
+    EgressOpen,
 }
 
 impl Message {
@@ -160,6 +169,9 @@ impl Message {
             Self::ConnectAck => FrameKind::ConnectAck,
             Self::ConnectError { .. } => FrameKind::ConnectError,
             Self::StreamClose => FrameKind::StreamClose,
+            Self::ConfigureNetwork { .. } => FrameKind::ConfigureNetwork,
+            Self::ConfigureNetworkAck { .. } => FrameKind::ConfigureNetworkAck,
+            Self::EgressOpen => FrameKind::EgressOpen,
         }
     }
 
@@ -211,9 +223,11 @@ impl Message {
                 writer.write_u32(*bytes)?;
                 Ok(writer.finish())
             }
-            Self::ExecCancel | Self::Shutdown | Self::ConnectAck | Self::StreamClose => {
-                Ok(Vec::new())
-            }
+            Self::ExecCancel
+            | Self::Shutdown
+            | Self::ConnectAck
+            | Self::StreamClose
+            | Self::EgressOpen => Ok(Vec::new()),
             Self::ExecExit {
                 code,
                 timed_out,
@@ -272,6 +286,22 @@ impl Message {
                 }
                 Ok(writer.finish())
             }
+            Self::ConfigureNetwork {
+                enable_egress_proxy,
+                proxy_port,
+            } => {
+                if *enable_egress_proxy && *proxy_port == 0 {
+                    return Err(ProtocolError::InvalidPayload(
+                        "ConfigureNetwork proxy_port must be nonzero when egress proxy is enabled"
+                            .to_owned(),
+                    ));
+                }
+                let mut writer = PayloadWriter::with_capacity(3)?;
+                writer.write_bool(*enable_egress_proxy)?;
+                writer.write_u16(*proxy_port)?;
+                Ok(writer.finish())
+            }
+            Self::ConfigureNetworkAck { proxy_port } => Ok(proxy_port.to_be_bytes().to_vec()),
         }
     }
 
@@ -351,6 +381,25 @@ impl Message {
                 message: reader.read_str()?,
             },
             FrameKind::StreamClose => Self::StreamClose,
+            FrameKind::ConfigureNetwork => {
+                let enable_egress_proxy =
+                    reader.read_bool("ConfigureNetwork.enable_egress_proxy")?;
+                let proxy_port = reader.read_u16()?;
+                if enable_egress_proxy && proxy_port == 0 {
+                    return Err(ProtocolError::InvalidPayload(
+                        "ConfigureNetwork proxy_port must be nonzero when egress proxy is enabled"
+                            .to_owned(),
+                    ));
+                }
+                Self::ConfigureNetwork {
+                    enable_egress_proxy,
+                    proxy_port,
+                }
+            }
+            FrameKind::ConfigureNetworkAck => Self::ConfigureNetworkAck {
+                proxy_port: reader.read_u16()?,
+            },
+            FrameKind::EgressOpen => Self::EgressOpen,
         };
         reader.finish(kind)?;
         Ok(msg)
@@ -861,6 +910,29 @@ mod tests {
                 Lane::Control,
             ),
             (Message::StreamClose, Lane::Control),
+            (
+                Message::ConfigureNetwork {
+                    enable_egress_proxy: false,
+                    proxy_port: 0,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ConfigureNetwork {
+                    enable_egress_proxy: true,
+                    proxy_port: 3128,
+                },
+                Lane::Control,
+            ),
+            (
+                Message::ConfigureNetworkAck { proxy_port: 0 },
+                Lane::Control,
+            ),
+            (
+                Message::ConfigureNetworkAck { proxy_port: 3128 },
+                Lane::Control,
+            ),
+            (Message::EgressOpen, Lane::Control),
         ];
 
         for (msg, expected_lane) in samples {
@@ -1145,6 +1217,15 @@ mod tests {
         let connect_error = Message::ConnectError {
             message: "dial failed".to_owned(),
         };
+        let cfg_net_enabled = Message::ConfigureNetwork {
+            enable_egress_proxy: true,
+            proxy_port: 3128,
+        };
+        let cfg_net_disabled = Message::ConfigureNetwork {
+            enable_egress_proxy: false,
+            proxy_port: 0,
+        };
+        let cfg_net_ack = Message::ConfigureNetworkAck { proxy_port: 3128 };
 
         // Every proper prefix of every structured message must fail with InvalidPayload.
         for msg in [
@@ -1158,6 +1239,9 @@ mod tests {
             connect_unix,
             connect_tcp,
             connect_error,
+            cfg_net_enabled,
+            cfg_net_disabled,
+            cfg_net_ack,
         ] {
             let valid = msg.encode_payload().unwrap();
             for prefix_len in 0..valid.len() {
@@ -1208,6 +1292,7 @@ mod tests {
             (FrameKind::Shutdown, vec![1]),
             (FrameKind::ConnectAck, vec![0]),
             (FrameKind::StreamClose, vec![0]),
+            (FrameKind::EgressOpen, vec![0]),
         ];
         for (kind, payload) in static_trailing_cases {
             assert!(
@@ -1305,6 +1390,34 @@ mod tests {
         assert_eq!(
             Message::decode(FrameKind::ConnectError, &bad_connect_err),
             Err(ProtocolError::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn configure_network_rejects_port_zero_when_enabled_and_invalid_bool() {
+        let zero_enabled = Message::ConfigureNetwork {
+            enable_egress_proxy: true,
+            proxy_port: 0,
+        };
+        assert!(matches!(
+            zero_enabled.encode_payload(),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            Message::decode(FrameKind::ConfigureNetwork, &[1, 0, 0]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            Message::decode(FrameKind::ConfigureNetwork, &[2, 0x0c, 0x38]),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        // Disabled proxy allows port 0 cleanly.
+        assert_eq!(
+            Message::decode(FrameKind::ConfigureNetwork, &[0, 0, 0]).unwrap(),
+            Message::ConfigureNetwork {
+                enable_egress_proxy: false,
+                proxy_port: 0,
+            }
         );
     }
 }

@@ -13,9 +13,16 @@ use std::{fmt, io};
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 12;
 pub const MAX_FRAME_PAYLOAD_BYTES: u32 = 1024 * 1024;
+pub const HOST_STREAM_ID_MAX: u32 = 0x7fff_ffff;
+pub const GUEST_STREAM_ID_BIT: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u32);
+
+/// Returns `true` when `id` belongs to the guest-initiated stream namespace (`bit 31` set).
+pub const fn is_guest_stream_id(id: StreamId) -> bool {
+    (id.0 & GUEST_STREAM_ID_BIT) != 0
+}
 
 impl fmt::Display for StreamId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,6 +71,9 @@ pub enum FrameKind {
     ConnectAck = 16,
     ConnectError = 17,
     StreamClose = 18,
+    ConfigureNetwork = 19,
+    ConfigureNetworkAck = 20,
+    EgressOpen = 21,
 }
 
 impl FrameKind {
@@ -72,8 +82,8 @@ impl FrameKind {
     /// [`FrameKind::CopyDone`] shares [`Lane::Data`] with [`FrameKind::StreamData`] so that
     /// copy-out completions preserve strict FIFO ordering behind the tar chunks they terminate
     /// inside [`PriorityFrameQueue`], while [`FrameKind::CopyError`], [`FrameKind::StreamCredit`],
-    /// tunnel lifecycle frames (`Connect*`, `StreamClose`), and cancel/liveness frames stay on
-    /// [`Lane::Control`].
+    /// tunnel/egress lifecycle frames (`Connect*`, `StreamClose`, `ConfigureNetwork*`,
+    /// `EgressOpen`), and cancel/liveness frames stay on [`Lane::Control`].
     pub const fn lane(self) -> Lane {
         match self {
             Self::StreamData | Self::CopyDone => Lane::Data,
@@ -92,7 +102,10 @@ impl FrameKind {
             | Self::ConnectStart
             | Self::ConnectAck
             | Self::ConnectError
-            | Self::StreamClose => Lane::Control,
+            | Self::StreamClose
+            | Self::ConfigureNetwork
+            | Self::ConfigureNetworkAck
+            | Self::EgressOpen => Lane::Control,
         }
     }
 }
@@ -120,6 +133,9 @@ impl TryFrom<u8> for FrameKind {
             16 => Ok(Self::ConnectAck),
             17 => Ok(Self::ConnectError),
             18 => Ok(Self::StreamClose),
+            19 => Ok(Self::ConfigureNetwork),
+            20 => Ok(Self::ConfigureNetworkAck),
+            21 => Ok(Self::EgressOpen),
             other => Err(ProtocolError::InvalidFrameKind(other)),
         }
     }
@@ -440,6 +456,9 @@ mod tests {
             (16, FrameKind::ConnectAck, Lane::Control),
             (17, FrameKind::ConnectError, Lane::Control),
             (18, FrameKind::StreamClose, Lane::Control),
+            (19, FrameKind::ConfigureNetwork, Lane::Control),
+            (20, FrameKind::ConfigureNetworkAck, Lane::Control),
+            (21, FrameKind::EgressOpen, Lane::Control),
         ];
 
         for (discriminant, kind, lane) in expected {
@@ -449,9 +468,19 @@ mod tests {
         }
         assert_eq!(FrameKind::try_from(0), Err(ProtocolError::InvalidFrameKind(0)));
         assert_eq!(
-            FrameKind::try_from(19),
-            Err(ProtocolError::InvalidFrameKind(19))
+            FrameKind::try_from(22),
+            Err(ProtocolError::InvalidFrameKind(22))
         );
+    }
+
+    #[test]
+    fn stream_id_partitioning_helpers() {
+        assert!(!is_guest_stream_id(StreamId(0)));
+        assert!(!is_guest_stream_id(StreamId(1)));
+        assert!(!is_guest_stream_id(StreamId(HOST_STREAM_ID_MAX)));
+        assert!(is_guest_stream_id(StreamId(GUEST_STREAM_ID_BIT)));
+        assert!(is_guest_stream_id(StreamId(GUEST_STREAM_ID_BIT | 1)));
+        assert!(is_guest_stream_id(StreamId(u32::MAX)));
     }
 
     #[test]
@@ -532,6 +561,20 @@ mod tests {
             )
             .unwrap(),
             Frame::from_message(StreamId(9), &Message::StreamClose).unwrap(),
+            Frame::from_message(
+                StreamId(0),
+                &Message::ConfigureNetwork {
+                    enable_egress_proxy: true,
+                    proxy_port: 3128,
+                },
+            )
+            .unwrap(),
+            Frame::from_message(
+                StreamId(0),
+                &Message::ConfigureNetworkAck { proxy_port: 3128 },
+            )
+            .unwrap(),
+            Frame::from_message(StreamId(GUEST_STREAM_ID_BIT | 1), &Message::EgressOpen).unwrap(),
         ];
 
         let mut wire = Vec::new();

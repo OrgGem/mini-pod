@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const DOCKER_SOCKET_WIN_PREFIX_PATH: &str = "//var/run/docker.sock";
 const GUEST_PODMAN_SOCKET_PATH: &str = "/run/podman/podman.sock";
+const DEFAULT_CONTAINER_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.88.0.1";
 
 /// Controls whether a container's request to mount `/var/run/docker.sock` (e.g., Testcontainers
 /// Ryuk reaper) is rejected or rewritten to the guest VM's internal Podman Unix socket.
@@ -19,9 +20,10 @@ pub enum ReaperSocketPolicy {
 }
 
 /// Security policy applied by the Docker API compatibility adapter on container creation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DockerCompatPolicy {
     pub reaper_socket: ReaperSocketPolicy,
+    pub container_proxy_http_url: Option<String>,
 }
 
 /// Host-to-container TCP port binding requested by a Docker client before VM-side normalization.
@@ -102,6 +104,10 @@ pub fn sanitize_container_create(
         }
     }
 
+    if let Some(proxy_url) = policy.container_proxy_http_url.as_deref() {
+        inject_container_proxy_env(root_obj, proxy_url)?;
+    }
+
     let rewritten_body = serde_json::to_vec(&root).map_err(|err| {
         PolicyRejection::new(format!("failed to serialize sanitized JSON: {err}"))
     })?;
@@ -110,6 +116,61 @@ pub fn sanitize_container_create(
         rewritten_body,
         requested_ports,
     })
+}
+
+fn inject_container_proxy_env(
+    root_obj: &mut Map<String, Value>,
+    proxy_url: &str,
+) -> Result<(), PolicyRejection> {
+    if proxy_url.is_empty() || proxy_url.chars().any(char::is_control) {
+        return Err(PolicyRejection::new(
+            "container_proxy_http_url must be a non-empty single-line URL",
+        ));
+    }
+
+    let mut env_entries = match root_obj.get("Env") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if !item.is_string() {
+                    return Err(PolicyRejection::new("Env entries must be strings"));
+                }
+            }
+            items.clone()
+        }
+        Some(_) => {
+            return Err(PolicyRejection::new(
+                "Env must be a JSON array of strings when provided",
+            ));
+        }
+    };
+
+    let mut existing_keys = BTreeSet::new();
+    for item in &env_entries {
+        if let Some(entry) = item.as_str() {
+            let key = entry.split_once('=').map(|(k, _)| k).unwrap_or(entry);
+            existing_keys.insert(key.to_owned());
+        }
+    }
+
+    let defaults = [
+        ("HTTP_PROXY", proxy_url),
+        ("HTTPS_PROXY", proxy_url),
+        ("ALL_PROXY", proxy_url),
+        ("http_proxy", proxy_url),
+        ("https_proxy", proxy_url),
+        ("all_proxy", proxy_url),
+        ("NO_PROXY", DEFAULT_CONTAINER_NO_PROXY),
+        ("no_proxy", DEFAULT_CONTAINER_NO_PROXY),
+    ];
+    for (key, value) in defaults {
+        if existing_keys.insert(key.to_owned()) {
+            env_entries.push(Value::String(format!("{key}={value}")));
+        }
+    }
+
+    root_obj.insert("Env".to_owned(), Value::Array(env_entries));
+    Ok(())
 }
 
 fn validate_top_level_volumes(volumes: &Value) -> Result<(), PolicyRejection> {
@@ -607,6 +668,7 @@ mod tests {
         let deny_policy = DockerCompatPolicy::default();
         let map_policy = DockerCompatPolicy {
             reaper_socket: ReaperSocketPolicy::MapGuestPodmanSocket,
+            ..Default::default()
         };
 
         let cases = [
@@ -677,9 +739,11 @@ mod tests {
     fn reaper_socket_denied_by_default_and_mapped_when_enabled() {
         let deny = DockerCompatPolicy {
             reaper_socket: ReaperSocketPolicy::Deny,
+            ..Default::default()
         };
         let map = DockerCompatPolicy {
             reaper_socket: ReaperSocketPolicy::MapGuestPodmanSocket,
+            ..Default::default()
         };
 
         for (raw_bind, expected_bind) in [
@@ -880,5 +944,76 @@ mod tests {
             rewritten["HostConfig"]["PortBindings"]["5432/tcp"],
             json!([{ "HostIp": "127.0.0.1", "HostPort": "" }])
         );
+    }
+
+    #[test]
+    fn injects_container_proxy_env_defaults_while_preserving_caller_overrides() {
+        let proxy_url = "http://10.88.0.1:3128";
+        let policy_disabled = DockerCompatPolicy::default();
+        assert_eq!(policy_disabled.container_proxy_http_url, None);
+
+        let policy_enabled = DockerCompatPolicy {
+            reaper_socket: ReaperSocketPolicy::MapGuestPodmanSocket,
+            container_proxy_http_url: Some(proxy_url.to_owned()),
+        };
+
+        // 1. Disabled policy leaves omitted Env untouched.
+        let bare = serde_json::to_vec(&json!({ "Image": "alpine" })).unwrap();
+        let plan_disabled = sanitize_container_create(&bare, &policy_disabled).unwrap();
+        let val_disabled: Value = serde_json::from_slice(&plan_disabled.rewritten_body).unwrap();
+        assert!(val_disabled.get("Env").is_none());
+
+        // 2. Enabled policy injects all 8 proxy vars when Env is null or absent.
+        let null_env = serde_json::to_vec(&json!({ "Image": "alpine", "Env": null })).unwrap();
+        let plan_null = sanitize_container_create(&null_env, &policy_enabled).unwrap();
+        let val_null: Value = serde_json::from_slice(&plan_null.rewritten_body).unwrap();
+        let env_null: Vec<&str> = val_null["Env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for expected in [
+            "HTTP_PROXY=http://10.88.0.1:3128",
+            "HTTPS_PROXY=http://10.88.0.1:3128",
+            "ALL_PROXY=http://10.88.0.1:3128",
+            "http_proxy=http://10.88.0.1:3128",
+            "https_proxy=http://10.88.0.1:3128",
+            "all_proxy=http://10.88.0.1:3128",
+            "NO_PROXY=localhost,127.0.0.1,::1,10.88.0.1",
+            "no_proxy=localhost,127.0.0.1,::1,10.88.0.1",
+        ] {
+            assert!(env_null.contains(&expected), "missing {expected} in {env_null:?}");
+        }
+
+        // 3. Preserves caller-defined overrides (including empty string) and unrelated vars.
+        let custom = serde_json::to_vec(&json!({
+            "Image": "alpine",
+            "Env": [
+                "FOO=bar",
+                "HTTP_PROXY=http://custom:8080",
+                "no_proxy=corp.local"
+            ]
+        }))
+        .unwrap();
+        let plan_custom = sanitize_container_create(&custom, &policy_enabled).unwrap();
+        let val_custom: Value = serde_json::from_slice(&plan_custom.rewritten_body).unwrap();
+        let env_custom: Vec<&str> = val_custom["Env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(env_custom.contains(&"FOO=bar"));
+        assert!(env_custom.contains(&"HTTP_PROXY=http://custom:8080"));
+        assert!(env_custom.contains(&"no_proxy=corp.local"));
+        assert!(!env_custom.iter().any(|e| *e == "HTTP_PROXY=http://10.88.0.1:3128"));
+        assert!(!env_custom.iter().any(|e| *e == "no_proxy=localhost,127.0.0.1,::1,10.88.0.1"));
+        assert!(env_custom.contains(&"HTTPS_PROXY=http://10.88.0.1:3128"));
+        assert!(env_custom.contains(&"NO_PROXY=localhost,127.0.0.1,::1,10.88.0.1"));
+
+        // 4. Rejects non-array Env cleanly.
+        let bad_env = serde_json::to_vec(&json!({ "Image": "alpine", "Env": "FOO=1" })).unwrap();
+        assert!(sanitize_container_create(&bad_env, &policy_enabled).is_err());
     }
 }

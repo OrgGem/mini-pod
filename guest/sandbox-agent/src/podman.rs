@@ -3,6 +3,7 @@
 use std::path::Path;
 #[cfg(any(unix, test))]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 #[cfg(unix)]
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -21,6 +22,8 @@ use std::thread;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use crate::egress_listener::{default_proxy_env_pairs, guest_proxy_url};
 #[cfg(unix)]
 use crate::supervisor_unix::{configure_process_group, kill_process_group, signal_process_group};
 
@@ -67,6 +70,7 @@ pub(crate) struct PodmanServiceManager {
     readiness_timeout: Duration,
     #[cfg(unix)]
     state: Mutex<ServiceState>,
+    proxy_port: AtomicU16,
 }
 
 impl Default for PodmanServiceManager {
@@ -93,7 +97,20 @@ impl PodmanServiceManager {
             readiness_timeout: READINESS_TIMEOUT,
             #[cfg(unix)]
             state: Mutex::new(ServiceState::Idle),
+            proxy_port: AtomicU16::new(0),
         }
+    }
+
+    /// Configures the local guest HTTP egress proxy port (`None` disables proxy env injection).
+    pub(crate) fn set_proxy_port(&self, port: Option<u16>) {
+        self.proxy_port.store(port.unwrap_or(0), Ordering::Release);
+    }
+
+    /// Returns the active guest HTTP egress proxy port if configured.
+    #[cfg(any(unix, test))]
+    pub(crate) fn proxy_port(&self) -> Option<u16> {
+        let port = self.proxy_port.load(Ordering::Acquire);
+        (port > 0).then_some(port)
     }
 
     #[cfg(all(test, unix))]
@@ -113,6 +130,7 @@ impl PodmanServiceManager {
             xdg_runtime_dir,
             readiness_timeout,
             state: Mutex::new(ServiceState::Idle),
+            proxy_port: AtomicU16::new(0),
         }
     }
 
@@ -204,6 +222,9 @@ impl PodmanServiceManager {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        if let Some(port) = self.proxy_port() {
+            cmd.envs(default_proxy_env_pairs(&guest_proxy_url(port)));
+        }
         configure_process_group(&mut cmd);
         cmd
     }
@@ -387,6 +408,11 @@ mod tests {
         let mgr = PodmanServiceManager::new();
         assert_eq!(mgr.socket_path(), Path::new(PODMAN_SOCKET_PATH));
         assert!(PODMAN_SOCKET_PATH.starts_with("/run/podman/"));
+        assert_eq!(mgr.proxy_port(), None);
+        mgr.set_proxy_port(Some(3128));
+        assert_eq!(mgr.proxy_port(), Some(3128));
+        mgr.set_proxy_port(None);
+        assert_eq!(mgr.proxy_port(), None);
         mgr.shutdown();
     }
 
@@ -479,6 +505,42 @@ mod tests {
         assert!(
             cleared_container_host,
             "service_command must explicitly remove CONTAINER_HOST for Podman 5 compatibility"
+        );
+        assert!(
+            !cmd.get_envs().any(|(k, _)| k == "HTTP_PROXY"),
+            "HTTP_PROXY must not be injected when egress proxy is disabled"
+        );
+
+        mgr.set_proxy_port(Some(3128));
+        let dev_null_2 = fs::File::open("/dev/null").unwrap();
+        let dev_null_err_2 = dev_null_2.try_clone().unwrap();
+        let proxy_cmd = mgr.service_command(dev_null_2, dev_null_err_2);
+        let envs: std::collections::HashMap<String, Option<String>> = proxy_cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(envs.get(key).and_then(|v| v.as_deref()), Some("http://127.0.0.1:3128"));
+        }
+        assert_eq!(
+            envs.get("NO_PROXY").and_then(|v| v.as_deref()),
+            Some(crate::egress_listener::DEFAULT_NO_PROXY)
+        );
+        assert_eq!(
+            envs.get("no_proxy").and_then(|v| v.as_deref()),
+            Some(crate::egress_listener::DEFAULT_NO_PROXY)
         );
     }
 }
