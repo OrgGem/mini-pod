@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sandbox-core = { workspace = true }
+sandbox-core = { workspace = true, features = ["safe-tar"] }
 sandbox-protocol = { workspace = true }
 async-trait = { workspace = true }
-tar = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tar = { workspace = true }

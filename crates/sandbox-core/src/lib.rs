@@ -6,6 +6,8 @@ pub mod error;
 pub mod exec;
 pub mod lifecycle;
 pub mod policy;
+#[cfg(feature = "safe-tar")]
+pub mod safe_tar;
 
 pub use arch::GuestArch;
 pub use error::SandboxError;

@@ -13,9 +13,7 @@ pub mod safe_tar;
 pub mod tunnel;
 pub mod warm_pool;
 
-use std::fs;
-use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sandbox_core::{DestroyStatus, ExecRequest, SandboxError, SandboxId, SandboxLease, SandboxSpec};
@@ -55,41 +53,7 @@ pub trait RuntimeManager: Send + Sync {
     async fn destroy(&self, id: &SandboxId) -> Result<DestroyStatus, SandboxError>;
 }
 
-pub(crate) const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-
-/// Returns `true` when `meta` represents a symlink or Windows reparse point/junction.
-pub(crate) fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if (meta.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT;
-    false
-}
-
-pub(crate) fn map_fs_error(path: &Path, action: &str, err: io::Error) -> SandboxError {
-    match err.kind() {
-        ErrorKind::NotFound => SandboxError::NotFound(format!(
-            "cannot {action} '{}': {err}",
-            path.display()
-        )),
-        ErrorKind::PermissionDenied => SandboxError::PolicyViolation(format!(
-            "permission denied while attempting to {action} '{}': {err}",
-            path.display()
-        )),
-        _ => SandboxError::Internal(format!(
-            "failed to {action} '{}': {err}",
-            path.display()
-        )),
-    }
-}
+pub(crate) use sandbox_core::safe_tar::{is_symlink_or_reparse, map_fs_error};
 
 #[cfg(test)]
 pub(crate) mod test_util {

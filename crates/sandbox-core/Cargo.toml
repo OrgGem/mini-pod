@@ -5,4 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+safe-tar = ["dep:tar"]
+
 [dependencies]
+tar = { workspace = true, optional = true }
