@@ -1,8 +1,8 @@
 # BRD & Đặc tả Kỹ thuật Chung — mini-pod (v2.1)
 
 - **Phiên bản:** `v2.1`
-- **Ngày cập nhật:** `2026-11-15`
-- **Trạng thái:** Đã chốt kiến trúc (Tài liệu chuẩn trước khi viết code Tuần 1)
+- **Ngày cập nhật:** `2026-11-17`
+- **Trạng thái:** Đã chốt kiến trúc & mô hình tin cậy/sở hữu tài nguyên (MVP `v0.1.0-rc2`)
 
 ## Quyết định Kiến trúc Chốt (Executive Decision)
 
@@ -240,3 +240,64 @@ Kế hoạch dưới đây ước lượng cho hai kỹ sư toàn thời gian c�
 5. Bộ kiểm thử bảo mật tự động xác nhận các mẫu tấn công DNS rebinding, địa chỉ IPv6 nội bộ/ánh xạ và gói tar chứa symlink hoặc đường dẫn vượt cấp đều bị chặn hoàn toàn.
 6. Bộ test tích hợp Testcontainers hoàn thành trọn vẹn chu trình kéo/tạo container, kết nối thành công vào cổng dịch vụ được ánh xạ ra Host, đọc luồng log và thu dọn sạch sẽ.
 7. Tác vụ cố tình ghi tràn ổ đĩa hoặc bơm vô hạn dữ liệu ra luồng `stdout`/`stderr` bị ngắt đúng hạn mức và giải phóng toàn bộ dung lượng tạm trong ngân sách vật lý đã công bố.
+
+## 7. Mô hình Tin cậy, Phân quyền Endpoint và Quyền Sở hữu Tài nguyên
+
+### 7.1. Mô hình Tin cậy giữa Host và Guest
+
+Host sở hữu việc quyết định chính sách cô lập, mạng, cấp phát tài nguyên và vòng đời sandbox. `sandbox-runtime` điều phối các quyết định này; các adapter thực hiện cơ chế tương ứng và báo cáo kết quả cùng mức `EnforcementLevel`. Cấu hình và việc lựa chọn adapter được thực hiện tại composition root trong `bins/*`.
+
+Trong chế độ `VmRequired`, ranh giới cô lập bảo vệ Host là máy ảo có kernel riêng và vòng đời dùng một lần (hủy một chiều sau khi sử dụng). Việc chuyển từ tăng tốc phần cứng sang `TCG` không làm thay đổi ranh giới này. `SharedKernelAllowed` là lựa chọn tường minh chỉ trên Linux và không bao giờ được sử dụng làm fallback tự động cho `VmRequired`.
+
+`tiny-init` (PID 1), Guest Agent (`sandbox-agent`) và Execution Supervisor thực hiện các tác vụ bên trong Guest (gắn hệ tệp gốc chỉ đọc `MS_RDONLY`, giám sát thực thi theo `cgroup v2` / process group, giới hạn `deadline` và `stdout`/`stderr` budget, chuyển tiếp Podman Unix socket). Tuy nhiên, **Host không mặc nhiên tin cậy dữ liệu do workload tạo ra hoặc dữ liệu trả về qua kênh Guest (kể cả từ Guest Agent sau khi VM đã chạy mã không tin cậy)**: mọi thông điệp phải được kiểm tra theo hợp đồng `sandbox-protocol` (phiên bản, kích thước khung, làn ưu tiên, cửa sổ tín dụng `StreamCredit`); dữ liệu `copy-out` phải vượt qua bộ kiểm tra đường dẫn, loại entry và ngân sách kích thước/số lượng entry trên Host trước khi tác động lên filesystem Host.
+
+Các chính sách về **ngân sách tài nguyên Host, thời hạn thực thi (`deadline`), ngân sách `stdout`/`stderr` và kiểm soát mạng Egress** phải áp dụng đồng nhất cho cả `ExecTarget::Guest` và `ExecTarget::Container`. Giới hạn thực thi bên trong Guest chỉ hỗ trợ dọn dẹp sớm, không thay thế hàng rào bảo vệ tài nguyên Host.
+
+* **Quyền của workload bên trong Guest:**
+  * Mỗi sandbox `VmRequired` là máy ảo đơn thuê bao (single-tenant). Với `ExecTarget::Guest`, người gọi được phép chỉ định danh tính Unix qua `ExecRequest.user` (bao gồm cả `0:0` / `root`, hoặc kế thừa danh tính chạy của `sandbox-agent` khi `user: None`) để phục vụ thiết lập môi trường và cài đặt gói bên trong VM; với `ExecTarget::Container`, tiến trình chịu sự giới hạn namespace/capability của Podman và bộ lọc `HostConfig` tại `sandbox-docker-compat` (từ chối `Privileged`, `CapAdd`, `Devices`, chia sẻ host namespace và các đường dẫn `/libpod/*`).
+  * Podman chỉ lắng nghe trên Unix socket nội bộ của Guest (`/run/podman/podman.sock`, thư mục `0700`). Đối với container, quyền gắn socket này mặc định bị chặn (`ReaperSocketPolicy::Deny`); trường hợp container dọn dẹp Ryuk của Testcontainers yêu cầu gắn `/var/run/docker.sock` được xử lý như ngoại lệ tường minh do adapter quản lý (`ReaperSocketPolicy::MapGuestPodmanSocket`, viết lại đích gắn vào `/run/podman/podman.sock` nội bộ Guest thay vì socket trên Host).
+  * Vì tiến trình chạy với quyền `root` bên trong Guest có khả năng can thiệp `sandbox-agent`, Execution Supervisor hoặc Podman socket của chính máy ảo đó, **toàn bộ bảo đảm an toàn cho Host (trần CPU/RSS qua Job Object / delegated cgroup v2, ngân sách lưu trữ vật lý, TTL lease, `-nic none` + `HostEgressProxy`, kiểm tra khung/credit IPC và giải nén `safe_tar`) bắt buộc được Host cưỡng chế độc lập bên ngoài VM**, đồng thời mọi VM đã chạy workload đều bị hủy bỏ một chiều (không bao giờ hoàn trả về `Warm Pool`).
+* **Ràng buộc phiên IPC giữa Host và Guest:**
+  * Ở mỗi lượt khởi tạo VM, Host cấp phát một endpoint IPC điểm-nối-điểm riêng (`virtio-serial` mặc định hoặc `virtio-vsock` khi bật) gắn cố định 1–1 với đúng một `SandboxId` và phiên tiến trình QEMU `(pid, start_token)`; Guest không có khả năng chọn hoặc chuyển hướng sang sandbox khác. *(Cơ chế cấp mới định danh phiên trên bản tin wire sẽ bắt buộc mở rộng khi triển khai State Snapshot sau MVP theo Mục 4.1.)*
+  * Không gian `StreamId` phân tách rõ luồng do Host mở và luồng do Guest mở (`GUEST_STREAM_ID_BIT`). Khi Guest gửi khung sai phiên bản ở bước bắt tay, vượt cửa sổ tín dụng cho phép, hoặc gửi thông điệp sai trạng thái luồng/phiên hiện hành, Host hủy luồng vi phạm hoặc đóng ngay toàn bộ kết nối transport của VM đó và trả lỗi cho các thao tác đang chờ.
+
+### 7.2. Quyền Truy cập Từng Endpoint
+
+Quyền kết nối tới một endpoint và phạm vi thao tác được phép sau khi kết nối được quy định tách biệt cho từng đường giao tiếp:
+
+| Endpoint / Đường giao tiếp | Ràng buộc kết nối & Xác thực | Phạm vi thao tác & Giới hạn |
+| --- | --- | --- |
+| Điều khiển cục bộ trên Host (`sandboxd` Control IPC) | Unix socket `0600` trong thư mục `0700` (từ chối symlink); Windows Named Pipe gắn DACL giới hạn đúng SID chủ sở hữu kèm cờ từ chối client từ xa. Hợp đồng kiến trúc chỉ cho phép mở TCP khi cấu hình tường minh kèm mTLS (không bao giờ coi bind loopback tương đương giới hạn UID/SID); trong MVP, mọi URI mạng (`tcp://`, `http://`, `tls://`, UNC pipe từ xa) bị từ chối mặc định (`PolicyViolation`). | Tin cậy theo phạm vi tài khoản OS: mọi client chạy cùng UID/SID sau khi kết nối được phép quản lý toàn bộ sandbox thuộc daemon của tài khoản đó. MVP không cô lập quyền giữa các ứng dụng/agent chạy chung cùng một tài khoản OS. |
+| Host ↔ Guest qua virtio | `virtio-serial` mặc định (`virtio-vsock` khi dò thấy hỗ trợ), kết nối điểm-nối-điểm riêng cho từng VM; giao thức có framing giới hạn kích thước, phiên bản, phân luồng `StreamId`, làn ưu tiên control và `StreamCredit` backpressure. | Ràng buộc cứng 1–1 với một `SandboxId` và phiên tiến trình QEMU tương ứng; từ chối/đóng transport khi sai phiên bản, sai không gian `StreamId`, vượt credit hoặc sai trạng thái. |
+| Guest Agent ↔ Podman | Podman lắng nghe trên Unix socket nội bộ Guest (`/run/podman/podman.sock` trong thư mục `0700`); xóa bỏ hoàn toàn TCP `2375`. | Chỉ phục vụ `sandbox-agent` (và tiến trình có quyền `root` trong Guest) cùng ngoại lệ container Ryuk khi bật tường minh `ReaperSocketPolicy::MapGuestPodmanSocket`. |
+| Docker API Adapter phía Host (`sandbox-docker-compat`) | Lắng nghe trên Unix socket `0600` (thư mục `0700`) hoặc Windows Named Pipe gắn DACL owner-only; không phơi cổng TCP không xác thực ra daemon. | Gắn với một `SandboxId` xác định; chuẩn hóa đường dẫn URL/khóa JSON, chặn `/libpod/*`, từ chối bind mount thô từ Host và các cờ nâng quyền container nguy hiểm. |
+| Giao diện MCP (`sandboxd mcp`) | JSON-RPC 2.0 qua `stdio`, kế thừa trực tiếp danh tính tài khoản OS của tiến trình khởi chạy MCP. | Hỗ trợ chế độ `Connected` (ủy quyền qua Control IPC owner-only tới `sandboxd` đang chạy) hoặc chế độ `Standalone` (tự khởi tạo runtime riêng với điều kiện giữ khóa độc quyền `state.lock` trên một `state_dir` tách biệt). |
+| Cổng dịch vụ container được publish trên Host | `sandbox-docker-compat` mở listener TCP chỉ trên loopback `127.0.0.1` trong MVP, chuyển tiếp qua virtio vào Guest và viết lại địa chỉ/cổng trong phản hồi `inspect`/`list`. | Chưa cho phép bind LAN hay `0.0.0.0` trong MVP; tách biệt hoàn toàn với API điều khiển daemon/Docker. Lưu ý: loopback không phân quyền theo UID/SID giữa các tài khoản cục bộ trên cùng máy, dịch vụ nhạy cảm cần tự xác thực ở tầng ứng dụng. |
+| Guest ↔ Host Egress Proxy | Với `InternetOnly` và `DomainAllowList`, VM khởi chạy không NIC ảo (`-nic none`) và bắt buộc đi qua `HostEgressProxy` trên virtio; Host phân giải DNS, lọc dải IPv4/IPv6 cấm và kết nối TCP trực tiếp tới IP đã duyệt (kiểm tra lại ở mọi bước HTTP redirect). | Gắn cố định với chính sách `NetworkPolicy` hiện hành của đúng sandbox đó; áp dụng giới hạn số luồng egress đồng thời trên mỗi VM cùng các ngưỡng timeout bắt tay, kết nối đích và luồng nhàn rỗi trên Host. |
+
+### 7.3. Quyền Sở hữu Tài nguyên và Trách nhiệm Thu hồi
+
+Trong mục này, “sở hữu” chỉ trách nhiệm quyết định vòng đời và bảo đảm thu hồi tài nguyên, không đồng nghĩa với UID/SID sở hữu đối tượng ở mức hệ điều hành. `sandbox-runtime` sở hữu vòng đời logic của sandbox; các adapter sở hữu cơ chế cấp phát/thu hồi tài nguyên thuộc phạm vi của mình và cung cấp đủ siêu dữ liệu để runtime ghi journal, đối soát và báo cáo trạng thái chính xác:
+
+| Tài nguyên | Chủ sở hữu trách nhiệm | Nghĩa vụ vòng đời & thu hồi |
+| --- | --- | --- |
+| Sandbox, lease, admission và `Warm Pool` | `sandbox-runtime` | Quyết định cấp phát, gia hạn, hết hạn TTL, hủy bỏ một chiều VM bẩn và kế toán tổng tài nguyên cấp sandbox. |
+| Tiến trình QEMU, helper và IPC của VMM | `sandbox-vmm` | Khởi chạy trong phạm vi khóa tiến trình của OS (Win32 Job Object + handle whitelist; Unix process group / cgroup), quản lý kênh IPC và buộc dừng tiến trình; không tự giữ lease hay quyết định chính sách. |
+| Bundle, cache và đĩa nhánh `qcow2` overlay | `sandbox-image` thực thi; `sandbox-runtime` điều phối tài nguyên gắn với sandbox | Xác thực chữ ký Ed25519 + SHA-256, kích hoạt gói nguyên tử và tạo/xóa đĩa nhánh `overlay.qcow2` theo vòng đời sandbox. |
+| Crash journal, `state.lock` và startup reconciliation | `sandbox-runtime` | Giữ khóa vùng trạng thái, ghi journal bền vững trước bước cấp phát/thu hồi và đối soát tài nguyên mồ côi khi khởi động lại. |
+| Listener và kết nối chuyển tiếp cổng container | `sandbox-docker-compat` thực thi | Gắn chặt với vòng đời container/sandbox và đóng toàn bộ socket lắng nghe ngay khi container dừng hoặc sandbox bị hủy. |
+| `HostEgressProxy` và tài nguyên phục vụ mạng | `sandbox-runtime` | Thực thi `NetworkPolicy`, quản lý kết nối ra ngoài, tác vụ chuyển tiếp và bộ đệm trong giới hạn cho phép. |
+| Tiến trình thực thi bên trong Guest | `sandbox-agent` / Execution Supervisor; `tiny-init` làm PID 1 | Hủy toàn bộ `cgroup v2` con / process group khi quá `deadline`, tràn `stdout`/`stderr` budget hoặc nhận lệnh hủy ưu tiên; thu dọn zombie và xử lý tín hiệu tắt máy. |
+
+Việc tiến trình QEMU đã thoát không đồng nghĩa mọi tài nguyên đã được dọn sạch. `destroy()` bắt buộc lũy đẳng (idempotent) và chỉ trả `DestroyStatus::AllResourcesCleaned` khi toàn bộ tiến trình và tệp tạm thuộc phạm vi thu hồi của sandbox đã được xóa; nếu vẫn còn tệp chưa xóa được sau chu kỳ thử lại, hệ thống lưu lại trạng thái đối soát và trả `DestroyStatus::ProcessExited { remaining_artifacts }`.
+
+* **Độc quyền vùng trạng thái (`state_dir`) và xác minh tiến trình mồ côi:**
+  * Mỗi thư mục trạng thái bền vững (`state_dir`) tại một thời điểm chỉ do duy nhất một thực thể runtime sở hữu, được bảo đảm bằng khóa tệp OS độc quyền (`state.lock`) chiếm giữ ngay từ trước bước `reconcile_startup` cho tới hết vòng đời runtime. Thực thể thứ hai trỏ vào cùng `state_dir` sẽ bị từ chối ngay lập tức và phải kết nối qua daemon hiện hành hoặc sử dụng một `state_dir` riêng.
+  * Mỗi bản ghi journal gắn với `SandboxId` và lưu cặp định danh tiến trình `(pid, start_token)` (mốc thời gian khởi tạo tiến trình do nhân OS cấp, ghi bền vững trước cả bước bắt tay IPC) để phân biệt chính xác tiến trình mồ côi với tiến trình khác đã tái sử dụng lại cùng PID. Khi không thể xác minh hoặc thu hồi an toàn, trình đối soát giữ lại bản ghi và báo cáo thu hồi chưa hoàn tất thay vì diệt tiến trình hoặc xóa tệp theo phỏng đoán.
+* **Phạm vi kế toán ngân sách Host và báo cáo `EnforcementLevel`:**
+  * Ngân sách cấp sandbox (`ResourceBudget`: số lượng máy ảo, hạn ngạch CPU, RSS và dung lượng lưu trữ vật lý gồm `overlay.qcow2`, journal, thư mục làm việc `sandboxes/<id>`) được kiểm soát bởi `AdmissionController` (xếp hàng FIFO có giới hạn thời gian chờ hoặc từ chối có kiểm soát với `AdmissionRejected`, luôn ưu tiên yêu cầu trực tiếp hơn tác vụ bù `Warm Pool`).
+  * Các tài nguyên phục vụ nằm ngoài tiến trình QEMU bên trong không gian nhớ của Host daemon (hàng đợi khung truyền tải, bộ đệm cửa sổ tín dụng theo từng luồng `StreamId`, luồng kết nối `HostEgressProxy`, cổng chuyển tiếp và tệp `qemu-stderr.log`) được khống chế bằng trần kích thước bộ đệm cố định, giới hạn số kết nối đồng thời và timeout cứng trên từng luồng.
+  * Hệ thống chỉ báo `EnforcementLevel::HardLimit` khi cơ chế hệ điều hành thực sự chặn cứng việc vượt trần (Win32 Job Object hoặc Linux delegated cgroup v2 cho CPU/RSS; `-nic none` kết hợp `HostEgressProxy` cho kiểm soát mạng). Những cơ chế dựa trên đo đạc định kỳ rồi xử lý hậu kiểm khi vượt ngưỡng (như quét dung lượng thư mục lưu trữ vật lý trên Host) bắt buộc báo cáo trung thực là `BestEffort` (hoặc `Unsupported` khi nền tảng không hỗ trợ).
+* **Ngữ nghĩa ghi dữ liệu `copy-out` và bảo toàn tài nguyên dùng chung:**
+  * Thao tác `copy-out` giải nén vào thư mục đích `dst_host` trên Host (tự tạo thư mục nếu chưa có; kiểm tra từng thành phần đường dẫn và từ chối tuyệt đối `..`, đường dẫn tuyệt đối, tên thiết bị đặc biệt Windows, symlink, hardlink trong tar và Windows reparse point/junction) theo cơ chế **ghi tạm và hoán đổi nguyên tử từng tệp (per-file atomic staging & rename)**: mỗi tệp regular được ghi đầy đủ và kiểm tra khớp kích thước/ngân sách vào một tệp staging mới (`create_new`) nằm ngay trong cùng thư mục cha trên cùng filesystem, đồng bộ dữ liệu rồi mới `rename` nguyên tử vào đường dẫn đích (nếu xảy ra lỗi hoặc cắt cụt dữ liệu giữa chừng, tệp staging tự động bị xóa và tệp đích cũ của mục đang lỗi được giữ nguyên). Bộ giải nén từ chối ghi đè nếu đích hiện hữu là thư mục, symlink, reparse point, node đặc biệt hoặc tệp đang có nhiều hardlink (`nlink > 1` trên Unix); tính nguyên tử được cam kết ở mức từng tệp regular riêng lẻ, không phải giao dịch hoàn tác toàn bộ cây thư mục.
+  * Tách biệt tài nguyên riêng của sandbox với tài nguyên dùng chung: `destroy()` chỉ thu hồi tiến trình, kết nối, journal và thư mục riêng `sandboxes/<id>` của đúng sandbox đó. Các gói Portable Runtime Bundle dùng chung (`base.qcow2`, kernel, initramfs) luôn giữ ở chế độ chỉ đọc kèm cơ chế khóa đọc dùng chung khi nâng cấp gói để việc hủy một sandbox không bao giờ làm mất dữ liệu nền của các sandbox khác đang hoạt động; MVP chưa thực hiện tự động thu gom rác (GC) đối với kho bundle/cache dùng chung.
