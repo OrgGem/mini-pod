@@ -803,6 +803,14 @@ impl SandboxClient {
         }
     }
 
+    /// Requests graceful daemon shutdown over the authenticated local control endpoint.
+    pub async fn shutdown(&self) -> Result<(), SandboxError> {
+        match self.rpc(ControlRequest::Shutdown).await? {
+            ControlResponse::Ack => Ok(()),
+            other => Err(unexpected_response("Shutdown", &other)),
+        }
+    }
+
     async fn rpc(&self, req: ControlRequest) -> Result<ControlResponse, SandboxError> {
         let mut stream = self.connect_with_connector().await?;
         let payload = req.to_json_bytes()?;
@@ -1149,6 +1157,7 @@ mod tests {
                         assert_eq!(id.as_str(), "sb-test-1");
                         ControlResponse::Destroyed(DestroyStatus::AllResourcesCleaned)
                     }
+                    ControlRequest::Shutdown => ControlResponse::Ack,
                     other => panic!("unexpected request: {other:?}"),
                 };
                 write_control_frame(&mut stream, &resp.to_json_bytes().unwrap())
@@ -1202,6 +1211,8 @@ mod tests {
 
         let destroyed = client.destroy(&lease.id).await.unwrap();
         assert_eq!(destroyed, DestroyStatus::AllResourcesCleaned);
+
+        client.shutdown().await.unwrap();
 
         join_server_tasks(tasks).await;
     }

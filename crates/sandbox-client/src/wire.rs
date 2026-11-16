@@ -185,6 +185,7 @@ pub enum ControlRequest {
     Destroy {
         id: SandboxId,
     },
+    Shutdown,
 }
 
 impl ControlRequest {
@@ -233,6 +234,7 @@ impl ControlRequest {
                 "type": "Destroy",
                 "id": id.as_str(),
             }),
+            Self::Shutdown => json!({ "type": "Shutdown" }),
         }
     }
 
@@ -273,6 +275,7 @@ impl ControlRequest {
             "Destroy" => Ok(Self::Destroy {
                 id: SandboxId::new(req_string(obj, "id", "ControlRequest::Destroy")?),
             }),
+            "Shutdown" => Ok(Self::Shutdown),
             other => Err(SandboxError::Transport(format!(
                 "unknown ControlRequest type '{other}'"
             ))),
@@ -1358,6 +1361,7 @@ mod tests {
             ControlRequest::Destroy {
                 id: SandboxId::new("sb-1"),
             },
+            ControlRequest::Shutdown,
         ];
 
         for req in requests {

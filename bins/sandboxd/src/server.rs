@@ -48,6 +48,7 @@ struct CachedDockerCompat {
 pub struct DaemonState {
     runtime: Arc<LocalRuntimeManager>,
     docker_compat: AsyncMutex<HashMap<SandboxId, CachedDockerCompat>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl DaemonState {
@@ -56,6 +57,26 @@ impl DaemonState {
         Self {
             runtime,
             docker_compat: AsyncMutex::new(HashMap::new()),
+            shutdown_tx: None,
+        }
+    }
+
+    /// Wraps an initialized [`LocalRuntimeManager`] with a daemon shutdown signal sender.
+    pub fn with_shutdown(
+        runtime: Arc<LocalRuntimeManager>,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            runtime,
+            docker_compat: AsyncMutex::new(HashMap::new()),
+            shutdown_tx: Some(shutdown_tx),
+        }
+    }
+
+    /// Signals the daemon control listener to stop accepting new connections and shut down cleanly.
+    pub fn request_shutdown(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(true);
         }
     }
 
@@ -217,35 +238,57 @@ pub async fn build_runtime(cfg: &ServeConfig) -> Result<Arc<LocalRuntimeManager>
     Ok(runtime)
 }
 
-/// Runs the local owner-only control daemon until SIGINT (`Ctrl-C`) or `SIGTERM`.
+/// Runs the local owner-only control daemon until SIGINT (`Ctrl-C`), `SIGTERM`, or `ControlRequest::Shutdown`.
 pub async fn run_serve(cfg: ServeConfig) -> Result<(), SandboxError> {
     cfg.endpoint.validate()?;
 
     let runtime = build_runtime(&cfg).await?;
-    let state = Arc::new(DaemonState::new(runtime));
-
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let signal_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
+    let state = Arc::new(DaemonState::with_shutdown(runtime, shutdown_tx.clone()));
+
+    let signal_tx = shutdown_tx;
+    let signal_handle = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         let _ = signal_tx.send(true);
     });
+    struct SignalAbortGuard(JoinHandle<()>);
+    impl Drop for SignalAbortGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _signal_guard = SignalAbortGuard(signal_handle);
 
-    let serve_res = match &cfg.endpoint {
+    let serve_res = serve_endpoint_with_shutdown(
+        &cfg.endpoint,
+        cfg.ready_file.as_deref(),
+        Arc::clone(&state),
+        shutdown_rx,
+    )
+    .await;
+
+    state.shutdown_all().await;
+    serve_res
+}
+
+/// Binds the owner-only local control endpoint (`NamedPipe` or `UnixSocket`), optionally emits
+/// `ready_file` atomically, and serves requests until `shutdown_rx` becomes `true`.
+pub async fn serve_endpoint_with_shutdown(
+    endpoint: &ControlEndpoint,
+    ready_file: Option<&Path>,
+    state: Arc<DaemonState>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), SandboxError> {
+    endpoint.validate()?;
+    match endpoint {
         ControlEndpoint::NamedPipe(pipe_path) => {
             #[cfg(windows)]
             {
-                run_windows_named_pipe_server(
-                    pipe_path,
-                    cfg.ready_file.as_deref(),
-                    Arc::clone(&state),
-                    shutdown_rx,
-                )
-                .await
+                run_windows_named_pipe_server(pipe_path, ready_file, state, shutdown_rx).await
             }
             #[cfg(not(windows))]
             {
-                let _ = (pipe_path, shutdown_rx);
+                let _ = (pipe_path, ready_file, state, shutdown_rx);
                 Err(SandboxError::PolicyViolation(
                     "Windows Named Pipe listener is not supported on non-Windows hosts; use Unix socket"
                         .to_owned(),
@@ -255,27 +298,18 @@ pub async fn run_serve(cfg: ServeConfig) -> Result<(), SandboxError> {
         ControlEndpoint::UnixSocket(sock_path) => {
             #[cfg(unix)]
             {
-                run_unix_socket_server(
-                    sock_path,
-                    cfg.ready_file.as_deref(),
-                    Arc::clone(&state),
-                    shutdown_rx,
-                )
-                .await
+                run_unix_socket_server(sock_path, ready_file, state, shutdown_rx).await
             }
             #[cfg(not(unix))]
             {
-                let _ = (sock_path, shutdown_rx);
+                let _ = (sock_path, ready_file, state, shutdown_rx);
                 Err(SandboxError::PolicyViolation(
                     "Unix socket control listener is not supported on Windows; use Named Pipe"
                         .to_owned(),
                 ))
             }
         }
-    };
-
-    state.shutdown_all().await;
-    serve_res
+    }
 }
 
 #[cfg(windows)]
@@ -610,10 +644,14 @@ where
         return handle_exec_connection(stream, &state, &id, req).await;
     }
 
+    let is_shutdown = matches!(req, ControlRequest::Shutdown);
     let resp = dispatch_unary_request(&state, req).await;
     let bytes = resp.to_json_bytes()?;
     write_control_frame(&mut stream, &bytes).await?;
     let _ = stream.shutdown().await;
+    if is_shutdown {
+        state.request_shutdown();
+    }
     Ok(())
 }
 
@@ -663,6 +701,7 @@ async fn dispatch_unary_request(state: &DaemonState, req: ControlRequest) -> Con
             Ok(status) => ControlResponse::Destroyed(status),
             Err(err) => ControlResponse::Error(WireError::from(err)),
         },
+        ControlRequest::Shutdown => ControlResponse::Ack,
         ControlRequest::ExecStart { .. } => {
             ControlResponse::Error(WireError::from(SandboxError::Internal(
                 "ExecStart must be dispatched on streaming connection handler".to_owned(),
@@ -811,6 +850,17 @@ async fn wait_for_shutdown_signal() {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}
+            }
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c};
+        if let (Ok(mut c), Ok(mut b)) = (ctrl_c(), ctrl_break()) {
+            tokio::select! {
+                _ = c.recv() => {}
+                _ = b.recv() => {}
             }
             return;
         }

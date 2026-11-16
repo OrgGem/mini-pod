@@ -2,13 +2,10 @@
 //! Layer 4 daemon composition root: local IPC authentication, runtime wiring,
 //! Docker compatibility server, and MCP adapter.
 
-mod config;
-mod mcp;
-mod server;
-
 use std::process::ExitCode;
 
-use config::{parse_env_args, Command};
+use sandboxd::config::{parse_env_args, Command};
+use sandboxd::{mcp, server};
 
 fn main() -> ExitCode {
     let cmd = match parse_env_args() {

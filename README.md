@@ -1,75 +1,103 @@
 # mini-pod
 
-Unprivileged, QEMU-First sandbox runtime for executing untrusted workloads and containerized dependencies (`Podman`-inside-VM with Docker API compatibility) across Windows, Linux, and macOS.
+Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with signed Portable Runtime Bundles, owner-only local IPC, an anti-rebinding Host Egress Proxy, an embedded Podman/Docker API compatibility adapter, a Warm Pool, CLI, MCP server, and lightweight async SDK.
 
-- **Specification & Contracts:** [BRD.md](BRD.md) (`v2.1`)
-- **Engineering Rules & Phase Workflow:** [AGENTS.md](AGENTS.md)
+- **Specification & Architecture Contract:** [BRD.md](BRD.md) (`v2.1`)
+- **Engineering & Security Invariants:** [AGENTS.md](AGENTS.md)
+- **Release Candidate Notes & Support Matrix:** [docs/release-candidate-v0.1.0.md](docs/release-candidate-v0.1.0.md)
+- **Measured Benchmark Report:** [docs/benchmarks/phase6-windows-x86_64.md](docs/benchmarks/phase6-windows-x86_64.md)
 
-## Cargo Workspace Structure
+---
+
+## Architecture (4-Layer Clean Workspace)
+
+Dependency arrows point strictly inward from outer composition roots toward domain types and framing:
 
 ```text
-mini-pod/
-├── Cargo.toml                         # Workspace root (11 members, guest-release profile)
-├── crates/
-│   ├── sandbox-core/                  # Layer 1: Domain types, policy invariants, SandboxError
-│   ├── sandbox-protocol/              # Layer 1: Versioned binary framing, Control/Data lanes
-│   ├── sandbox-runtime/               # Layer 2: RuntimeManager trait & lifecycle use cases
-│   ├── sandbox-vmm/                   # Layer 3: Shared QEMU driver + OS modules (windows/unix)
-│   ├── sandbox-image/                 # Layer 3: Ed25519 bundle verification & qcow2 CoW overlays
-│   ├── sandbox-docker-compat/         # Layer 3: Docker API adapter, port mapping & HTTP hijack
-│   └── sandbox-client/                # Adapter: Lightweight Rust SDK (no daemon/VMM/MCP)
-├── bins/
-│   ├── sandboxd/                      # Layer 4: Daemon composition root (auth, MCP, runtime wiring)
-│   └── sandbox-cli/                   # Layer 4: CLI composition root
-└── guest/
-    ├── tiny-init/                     # Guest PID 1 (ro rootfs + Podman overlay, zombie reaper)
-    └── sandbox-agent/                 # Guest RPC daemon, Execution Supervisor & Podman relay
+Layer 4 (Composition Roots):   bins/sandboxd  |  bins/sandbox-cli
+                                      |                   |
+                                      v                   v
+Layer 3 (Adapters & SDK):      sandbox-docker-compat | sandbox-vmm | sandbox-image | sandbox-client
+                                      \                     |             /
+                                       +--------------------+------------+
+                                                            v
+Layer 2 (Use Cases):                                 sandbox-runtime
+                                                            |
+                                                            v
+Layer 1 (Domain & Framing):                    sandbox-core + sandbox-protocol
+
+Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/sandbox-agent
 ```
 
-## Clean Architecture Dependency Matrix
+| Crate / Binary | Layer | Responsibility |
+| --- | --- | --- |
+| [`crates/sandbox-core`](crates/sandbox-core) | 1 | Domain policies (`IsolationMode`, `AccelerationPolicy`, `NetworkPolicy`, `EnforcementLevel`, `ResourceBudget`), `SandboxSpec` validation, `SandboxError`. |
+| [`crates/sandbox-protocol`](crates/sandbox-protocol) | 1 | Length-bounded binary framing, handshake negotiation, prioritized control vs. data lanes, and credit-based backpressure. |
+| [`crates/sandbox-runtime`](crates/sandbox-runtime) | 2 | `RuntimeManager` (`LocalRuntimeManager`): lifecycle, admission control, TTL lease sweeper, crash journal & startup reconciler, Warm Pool, safe tar I/O, and `HostEgressProxy`. |
+| [`crates/sandbox-vmm`](crates/sandbox-vmm) | 3 | Cross-OS QEMU driver (`KVM`/`HVF`/`WHPX` -> `TCG`, never falling back to `SharedKernelAllowed`), Windows Job Object confinement, Unix `setpgid`/cgroup v2, owner-only IPC (`virtio-serial`). |
+| [`crates/sandbox-image`](crates/sandbox-image) | 3 | Ed25519 manifest signature verification, SHA-256 + anti-tamper tree validation, atomic bundle swap, `qemu-img` CoW QCOW2 overlays, and `bundle-pack` signer CLI. |
+| [`crates/sandbox-docker-compat`](crates/sandbox-docker-compat) | 3 | Loopback HTTP/1.1 Docker Engine compatibility adapter (`bollard` / `testcontainers` + Ryuk), host port forwarding over virtio, HTTP hijack & half-close, raw host bind-mount rejection. |
+| [`crates/sandbox-client`](crates/sandbox-client) | Adapter | Lightweight async `SandboxClient` SDK + `ControlEndpoint` parser + client-side safe tar packing/extraction (no daemon/QEMU/MCP deps). |
+| [`bins/sandboxd`](bins/sandboxd) | 4 | Local daemon (`serve`) over owner-only Named Pipe / Unix socket and JSON-RPC 2.0 `stdio` MCP server (`mcp`). |
+| [`bins/sandbox-cli`](bins/sandbox-cli) | 4 | CLI client (`status`, `spawn`, `exec`, `renew`, `copy-in`, `copy-out`, `docker-endpoint`, `destroy`). |
+| [`guest/tiny-init`](guest/tiny-init) & [`guest/sandbox-agent`](guest/sandbox-agent) | Guest | PID 1 read-only rootfs + overlay setup, zombie reaping, execution supervisor (process-group/cgroup kill on deadline or output budget), and Podman Unix socket relay. |
 
-Source-code dependencies point strictly inward toward `sandbox-core` and `sandbox-protocol`:
+---
 
-| Component | Layer | Allowed Internal Dependencies | Forbidden Dependencies |
-| --- | --- | --- | --- |
-| `sandbox-core` | Layer 1 (Domain) | None (pure `std`) | `tokio` I/O, HTTP, QEMU, OS process APIs |
-| `sandbox-protocol` | Layer 1 (Protocol) | None (pure `std`) | Host filesystem, QEMU, Podman logic |
-| `sandbox-runtime` | Layer 2 (Use Cases) | `sandbox-core`, `sandbox-protocol` | Layer 3 adapters, CLI, MCP, Docker HTTP routing |
-| `sandbox-vmm` | Layer 3 (Adapter) | `sandbox-core`, `sandbox-protocol`, `sandbox-runtime` | Lease/Warm Pool policies, `bins/*` |
-| `sandbox-image` | Layer 3 (Adapter) | `sandbox-core` | VM process lifecycle, HTTP servers |
-| `sandbox-docker-compat` | Layer 3 (Adapter) | `sandbox-core`, `sandbox-protocol`, `sandbox-runtime` | Direct `bins/*`; `bollard` allowed only in client/tests |
-| `sandbox-client` | Adapter (SDK) | `sandbox-core`, `sandbox-protocol` | `sandbox-runtime`, `sandbox-vmm`, `sandboxd`, MCP |
-| `bins/sandboxd` | Layer 4 (Composition) | Layer 1–3 host crates | Library crates depending back on `bins/*` |
-| `bins/sandbox-cli` | Layer 4 (Composition) | `sandbox-core`, `sandbox-client` | `sandbox-vmm`, daemon internals |
-| `guest/tiny-init`, `guest/sandbox-agent` | Guest | `sandbox-protocol` | Host crates, TCP `2375` listener |
+## Prerequisites
 
-## Toolchain Setup (Prerequisites for Phase 1)
+- **Rust toolchain:** Rust `1.75+` (`rustfmt`, `cargo`)
+- **QEMU:** `qemu-system-x86_64` (plus `qemu-system-aarch64` for cross-arch bundle test) and `qemu-img` on `PATH` (or in standard Windows `Program Files\qemu` / `%LOCALAPPDATA%\Programs\qemu`)
+- **Docker (optional, for rebuilding reproducible guest bundles & offline OCI test images):** Linux container runtime supporting `linux/amd64` and `linux/arm64`
 
-1. Install Rust (`>= 1.75`) via `rustup`:
-   ```powershell
-   winget install Rustlang.Rustup
-   rustup default stable
-   rustup target add x86_64-unknown-linux-musl
-   ```
-2. Install QEMU for host spike testing:
-   ```powershell
-   winget install SoftwareFreedomConservancy.QEMU
-   ```
-3. Verify workspace compilation and end-of-phase tests:
-   ```powershell
-   cargo check --all-targets
-   cargo test --workspace
-   cargo build -p sandbox-agent --profile guest-release
-   ```
+---
 
-## Phase Roadmap Mapping (`BRD.md` Section 6)
+## Build & Test Commands
 
-| Phase | Timeline | Target Crates / Components | Completion Gate |
-| --- | --- | --- | --- |
-| Phase 1 | Week 1 | Spike QEMU + `sandbox-protocol` + `sandbox-vmm` | Unprivileged boot, `virtio-serial` handshake (`-chardev pipe` / `socket`), exec, clean teardown |
-| Phase 2 | Week 2 | `sandbox-image`, CI bundle pipeline | Reproducible guest rootfs/kernel, Ed25519 + SHA-256 verification, atomic swap (`x86_64` & `aarch64`) |
-| Phase 3 | Weeks 3–4 | `sandbox-core`, `sandbox-runtime`, `sandbox-vmm`, `guest/*` | Isolated execution on 3 OSes, Windows Job Object, TTL lease, crash journal/reconciler, safe Copy I/O |
-| Phase 4 | Weeks 5–6 | `guest/sandbox-agent`, `sandbox-docker-compat` | Podman Unix socket relay, Host port forwarding, Docker SDK & Testcontainers suite passing |
-| Phase 5 | Week 7 | `sandbox-runtime` (egress & accounting) | Host Egress Proxy (anti-DNS-rebinding & IPv6 filter), admission control, honest `EnforcementLevel` |
-| Phase 6 | Week 8 | `sandbox-runtime` (Warm Pool) | Separated benchmarks (`Cold Boot`, `Warm Checkout`, `Container-Ready`), pool exhaustion backpressure |
-| Phase 7 | Week 9 | `sandbox-client`, `bins/sandbox-cli`, `bins/sandboxd` | Packaged CLI/SDK/MCP server, crash recovery drills, all 7 Release Gates signed off |
+### Fast Compile & Unit/Component Tests (No QEMU Required)
+
+```powershell
+# Compile all workspace targets
+cargo check --all-targets
+
+# Run workspace unit + non-QEMU tests (QEMU-backed E2E tests skip cleanly unless MINIPOD_REQUIRE_QEMU_TESTS=1)
+cargo test --workspace
+```
+
+### Build Signed Portable Runtime Bundles & Run Full QEMU E2E Suite
+
+```powershell
+# 1. Build reproducible signed x86_64 & aarch64 bundles (.cache/bundles-src + .cache/keys/dev-bundle.pub)
+powershell -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1
+
+# 2. Build offline OCI test images for Docker compat / Testcontainers E2E (.cache/test-images)
+powershell -ExecutionPolicy Bypass -File scripts/build-test-oci-images.ps1
+
+# 3. Run full workspace tests requiring live QEMU + WHPX/KVM/TCG
+$env:MINIPOD_REQUIRE_QEMU_TESTS = "1"
+cargo test --workspace
+```
+
+---
+
+## Benchmark Summary (`windows-x86_64`, `whpx`)
+
+Measured by `crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs` and recorded in [docs/benchmarks/phase6-windows-x86_64.md](docs/benchmarks/phase6-windows-x86_64.md):
+
+| Metric | Category | Status | n | Min (ms) | p50 (ms) | p95 (ms) | Max (ms) | Mean (ms) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold_boot_spawn` | Cold Boot | Measured | 3 | 2011.93 | 2092.41 | 2115.95 | 2115.95 | 2073.43 |
+| `cold_boot_first_exec` | Cold Boot | Measured | 3 | 1.27 | 1.45 | 1.47 | 1.47 | 1.40 |
+| `warm_checkout_spawn` | Warm Checkout | Measured | 3 | 3.05 | **3.50** | 4.08 | 4.08 | 3.54 |
+| `warm_checkout_first_exec` | Warm Checkout | Measured | 3 | 1.40 | 1.57 | 1.65 | 1.65 | 1.54 |
+| `snapshot_restore` | Snapshot Restore | `DeferredPostMvp` | - | - | - | - | - | - |
+| `container_ready_cold_podman` | Container-Ready | Measured | 3 | 3800.39 | 3801.77 | 4063.79 | 4063.79 | 3888.65 |
+| `container_ready_warm_vm` | Container-Ready | Measured | 3 | 120.33 | 120.90 | 124.18 | 124.18 | 121.81 |
+
+Warm Pool Checkout (`3.50 ms` p50) meets the `<= 500.0 ms` Warm Pool target. Cold Boot (`2092.41 ms` p50) and State/Memory Snapshot (`DeferredPostMvp`) are tracked independently per [BRD.md](BRD.md).
+
+---
+
+## License
+
+MIT (`Cargo.toml`: `license = "MIT"`).
