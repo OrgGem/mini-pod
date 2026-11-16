@@ -1276,7 +1276,9 @@ name = "sandbox-client"
 version = "0.1.0"
 dependencies = [
  "sandbox-core",
- "sandbox-protocol",
+ "serde_json",
+ "tar",
+ "tokio",
 ]
 
 [[package]]
