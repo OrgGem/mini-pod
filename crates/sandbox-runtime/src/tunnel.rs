@@ -1,7 +1,9 @@
 //! Async bidirectional stream bridge for multiplexed guest Podman socket and loopback TCP tunnels.
 
+use std::any::Any;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use sandbox_protocol::StreamId;
@@ -22,6 +24,7 @@ pub struct TunnelStream {
     io: DuplexStream,
     write_shutdown: bool,
     drop_tx: Option<oneshot::Sender<bool>>,
+    guard: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// Driver-side bridge handles paired with a [`TunnelStream`].
@@ -45,6 +48,7 @@ impl TunnelStream {
             io: client_io,
             write_shutdown: false,
             drop_tx: Some(drop_tx),
+            guard: None,
         };
         let handle = TunnelStreamHandle {
             stream_id,
@@ -53,6 +57,11 @@ impl TunnelStream {
             drop_rx,
         };
         (stream, handle)
+    }
+
+    /// Attaches an opaque lifecycle guard kept alive until after `TunnelStream` is dropped.
+    pub fn attach_guard(&mut self, guard: Arc<dyn Any + Send + Sync>) {
+        self.guard = Some(guard);
     }
 
     /// Returns the protocol `StreamId` assigned to this tunnel.
@@ -98,6 +107,7 @@ impl Drop for TunnelStream {
         if let Some(tx) = self.drop_tx.take() {
             let _ = tx.send(self.write_shutdown);
         }
+        drop(self.guard.take());
     }
 }
 

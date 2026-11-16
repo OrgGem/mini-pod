@@ -452,6 +452,9 @@ mod tests {
 
         if let Some(path_var) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_var) {
+                if !dir.is_absolute() {
+                    continue;
+                }
                 let candidate = dir.join(exe_name);
                 if candidate.is_file() {
                     return Some(candidate);

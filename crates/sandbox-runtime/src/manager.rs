@@ -168,6 +168,7 @@ fn spawn_egress_acceptor(
                 maybe_stream = rx.recv() => {
                     match maybe_stream {
                         Some(stream) => {
+                            while tasks.try_join_next().is_some() {}
                             if tasks.len() >= MAX_CONCURRENT_EGRESS_STREAMS {
                                 drop(stream);
                                 continue;
@@ -1087,7 +1088,7 @@ impl LocalRuntimeManager {
             return Err(err);
         }
 
-        let prepared = match self
+        let mut prepared = match self
             .overlay
             .prepare_overlay(&sandbox_id, spec, &work_dir)
             .await
@@ -1157,7 +1158,10 @@ impl LocalRuntimeManager {
             work_dir: work_dir.clone(),
             on_boot_progress: Some(on_boot_progress),
         };
-        let boot = match self.vm_runtime.boot_vm(boot_cfg).await {
+        let boot_result = self.vm_runtime.boot_vm(boot_cfg).await;
+        // Release the shared bundle read lock once QEMU has launched and opened its bundle files.
+        prepared.bundle_guard = None;
+        let boot = match boot_result {
             Ok(outcome) => outcome,
             Err(err) => {
                 let recorded = self.load_record_async(sandbox_id.clone()).await.ok().flatten();
@@ -2150,6 +2154,7 @@ mod tests {
                 kernel_cmdline: "quiet panic=-1 minipod.root=/dev/vda".to_owned(),
                 virtual_disk_mb: spec.budget.virtual_disk_mb,
                 provisioned_host_bytes: 64,
+                bundle_guard: None,
             })
         }
 

@@ -79,6 +79,9 @@ fn find_binary_in_dirs(
     }
 
     for dir in search_dirs {
+        if !dir.is_absolute() {
+            continue;
+        }
         let candidate = dir.join(binary_name);
         if candidate.is_file() {
             return Ok(candidate);
@@ -93,15 +96,16 @@ fn find_binary_in_dirs(
 fn default_qemu_search_dirs() -> Vec<PathBuf> {
     let mut search_dirs = Vec::new();
     if let Some(path_var) = std::env::var_os("PATH") {
-        search_dirs.extend(
-            std::env::split_paths(&path_var).filter(|dir| !dir.as_os_str().is_empty()),
-        );
+        search_dirs.extend(std::env::split_paths(&path_var).filter(|dir| dir.is_absolute()));
     }
 
     #[cfg(windows)]
     {
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            search_dirs.push(PathBuf::from(local_app_data).join("Programs").join("qemu"));
+            let candidate = PathBuf::from(local_app_data).join("Programs").join("qemu");
+            if candidate.is_absolute() {
+                search_dirs.push(candidate);
+            }
         }
         search_dirs.push(PathBuf::from(r"C:\Program Files\qemu"));
     }
@@ -580,7 +584,17 @@ mod tests {
         fs::write(&fake_qemu_arm64, b"dummy").expect("write dummy aarch64 qemu binary");
         fs::write(&fake_qemu_img, b"dummy").expect("write dummy qemu-img binary");
 
-        let search_dirs = vec![empty_dir.path().to_path_buf(), bin_dir.path().to_path_buf()];
+        let search_dirs = vec![
+            PathBuf::from("."),
+            PathBuf::from("relative-bin"),
+            empty_dir.path().to_path_buf(),
+            bin_dir.path().to_path_buf(),
+        ];
+
+        assert!(matches!(
+            find_qemu_binary_in_dirs(None, &[PathBuf::from(".")]),
+            Err(SandboxError::NotFound(_))
+        ));
 
         let found_x64 =
             find_qemu_binary_in_dirs(None, &search_dirs).expect("should find x86_64 in second dir");

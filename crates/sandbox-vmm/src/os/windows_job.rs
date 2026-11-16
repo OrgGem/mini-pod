@@ -580,28 +580,6 @@ pub(crate) fn spawn_in_job_internal(
 }
 
 fn resolve_windows_application_path(program: &Path) -> Result<std::path::PathBuf, SandboxError> {
-    use std::os::windows::ffi::OsStrExt;
-
-    if program.as_os_str().is_empty() {
-        return Err(SandboxError::InvalidSpec(
-            "process launch program path cannot be empty".to_owned(),
-        ));
-    }
-    let has_sep_or_drive = program
-        .as_os_str()
-        .encode_wide()
-        .any(|u| u == b'\\' as u16 || u == b'/' as u16 || u == b':' as u16);
-    if has_sep_or_drive {
-        return Ok(program.to_path_buf());
-    }
-
-    let mut leaf_names = vec![program.as_os_str().to_os_string()];
-    if program.extension().is_none() {
-        let mut with_exe = program.as_os_str().to_os_string();
-        with_exe.push(".exe");
-        leaf_names.push(with_exe);
-    }
-
     let mut search_dirs = Vec::new();
     if let Some(sys_root) = std::env::var_os("SystemRoot") {
         let sys32 = std::path::PathBuf::from(sys_root).join("System32");
@@ -618,7 +596,52 @@ fn resolve_windows_application_path(program: &Path) -> Result<std::path::PathBuf
         }
     }
 
+    resolve_windows_application_path_in_dirs(program, &search_dirs)
+}
+
+fn resolve_windows_application_path_in_dirs(
+    program: &Path,
+    search_dirs: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, SandboxError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if program.as_os_str().is_empty() {
+        return Err(SandboxError::InvalidSpec(
+            "process launch program path cannot be empty".to_owned(),
+        ));
+    }
+    let has_exe_ext = program
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    let has_sep_or_drive = program
+        .as_os_str()
+        .encode_wide()
+        .any(|u| u == b'\\' as u16 || u == b'/' as u16 || u == b':' as u16);
+    if has_sep_or_drive {
+        if !has_exe_ext && !program.is_file() {
+            let mut with_exe = program.as_os_str().to_os_string();
+            with_exe.push(".exe");
+            let exe_candidate = std::path::PathBuf::from(with_exe);
+            if exe_candidate.is_file() {
+                return Ok(exe_candidate);
+            }
+        }
+        return Ok(program.to_path_buf());
+    }
+
+    // Prefer `.exe` over extensionless shims/scripts (e.g. Git/MSYS2 wrappers or dotted version stems).
+    let mut leaf_names = Vec::with_capacity(2);
+    if !has_exe_ext {
+        let mut with_exe = program.as_os_str().to_os_string();
+        with_exe.push(".exe");
+        leaf_names.push(with_exe);
+    }
+    leaf_names.push(program.as_os_str().to_os_string());
+
     for dir in search_dirs {
+        if !dir.is_absolute() {
+            continue;
+        }
         for leaf in &leaf_names {
             let candidate = dir.join(leaf);
             if candidate.is_file() {
@@ -1551,5 +1574,68 @@ mod tests {
 
         proc.kill_and_wait().expect("kill confined cmd.exe");
         assert_eq!(proc.current_rss_bytes(), None);
+    }
+
+    #[test]
+    fn resolve_windows_application_path_skips_relative_dirs_and_prefers_exe_for_dotted_stems() {
+        struct LocalTempDir(std::path::PathBuf);
+        impl Drop for LocalTempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "minipod-win-path-resolve-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let tmp = LocalTempDir(root);
+        let abs_dir = tmp.0.join("bin");
+        fs::create_dir_all(&abs_dir).unwrap();
+
+        // Bare name with extensionless sibling + `.exe`: must pick `.exe` and ignore relative dirs.
+        let shim_no_ext = abs_dir.join("qemu-system-x86_64");
+        let exe_bin = abs_dir.join("qemu-system-x86_64.exe");
+        fs::write(&shim_no_ext, b"#!/bin/sh\n").unwrap();
+        fs::write(&exe_bin, b"MZ").unwrap();
+
+        // Dotted version stem: `.exe` must still be appended rather than replacing `.2`.
+        let dotted_exe = abs_dir.join("qemu-system-x86_64-9.2.exe");
+        fs::write(&dotted_exe, b"MZ").unwrap();
+
+        let dirs = vec![
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("relative-tools"),
+            abs_dir.clone(),
+        ];
+
+        assert_eq!(
+            resolve_windows_application_path_in_dirs(Path::new("qemu-system-x86_64"), &dirs)
+                .unwrap(),
+            exe_bin
+        );
+        assert_eq!(
+            resolve_windows_application_path_in_dirs(Path::new("qemu-system-x86_64-9.2"), &dirs)
+                .unwrap(),
+            dotted_exe
+        );
+        assert_eq!(
+            resolve_windows_application_path_in_dirs(
+                &abs_dir.join("qemu-system-x86_64-9.2"),
+                &[],
+            )
+            .unwrap(),
+            dotted_exe
+        );
+        assert!(matches!(
+            resolve_windows_application_path_in_dirs(
+                Path::new("qemu-system-x86_64"),
+                &[std::path::PathBuf::from(".")],
+            ),
+            Err(SandboxError::NotFound(_))
+        ));
     }
 }

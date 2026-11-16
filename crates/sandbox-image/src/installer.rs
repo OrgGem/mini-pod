@@ -116,23 +116,26 @@ pub fn verify_installed_bundle(
     bundle_dir: &Path,
     verifier: &BundleVerifier,
 ) -> Result<InstalledBundle, SandboxError> {
-    with_verified_installed_bundle_read_locked(bundle_dir, verifier, Ok)
+    with_verified_installed_bundle_read_locked(bundle_dir, verifier, |installed, _read_guard| {
+        Ok(installed)
+    })
 }
 
 /// Acquires a shared OS lock on `<install_parent>/.lock-<bundle_id>` (healing any interrupted
 /// `.promote-<bundle_id>.v1` swap first), verifies `bundle_dir`, and runs `op` while holding the
-/// shared read lock so concurrent live upgrades cannot swap `bundle_dir` mid-operation.
+/// shared read lock (passing the lock file handle so callers can extend the shared read lock
+/// across subsequent VM launches) so concurrent live upgrades cannot swap `bundle_dir` mid-operation.
 pub(crate) fn with_verified_installed_bundle_read_locked<T, F>(
     bundle_dir: &Path,
     verifier: &BundleVerifier,
     op: F,
 ) -> Result<T, SandboxError>
 where
-    F: FnOnce(InstalledBundle) -> Result<T, SandboxError>,
+    F: FnOnce(InstalledBundle, Option<File>) -> Result<T, SandboxError>,
 {
-    let _read_guard = acquire_bundle_read_guard(bundle_dir)?;
+    let read_guard = acquire_bundle_read_guard(bundle_dir)?;
     let installed = verify_installed_bundle_once(bundle_dir, verifier)?;
-    op(installed)
+    op(installed, read_guard)
 }
 
 fn verify_installed_bundle_once(
@@ -700,11 +703,18 @@ fn open_bundle_lock_file(lock_path: &Path, create_if_missing: bool) -> Result<Op
     match opts.open(lock_path) {
         Ok(file) => Ok(Some(file)),
         Err(err) if !create_if_missing && err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => match File::open(lock_path) {
-            Ok(file) => Ok(Some(file)),
-            Err(e) if !create_if_missing && e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(map_fs_error(lock_path, "open bundle lock file", e)),
-        },
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match File::open(lock_path) {
+                Ok(file) => Ok(Some(file)),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(map_fs_error(lock_path, "open bundle lock file", e)),
+            }
+        }
         Err(err) => Err(map_fs_error(lock_path, "open bundle lock file", err)),
     }
 }
@@ -725,8 +735,32 @@ fn acquire_bundle_read_guard(target_dir: &Path) -> Result<Option<File>, SandboxE
     let Some((lock_path, intent_path)) = bundle_lock_and_intent_paths(target_dir) else {
         return Ok(None);
     };
-    let need_create = intent_path.exists();
-    let Some(shared_file) = open_bundle_lock_file(&lock_path, need_create)? else {
+    let Some(parent_dir) = lock_path.parent() else {
+        return Ok(None);
+    };
+    match fs::symlink_metadata(parent_dir) {
+        Ok(meta) => validate_metadata_no_link(parent_dir, &meta, true, false)?,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(map_fs_error(
+                parent_dir,
+                "inspect install parent directory",
+                err,
+            ))
+        }
+    }
+    // Check target_dir before creating `.lock-*` so symlink/junction rejections never leave lock files behind.
+    match fs::symlink_metadata(target_dir) {
+        Ok(meta) => validate_metadata_no_link(target_dir, &meta, true, false)?,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            if !intent_path.exists() && !lock_path.exists() {
+                return Ok(None);
+            }
+        }
+        Err(err) => return Err(map_fs_error(target_dir, "inspect installed bundle dir", err)),
+    }
+
+    let Some(shared_file) = open_bundle_lock_file(&lock_path, true)? else {
         return Ok(None);
     };
     shared_file
@@ -1417,5 +1451,110 @@ mod tests {
         for handle in readers {
             handle.join().expect("reader thread panicked");
         }
+    }
+
+    #[test]
+    fn read_guard_locks_preexisting_unpromoted_bundle_and_blocks_concurrent_swap() {
+        let temp = TestTempDir::new("preexisting-lock");
+        let install_root = temp.path().join("bundles");
+        fs::create_dir_all(&install_root).expect("create install root");
+
+        let secret = [17u8; 32];
+        let verifier =
+            BundleVerifier::with_public_key(public_key_from_secret(&secret)).expect("verifier");
+        let bundle_id = "bundle-preexisting";
+        let target_dir = install_root.join(bundle_id);
+
+        let files_v1 = [
+            ("guest/vmlinuz", ArtifactRole::Kernel, b"kernel-v1".as_slice()),
+            (
+                "guest/initrd.img",
+                ArtifactRole::Initrd,
+                b"initrd-v1".as_slice(),
+            ),
+            (
+                "guest/base.qcow2",
+                ArtifactRole::BaseRootfsQcow2,
+                b"qcow2-v1".as_slice(),
+            ),
+            (
+                "guest/tiny-init",
+                ArtifactRole::TinyInit,
+                b"init-v1".as_slice(),
+            ),
+            (
+                "guest/sandbox-agent",
+                ArtifactRole::GuestAgent,
+                b"agent-v1".as_slice(),
+            ),
+        ];
+        write_signed_bundle(&target_dir, bundle_id, &secret, &files_v1);
+
+        let src_v2 = temp.path().join("src-v2");
+        let files_v2 = [
+            ("guest/vmlinuz", ArtifactRole::Kernel, b"kernel-v2".as_slice()),
+            (
+                "guest/initrd.img",
+                ArtifactRole::Initrd,
+                b"initrd-v2".as_slice(),
+            ),
+            (
+                "guest/base.qcow2",
+                ArtifactRole::BaseRootfsQcow2,
+                b"qcow2-v2".as_slice(),
+            ),
+            (
+                "guest/tiny-init",
+                ArtifactRole::TinyInit,
+                b"init-v2".as_slice(),
+            ),
+            (
+                "guest/sandbox-agent",
+                ArtifactRole::GuestAgent,
+                b"agent-v2".as_slice(),
+            ),
+        ];
+        write_signed_bundle(&src_v2, bundle_id, &secret, &files_v2);
+
+        let guard = with_verified_installed_bundle_read_locked(
+            &target_dir,
+            &verifier,
+            |_installed, read_guard| Ok(read_guard),
+        )
+        .expect("verified preexisting bundle")
+        .expect("read guard must be created even before any install promotion");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let swap_src = src_v2.clone();
+        let swap_root = install_root.clone();
+        let swap_verifier = verifier.clone();
+        let swap_thread = std::thread::spawn(move || {
+            let res = install_bundle_atomic(&swap_src, &swap_root, &swap_verifier);
+            let _ = tx.send(res);
+        });
+
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "concurrent bundle swap must block while shared read guard is held"
+        );
+        assert_eq!(
+            fs::read(target_dir.join("guest/vmlinuz")).expect("read v1 kernel"),
+            b"kernel-v1"
+        );
+
+        drop(guard);
+
+        let swap_res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("swap finishes after read guard drops");
+        swap_res.expect("bundle upgrade succeeds after guard release");
+        swap_thread.join().expect("swap thread joins");
+        assert_eq!(
+            fs::read(target_dir.join("guest/vmlinuz")).expect("read v2 kernel"),
+            b"kernel-v2"
+        );
     }
 }

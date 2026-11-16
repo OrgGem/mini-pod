@@ -208,6 +208,7 @@ impl DiskOverlayPort for StubOverlay {
             kernel_cmdline: "quiet".to_owned(),
             virtual_disk_mb: spec.budget.virtual_disk_mb,
             provisioned_host_bytes: 5,
+            bundle_guard: None,
         })
     }
 

@@ -2,6 +2,7 @@
 //! `sandbox-vmm`) and injected at the composition root.
 
 use std::fmt;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,32 @@ use crate::exec_stream::ExecStream;
 use crate::tunnel::TunnelStream;
 use crate::RuntimeManager;
 
+/// Opaque shared OS file lock guard keeping an installed Portable Runtime Bundle pinned from
+/// overlay preparation until the VMM has launched and opened its boot artifacts.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct BundleReadGuard(Arc<File>);
+
+impl BundleReadGuard {
+    pub fn new(file: File) -> Self {
+        Self(Arc::new(file))
+    }
+}
+
+impl fmt::Debug for BundleReadGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("BundleReadGuard").field(&"<locked>").finish()
+    }
+}
+
+impl PartialEq for BundleReadGuard {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for BundleReadGuard {}
+
 /// Per-sandbox Copy-on-Write disk overlay and verified boot artifact paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedOverlay {
@@ -23,6 +50,7 @@ pub struct PreparedOverlay {
     pub kernel_cmdline: String,
     pub virtual_disk_mb: u32,
     pub provisioned_host_bytes: u64,
+    pub bundle_guard: Option<BundleReadGuard>,
 }
 
 /// Driven port for preparing and removing per-sandbox CoW disk overlays.

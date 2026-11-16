@@ -7,7 +7,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use sandbox_core::{GuestArch, SandboxError, SandboxId, SandboxSpec};
-use sandbox_runtime::{DiskOverlayPort, PreparedOverlay};
+use sandbox_runtime::{BundleReadGuard, DiskOverlayPort, PreparedOverlay};
 
 use crate::crypto::BundleVerifier;
 use crate::installer::{
@@ -124,8 +124,11 @@ impl DiskOverlayPort for BundleOverlayStore {
         let host_budget_bytes = u64::from(spec.budget.host_storage_budget_mb) * 1024 * 1024;
 
         tokio::task::spawn_blocking(move || {
-            with_verified_installed_bundle_read_locked(&bundle_dir, &verifier, |installed| {
-                let base_rootfs = installed.base_rootfs_qcow2_path();
+            with_verified_installed_bundle_read_locked(
+                &bundle_dir,
+                &verifier,
+                |installed, read_guard| {
+                    let base_rootfs = installed.base_rootfs_qcow2_path();
 
                 create_qcow2_overlay_atomic_with_runner(
                     &qemu_img_bin,
@@ -155,6 +158,7 @@ impl DiskOverlayPort for BundleOverlayStore {
                     kernel_cmdline,
                     virtual_disk_mb,
                     provisioned_host_bytes,
+                    bundle_guard: read_guard.map(BundleReadGuard::new),
                 })
             })
         })

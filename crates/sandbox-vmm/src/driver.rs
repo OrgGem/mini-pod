@@ -597,7 +597,7 @@ struct GuestEgressPermit {
 }
 
 impl GuestEgressPermit {
-    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Arc<Self>> {
         let mut cur = counter.load(Ordering::Acquire);
         loop {
             if cur >= limit {
@@ -610,9 +610,9 @@ impl GuestEgressPermit {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Some(Self {
+                    return Some(Arc::new(Self {
                         counter: Arc::clone(counter),
-                    });
+                    }));
                 }
                 Err(actual) => cur = actual,
             }
@@ -661,7 +661,7 @@ enum StreamHandler {
         inbound_tx: mpsc::UnboundedSender<TunnelInbound>,
         queued_bytes: Arc<AtomicUsize>,
         stdin_credits: Arc<StdinCreditWindow>,
-        _egress_permit: Option<GuestEgressPermit>,
+        _egress_permit: Option<Arc<GuestEgressPermit>>,
     },
 }
 
@@ -681,6 +681,8 @@ pub struct QemuVmSession {
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
     egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
+    #[cfg(test)]
+    active_guest_egress: Arc<AtomicUsize>,
     pending_network_ack: Arc<NetworkAckSlot>,
     network_cfg_lock: AsyncMutex<()>,
     session_closed_tx: watch::Sender<Option<String>>,
@@ -730,6 +732,7 @@ impl QemuVmSession {
             Arc::new(Mutex::new(HashMap::new()));
         let egress_tx = Arc::new(Mutex::new(egress_tx));
         let active_guest_egress = Arc::new(AtomicUsize::new(0));
+        let reader_active_guest_egress = Arc::clone(&active_guest_egress);
         let pending_network_ack: Arc<NetworkAckSlot> = Arc::new(Mutex::new(None));
         let (session_closed_tx, _) = watch::channel(None);
         let transport_closed = Arc::new(AtomicBool::new(false));
@@ -770,7 +773,7 @@ impl QemuVmSession {
                     reader_pending_ack,
                     reader_closed,
                     reader_egress_tx,
-                    active_guest_egress,
+                    reader_active_guest_egress,
                     reader_session_closed,
                     tokio_handle,
                 );
@@ -790,6 +793,8 @@ impl QemuVmSession {
             outbound,
             ops,
             egress_tx,
+            #[cfg(test)]
+            active_guest_egress,
             pending_network_ack,
             network_cfg_lock: AsyncMutex::new(()),
             session_closed_tx,
@@ -797,6 +802,11 @@ impl QemuVmSession {
             alive: AtomicBool::new(true),
             next_stream_id: AtomicU32::new(1),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_guest_egress_count(&self) -> usize {
+        self.active_guest_egress.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -2263,7 +2273,10 @@ fn handle_egress_open(
         return;
     };
 
-    let (client_stream, tunnel_handle) = TunnelStream::channel(stream_id);
+    let (mut client_stream, tunnel_handle) = TunnelStream::channel(stream_id);
+    // Keep the egress concurrency permit held across both the reader stream handler and the Host
+    // proxy TunnelStream so guest StreamClose cannot free a slot before Host forwarding finishes.
+    client_stream.attach_guard(Arc::clone(&permit) as Arc<dyn std::any::Any + Send + Sync>);
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
@@ -3800,6 +3813,87 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn egress_permit_stays_reserved_after_guest_stream_close_until_host_tunnel_drops() {
+        use sandbox_protocol::GUEST_STREAM_ID_BIT;
+        use tokio::io::AsyncReadExt;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-egress-permit-hold").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let (close_ack_tx, close_ack_rx) = oneshot::channel::<()>();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            let guest_sid = StreamId(GUEST_STREAM_ID_BIT | 1);
+
+            write_frame(
+                &mut client,
+                &Frame::from_message(guest_sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+
+            let ack = read_frame(&mut client).unwrap();
+            assert_eq!(ack.header.stream_id, guest_sid);
+            assert_eq!(ack.decode_message().unwrap(), Message::ConnectAck);
+
+            // Immediately close the guest stream handler while the Host proxy TunnelStream stays open.
+            write_frame(
+                &mut client,
+                &Frame::from_message(guest_sid, &Message::StreamClose).unwrap(),
+            )
+            .unwrap();
+            let _ = close_ack_tx.send(());
+
+            while let Ok(frame) = read_frame(&mut client) {
+                if matches!(frame.decode_message(), Ok(Message::Shutdown)) {
+                    let _ = write_frame(
+                        &mut client,
+                        &Frame::from_message(StreamId(0), &Message::Shutdown).unwrap(),
+                    );
+                    break;
+                }
+            }
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let (session, mut egress_rx) =
+            QemuVmSession::from_test_stream_with_egress(host_stream, Duration::from_secs(2))
+                .unwrap();
+
+        let mut egress_stream = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+            .await
+            .unwrap()
+            .expect("expected accepted egress tunnel stream");
+        tokio::time::timeout(Duration::from_secs(2), close_ack_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Reading EOF proves the reader loop processed Message::StreamClose and removed StreamHandler::Tunnel.
+        let mut eof_buf = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(2), egress_stream.read(&mut eof_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
+
+        assert_eq!(
+            session.active_guest_egress_count(),
+            1,
+            "permit must stay reserved while Host TunnelStream is still alive"
+        );
+
+        drop(egress_stream);
+        assert_eq!(
+            session.active_guest_egress_count(),
+            0,
+            "permit must release once Host TunnelStream drops"
+        );
 
         session.force_kill().await.unwrap();
         guest_thread.join().unwrap();
