@@ -29,6 +29,7 @@ use crate::ports::{
 };
 use crate::safe_tar::{
     ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar,
+    validate_tar_bytes,
 };
 use crate::tunnel::TunnelStream;
 use crate::warm_pool::{
@@ -191,6 +192,7 @@ struct ActiveSandbox {
     work_dir: PathBuf,
     overlay_path: PathBuf,
     artifact_paths: Vec<PathBuf>,
+    network_policy: NetworkPolicy,
     expires_at: Instant,
     reserved_rss_mb: u64,
     host_rss_budget_mb: Option<u32>,
@@ -335,6 +337,18 @@ impl LocalRuntimeManager {
     /// Returns a snapshot of current Warm Pool gauges and lifecycle counters.
     pub fn warm_pool_stats(&self) -> WarmPoolStats {
         self.warm_pool.stats()
+    }
+
+    /// Returns the IDs of all currently active sandboxes.
+    pub fn active_sandbox_ids(&self) -> Vec<SandboxId> {
+        let active = lock_unpoisoned(&self.active);
+        active.keys().cloned().collect()
+    }
+
+    /// Returns the configured [`NetworkPolicy`] for an active, unexpired, living sandbox.
+    pub fn active_sandbox_network(&self, id: &SandboxId) -> Result<NetworkPolicy, SandboxError> {
+        self.get_active_op_target(id)
+            .map(|(_, _, _, network)| network)
     }
 
     /// Samples the live host resident set size (`RSS` / working set) in bytes for an active sandbox.
@@ -807,7 +821,7 @@ impl LocalRuntimeManager {
     fn get_active_op_target(
         &self,
         id: &SandboxId,
-    ) -> Result<(Arc<dyn VmSessionPort>, PathBuf, u32), SandboxError> {
+    ) -> Result<(Arc<dyn VmSessionPort>, PathBuf, u32, NetworkPolicy), SandboxError> {
         let now = Instant::now();
         {
             let active = lock_unpoisoned(&self.active);
@@ -826,6 +840,7 @@ impl LocalRuntimeManager {
                     Arc::clone(&entry.session),
                     entry.work_dir.clone(),
                     entry.host_storage_budget_mb,
+                    entry.network_policy.clone(),
                 ));
             }
         }
@@ -849,7 +864,125 @@ impl LocalRuntimeManager {
         &self,
         id: &SandboxId,
     ) -> Result<Arc<dyn VmSessionPort>, SandboxError> {
-        self.get_active_op_target(id).map(|(session, _, _)| session)
+        self.get_active_op_target(id)
+            .map(|(session, _, _, _)| session)
+    }
+
+    /// Validates pre-packed `tar_bytes` on the host (traversal, entry types, storage budget)
+    /// and copies it directly to `dst_guest` without re-extracting or re-packing on disk.
+    pub async fn copy_in_tar_bytes(
+        &self,
+        id: &SandboxId,
+        dst_guest: String,
+        tar_bytes: Vec<u8>,
+    ) -> Result<(), SandboxError> {
+        validate_guest_path(&dst_guest, "dst_guest")?;
+        let (session, work_dir, storage_budget_bytes, pre_bytes) = self.begin_copy_in(id).await?;
+        let max_copy_bytes = self.config.max_copy_bytes;
+        let max_copy_entries = self.config.max_copy_entries;
+
+        if (tar_bytes.len() as u64) > max_copy_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "copy_in tar archive ({} bytes) exceeds max_copy_bytes ({max_copy_bytes} bytes)",
+                tar_bytes.len()
+            )));
+        }
+        let remaining_storage_bytes = storage_budget_bytes.saturating_sub(pre_bytes);
+        if (tar_bytes.len() as u64) > remaining_storage_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "copy_in archive ({} bytes) plus existing storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)",
+                tar_bytes.len()
+            )));
+        }
+
+        let validate_budget = max_copy_bytes.min(remaining_storage_bytes);
+        let tar_bytes = tokio::task::spawn_blocking(move || {
+            validate_tar_bytes(&tar_bytes, validate_budget, max_copy_entries)?;
+            Ok::<_, SandboxError>(tar_bytes)
+        })
+        .await
+        .map_err(|err| SandboxError::Internal(format!("copy_in tar validation failed: {err}")))??;
+
+        self.finish_copy_in(
+            id,
+            session,
+            &work_dir,
+            storage_budget_bytes,
+            pre_bytes,
+            &dst_guest,
+            tar_bytes,
+        )
+        .await
+    }
+
+    /// Streams `src_guest` from `id` as validated raw tar bytes without touching the host disk.
+    pub async fn copy_out_tar_bytes(
+        &self,
+        id: &SandboxId,
+        src_guest: String,
+    ) -> Result<Vec<u8>, SandboxError> {
+        validate_guest_path(&src_guest, "src_guest")?;
+        let session = self.get_active_session_for_op(id)?;
+        let max_bytes = self.config.max_copy_bytes;
+        let max_entries = self.config.max_copy_entries;
+
+        let tar_bytes = session.copy_out_tar(&src_guest, max_bytes).await?;
+
+        tokio::task::spawn_blocking(move || {
+            validate_tar_bytes(&tar_bytes, max_bytes, max_entries)?;
+            Ok::<_, SandboxError>(tar_bytes)
+        })
+        .await
+        .map_err(|err| SandboxError::Internal(format!("copy_out tar validation failed: {err}")))?
+    }
+
+    async fn begin_copy_in(
+        &self,
+        id: &SandboxId,
+    ) -> Result<(Arc<dyn VmSessionPort>, PathBuf, u64, u64), SandboxError> {
+        let (session, work_dir, host_storage_budget_mb, _) = self.get_active_op_target(id)?;
+        let storage_budget_bytes = u64::from(host_storage_budget_mb).saturating_mul(1024 * 1024);
+
+        let pre_bytes = self.measure_sandbox_storage_bytes(id, &work_dir).await?;
+        if pre_bytes > storage_budget_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "sandbox '{id}' physical storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)"
+            )));
+        }
+
+        Ok((session, work_dir, storage_budget_bytes, pre_bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_copy_in(
+        &self,
+        id: &SandboxId,
+        session: Arc<dyn VmSessionPort>,
+        work_dir: &Path,
+        storage_budget_bytes: u64,
+        pre_bytes: u64,
+        dst_guest: &str,
+        tar_bytes: Vec<u8>,
+    ) -> Result<(), SandboxError> {
+        if pre_bytes.saturating_add(tar_bytes.len() as u64) > storage_budget_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "copy_in archive ({} bytes) plus existing storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)",
+                tar_bytes.len()
+            )));
+        }
+
+        let _ = session
+            .copy_in_tar(dst_guest, tar_bytes, self.config.max_copy_bytes)
+            .await?;
+
+        let post_bytes = self.measure_sandbox_storage_bytes(id, work_dir).await?;
+        if post_bytes > storage_budget_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "sandbox '{id}' physical storage after copy_in ({post_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)"
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -1125,6 +1258,7 @@ impl LocalRuntimeManager {
                     work_dir: booted.work_dir,
                     overlay_path: booted.prepared.overlay_path,
                     artifact_paths: booted.artifact_paths,
+                    network_policy: spec.network.clone(),
                     expires_at,
                     reserved_rss_mb,
                     host_rss_budget_mb: spec.budget.host_rss_budget_mb,
@@ -1465,15 +1599,7 @@ impl RuntimeManager for LocalRuntimeManager {
         dst_guest: String,
     ) -> Result<(), SandboxError> {
         validate_guest_path(&dst_guest, "dst_guest")?;
-        let (session, work_dir, host_storage_budget_mb) = self.get_active_op_target(id)?;
-        let storage_budget_bytes = u64::from(host_storage_budget_mb).saturating_mul(1024 * 1024);
-
-        let pre_bytes = self.measure_sandbox_storage_bytes(id, &work_dir).await?;
-        if pre_bytes > storage_budget_bytes {
-            return Err(SandboxError::BudgetExceeded(format!(
-                "sandbox '{id}' physical storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)"
-            )));
-        }
+        let (session, work_dir, storage_budget_bytes, pre_bytes) = self.begin_copy_in(id).await?;
 
         let max_copy_bytes = self.config.max_copy_bytes;
         let remaining_storage_bytes = storage_budget_bytes.saturating_sub(pre_bytes);
@@ -1486,25 +1612,16 @@ impl RuntimeManager for LocalRuntimeManager {
                     SandboxError::Internal(format!("copy_in tar packing failed: {err}"))
                 })??;
 
-        if pre_bytes.saturating_add(tar_bytes.len() as u64) > storage_budget_bytes {
-            return Err(SandboxError::BudgetExceeded(format!(
-                "copy_in archive ({} bytes) plus existing storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)",
-                tar_bytes.len()
-            )));
-        }
-
-        let _ = session
-            .copy_in_tar(&dst_guest, tar_bytes, max_copy_bytes)
-            .await?;
-
-        let post_bytes = self.measure_sandbox_storage_bytes(id, &work_dir).await?;
-        if post_bytes > storage_budget_bytes {
-            return Err(SandboxError::BudgetExceeded(format!(
-                "sandbox '{id}' physical storage after copy_in ({post_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)"
-            )));
-        }
-
-        Ok(())
+        self.finish_copy_in(
+            id,
+            session,
+            &work_dir,
+            storage_budget_bytes,
+            pre_bytes,
+            &dst_guest,
+            tar_bytes,
+        )
+        .await
     }
 
     async fn copy_out(
@@ -1570,6 +1687,7 @@ impl RuntimeManager for LocalRuntimeManager {
                 work_dir: _,
                 overlay_path,
                 artifact_paths: entry_artifacts,
+                network_policy: _,
                 expires_at: _,
                 reserved_rss_mb: _,
                 host_rss_budget_mb: _,
@@ -3815,5 +3933,93 @@ mod tests {
         let lease = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
         assert_eq!(mgr.warm_pool_stats().total_checkouts, 1);
         mgr.destroy(&lease.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_in_out_tar_bytes_and_active_helpers_validate_tar_and_track_sandboxes() {
+        let tmp = TestTempDir::new("mgr-tar-bytes");
+        let state_dir = tmp.path().join("state");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mgr = LocalRuntimeManager::new(base_config(state_dir), overlay, vm.clone()).unwrap();
+
+        let mut spec = valid_spec(Duration::from_secs(60));
+        spec.network = NetworkPolicy::InternetOnly;
+        let lease = mgr.spawn(spec).await.unwrap();
+        assert_eq!(mgr.active_sandbox_ids(), vec![lease.id.clone()]);
+        assert_eq!(
+            mgr.active_sandbox_network(&lease.id).unwrap(),
+            NetworkPolicy::InternetOnly
+        );
+
+        let src_dir = tmp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("hello.txt"), b"tar-bytes-ok").unwrap();
+        let valid_tar = pack_host_path_to_tar(&src_dir, 64 * 1024).unwrap();
+
+        mgr.copy_in_tar_bytes(&lease.id, "/workspace".to_owned(), valid_tar.clone())
+            .await
+            .unwrap();
+        {
+            let st = lock_unpoisoned(&vm.state);
+            let sess = st.sessions.last().unwrap();
+            assert_eq!(
+                *lock_unpoisoned(&sess.copied_in),
+                vec![("/workspace".to_owned(), valid_tar.clone())]
+            );
+            *lock_unpoisoned(&sess.copy_out_archive) = valid_tar.clone();
+        }
+        let out_tar = mgr
+            .copy_out_tar_bytes(&lease.id, "/workspace".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(out_tar, valid_tar);
+
+        // Malicious traversal tar must be rejected BEFORE forwarding to session.
+        let mut evil_header = tar::Header::new_gnu();
+        evil_header.set_entry_type(tar::EntryType::Symlink);
+        evil_header.set_size(0);
+        evil_header.set_mode(0o777);
+        let raw_hdr = evil_header.as_mut_bytes();
+        raw_hdr[..3].copy_from_slice(b"sym");
+        raw_hdr[157..168].copy_from_slice(b"/etc/passwd");
+        evil_header.set_cksum();
+        let mut evil_tar = evil_header.as_bytes().to_vec();
+        evil_tar.resize(evil_tar.len() + 1024, 0);
+
+        let sessions_before = lock_unpoisoned(&vm.state).sessions.len();
+        assert_eq!(sessions_before, 1);
+        assert!(matches!(
+            mgr.copy_in_tar_bytes(&lease.id, "/workspace".to_owned(), evil_tar.clone())
+                .await,
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        // Only the 1 valid archive was forwarded to the mock VM session.
+        let copied_count = {
+            let st = lock_unpoisoned(&vm.state);
+            let sess = st.sessions.last().unwrap();
+            let count = lock_unpoisoned(&sess.copied_in).len();
+            count
+        };
+        assert_eq!(copied_count, 1);
+
+        // Compromised guest returning malicious symlink tar on copy_out must also be rejected.
+        {
+            let st = lock_unpoisoned(&vm.state);
+            let sess = st.sessions.last().unwrap();
+            *lock_unpoisoned(&sess.copy_out_archive) = evil_tar;
+        }
+        assert!(matches!(
+            mgr.copy_out_tar_bytes(&lease.id, "/workspace".to_owned())
+                .await,
+            Err(SandboxError::PolicyViolation(_))
+        ));
+
+        mgr.destroy(&lease.id).await.unwrap();
+        assert!(mgr.active_sandbox_ids().is_empty());
+        assert!(matches!(
+            mgr.active_sandbox_network(&lease.id),
+            Err(SandboxError::NotFound(_))
+        ));
     }
 }

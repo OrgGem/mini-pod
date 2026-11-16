@@ -236,36 +236,7 @@ pub fn extract_tar_safely(
             .map_err(|err| SandboxError::InvalidSpec(format!("invalid tar entry: {err}")))?;
         let entry_type = entry.header().entry_type();
         let raw_path_bytes = entry.path_bytes().into_owned();
-
-        let is_dir = match entry_type {
-            tar::EntryType::Directory => true,
-            tar::EntryType::Regular => false,
-            tar::EntryType::Symlink => {
-                return Err(SandboxError::PolicyViolation(
-                    "refusing tar symlink entry".to_owned(),
-                ));
-            }
-            tar::EntryType::Link => {
-                return Err(SandboxError::PolicyViolation(
-                    "refusing tar hardlink entry".to_owned(),
-                ));
-            }
-            tar::EntryType::Fifo
-            | tar::EntryType::Char
-            | tar::EntryType::Block
-            | tar::EntryType::Continuous => {
-                return Err(SandboxError::PolicyViolation(format!(
-                    "refusing forbidden tar entry type {entry_type:?}"
-                )));
-            }
-            other => {
-                return Err(SandboxError::PolicyViolation(format!(
-                    "refusing unsupported tar entry type {other:?}"
-                )));
-            }
-        };
-
-        let rel_segments = validate_tar_entry_segments(&raw_path_bytes, is_dir)?;
+        let (is_dir, rel_segments) = validate_entry_type_and_path(entry_type, &raw_path_bytes)?;
 
         if is_dir {
             if let Some(segments) = rel_segments {
@@ -345,6 +316,128 @@ pub fn extract_tar_safely(
     }
 
     Ok(total_extracted)
+}
+
+/// Validates an in-memory tar archive without touching disk, enforcing `max_entries`, `max_bytes`,
+/// strict relative UTF-8 paths, `Regular`/`Directory` entry-type allowlisting, and payload completeness.
+pub fn validate_tar_bytes(
+    tar_bytes: &[u8],
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<u64, SandboxError> {
+    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
+    let entries = archive
+        .entries()
+        .map_err(|err| SandboxError::InvalidSpec(format!("invalid tar archive header: {err}")))?;
+
+    let mut total_validated: u64 = 0;
+    let mut drain_buf = vec![0u8; COPY_IO_BUFFER_BYTES];
+
+    for (entry_count, entry_res) in entries.enumerate() {
+        if entry_count >= max_entries {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "tar entry count exceeds max_entries ({max_entries})"
+            )));
+        }
+
+        let mut entry = entry_res
+            .map_err(|err| SandboxError::InvalidSpec(format!("invalid tar entry: {err}")))?;
+        let entry_type = entry.header().entry_type();
+        let raw_path_bytes = entry.path_bytes().into_owned();
+        let (is_dir, rel_segments) = validate_entry_type_and_path(entry_type, &raw_path_bytes)?;
+
+        if is_dir {
+            continue;
+        }
+
+        let segments = rel_segments.ok_or_else(|| {
+            SandboxError::PolicyViolation(
+                "tar regular file entry cannot target destination root '.'".to_owned(),
+            )
+        })?;
+        let header_size = entry
+            .header()
+            .size()
+            .map_err(|err| SandboxError::InvalidSpec(format!("invalid tar entry size: {err}")))?;
+        let declared_size = entry.size().max(header_size);
+        let remaining = max_bytes.saturating_sub(total_validated);
+        if declared_size > remaining {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "tar entry size {declared_size} bytes exceeds remaining max_bytes budget ({remaining})"
+            )));
+        }
+
+        let mut read_bytes: u64 = 0;
+        let mut limited = (&mut entry).take(remaining.saturating_add(1));
+        loop {
+            let n = limited.read(&mut drain_buf).map_err(|err| {
+                SandboxError::InvalidSpec(format!(
+                    "failed reading tar payload for '{}': {err}",
+                    segments.join("/")
+                ))
+            })?;
+            if n == 0 {
+                break;
+            }
+            read_bytes = read_bytes
+                .checked_add(n as u64)
+                .ok_or_else(|| SandboxError::BudgetExceeded("tar byte count overflow".to_owned()))?;
+            if read_bytes > remaining {
+                return Err(SandboxError::BudgetExceeded(format!(
+                    "tar payload exceeded max_bytes ({max_bytes})"
+                )));
+            }
+        }
+
+        if read_bytes != declared_size {
+            return Err(SandboxError::InvalidSpec(format!(
+                "truncated tar entry '{}': expected {declared_size} bytes, got {read_bytes}",
+                segments.join("/")
+            )));
+        }
+
+        total_validated = total_validated
+            .checked_add(read_bytes)
+            .ok_or_else(|| SandboxError::BudgetExceeded("tar byte count overflow".to_owned()))?;
+    }
+
+    Ok(total_validated)
+}
+
+fn validate_entry_type_and_path(
+    entry_type: tar::EntryType,
+    raw_path_bytes: &[u8],
+) -> Result<(bool, Option<Vec<String>>), SandboxError> {
+    let is_dir = match entry_type {
+        tar::EntryType::Directory => true,
+        tar::EntryType::Regular => false,
+        tar::EntryType::Symlink => {
+            return Err(SandboxError::PolicyViolation(
+                "refusing tar symlink entry".to_owned(),
+            ));
+        }
+        tar::EntryType::Link => {
+            return Err(SandboxError::PolicyViolation(
+                "refusing tar hardlink entry".to_owned(),
+            ));
+        }
+        tar::EntryType::Fifo
+        | tar::EntryType::Char
+        | tar::EntryType::Block
+        | tar::EntryType::Continuous => {
+            return Err(SandboxError::PolicyViolation(format!(
+                "refusing forbidden tar entry type {entry_type:?}"
+            )));
+        }
+        other => {
+            return Err(SandboxError::PolicyViolation(format!(
+                "refusing unsupported tar entry type {other:?}"
+            )));
+        }
+    };
+
+    let rel_segments = validate_tar_entry_segments(raw_path_bytes, is_dir)?;
+    Ok((is_dir, rel_segments))
 }
 
 fn collect_dir_plan(
@@ -1361,5 +1454,59 @@ mod tests {
         }
 
         assert_eq!(measure_dir_bytes(&root).unwrap(), 120 + 345);
+    }
+
+    #[test]
+    fn validate_tar_bytes_accepts_valid_and_rejects_traversal_links_and_budget() {
+        let tmp = TestTempDir::new("validate-tar-bytes");
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), vec![b'a'; 60]).unwrap();
+        fs::write(src.join("sub").join("b.txt"), vec![b'b'; 60]).unwrap();
+
+        let valid_tar = pack_host_path_to_tar(&src, 64 * 1024).unwrap();
+        assert_eq!(validate_tar_bytes(&valid_tar, 64 * 1024, 32).unwrap(), 120);
+
+        for bad_path in [b"../escape.txt".as_slice(), b"/etc/passwd".as_slice(), b"sub\\evil.txt".as_slice()] {
+            let tar = make_raw_tar(&[(bad_path, tar::EntryType::Regular, b"pwn", None)]);
+            assert!(matches!(
+                validate_tar_bytes(&tar, 64 * 1024, 16),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        for bad_type in [
+            (b"sym".as_slice(), tar::EntryType::Symlink, b"".as_slice(), Some(b"/etc/passwd".as_slice())),
+            (b"hard".as_slice(), tar::EntryType::Link, b"".as_slice(), Some(b"a.txt".as_slice())),
+            (b"fifo".as_slice(), tar::EntryType::Fifo, b"".as_slice(), None),
+        ] {
+            let tar = make_raw_tar(&[bad_type]);
+            assert!(matches!(
+                validate_tar_bytes(&tar, 64 * 1024, 16),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        assert!(matches!(
+            validate_tar_bytes(&valid_tar, 100, 16),
+            Err(SandboxError::BudgetExceeded(_))
+        ));
+        assert!(matches!(
+            validate_tar_bytes(&valid_tar, 64 * 1024, 1),
+            Err(SandboxError::BudgetExceeded(_))
+        ));
+
+        let mut trunc_header = tar::Header::new_gnu();
+        trunc_header.set_entry_type(tar::EntryType::Regular);
+        trunc_header.set_path("trunc.bin").unwrap();
+        trunc_header.set_size(100);
+        trunc_header.set_mode(0o644);
+        trunc_header.set_cksum();
+        let mut trunc_tar = trunc_header.as_bytes().to_vec();
+        trunc_tar.extend_from_slice(&[0x11u8; 32]);
+        assert!(matches!(
+            validate_tar_bytes(&trunc_tar, 1024, 16),
+            Err(SandboxError::InvalidSpec(_))
+        ));
     }
 }

@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 sandbox-core = { workspace = true }
 sandbox-client = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }

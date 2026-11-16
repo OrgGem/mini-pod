@@ -40,7 +40,7 @@ pub use ports::{
     DiskOverlayPort, PreparedOverlay, SandboxTunnelPort, VmBootConfig, VmBootOutcome, VmRuntimePort,
     VmSessionPort,
 };
-pub use safe_tar::{extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar};
+pub use safe_tar::{extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar, validate_tar_bytes};
 pub use tunnel::{TunnelStream, TunnelStreamHandle};
 pub use warm_pool::{WarmPoolConfig, WarmPoolKey, WarmPoolStats};
 
