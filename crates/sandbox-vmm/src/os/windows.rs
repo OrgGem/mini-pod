@@ -5,8 +5,9 @@
 use std::ffi::{c_void, OsStr};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, zeroed, ManuallyDrop};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::RawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -14,10 +15,11 @@ use std::sync::Once;
 use std::time::Duration;
 
 use sandbox_core::SandboxError;
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, BOOL, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
-    HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, BOOL, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
+    ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Networking::WinSock::{
     accept, bind, closesocket, connect, listen, recv, select, send, setsockopt, shutdown, socket,
@@ -31,19 +33,22 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation, ImpersonateLoggedOnUser,
+    RevertToSelf, SecurityImpersonation, TokenImpersonation, TokenUser, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FindClose, FindFirstFileW, FlushFileBuffers,
     GetFileAttributesW, ReadFile, WriteFile, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL,
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -75,6 +80,11 @@ impl OwnedHandle {
 
     pub(crate) fn as_raw(&self) -> HANDLE {
         self.0
+    }
+
+    pub(crate) fn into_raw(self) -> HANDLE {
+        let handle = ManuallyDrop::new(self);
+        handle.0
     }
 }
 
@@ -545,16 +555,7 @@ fn select_socket_ready(sock: SOCKET, for_write: bool, timeout: Duration) -> io::
     Ok(ready > 0)
 }
 
-/// Returns the current process user's SID string (e.g. `S-1-5-21-...`).
-pub fn current_user_sid_string() -> Result<String, SandboxError> {
-    let mut raw_token: HANDLE = ptr::null_mut();
-    // SAFETY: `GetCurrentProcess()` returns a pseudo-handle that does not need closing; `raw_token` receives the owned token handle.
-    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
-    if ok == 0 {
-        return Err(win32_error("OpenProcessToken"));
-    }
-    let token = OwnedHandle::from_raw(raw_token)?;
-
+fn query_token_user_buf(token: &OwnedHandle) -> Result<Vec<usize>, SandboxError> {
     let mut needed: u32 = 0;
     // SAFETY: Probing required buffer length with null buffer and zero length.
     unsafe {
@@ -591,8 +592,20 @@ pub fn current_user_sid_string() -> Result<String, SandboxError> {
             "GetTokenInformation(TokenUser) returned truncated buffer".to_owned(),
         ));
     }
+    Ok(buf)
+}
 
-    // SAFETY: `GetTokenInformation` succeeded and `returned >= size_of::<TOKEN_USER>()`.
+/// Returns the current process user's SID string (e.g. `S-1-5-21-...`).
+pub fn current_user_sid_string() -> Result<String, SandboxError> {
+    let mut raw_token: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentProcess()` returns a pseudo-handle that does not need closing; `raw_token` receives the owned token handle.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+    if ok == 0 {
+        return Err(win32_error("OpenProcessToken"));
+    }
+    let token = OwnedHandle::from_raw(raw_token)?;
+    let buf = query_token_user_buf(&token)?;
+    // SAFETY: `query_token_user_buf` verified `returned >= size_of::<TOKEN_USER>()` and `usize` alignment.
     let token_user = unsafe { &*(buf.as_ptr().cast::<TOKEN_USER>()) };
     sid_to_string(token_user.User.Sid)
 }
@@ -606,9 +619,11 @@ pub fn owner_only_sddl(user_sid: &str, inherit: bool) -> String {
     }
 }
 
-/// Creates a server Named Pipe (`\\.\pipe\<pipe_name>`) with `FILE_FLAG_FIRST_PIPE_INSTANCE`
-/// and a protected owner-only DACL (`D:P(A;;GA;;;{user_sid})`).
-pub fn create_owner_only_named_pipe(pipe_name: &str) -> Result<OwnedNamedPipe, SandboxError> {
+fn create_owner_only_named_pipe_raw(
+    pipe_name: &str,
+    open_mode_flags: u32,
+    max_instances: u32,
+) -> Result<(OwnedHandle, String), SandboxError> {
     validate_pipe_name(pipe_name)?;
     let user_sid = current_user_sid_string()?;
     let sddl = owner_only_sddl(&user_sid, false);
@@ -626,9 +641,9 @@ pub fn create_owner_only_named_pipe(pipe_name: &str) -> Result<OwnedNamedPipe, S
     let raw = unsafe {
         CreateNamedPipeW(
             wide_path.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
+            PIPE_ACCESS_DUPLEX | open_mode_flags,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            max_instances,
             PIPE_BUFFER_BYTES,
             PIPE_BUFFER_BYTES,
             0,
@@ -641,7 +656,184 @@ pub fn create_owner_only_named_pipe(pipe_name: &str) -> Result<OwnedNamedPipe, S
         ))
     })?;
 
+    Ok((handle, pipe_path))
+}
+
+/// Creates a server Named Pipe (`\\.\pipe\<pipe_name>`) with `FILE_FLAG_FIRST_PIPE_INSTANCE`
+/// and a protected owner-only DACL (`D:P(A;;GA;;;{user_sid})`).
+pub fn create_owner_only_named_pipe(pipe_name: &str) -> Result<OwnedNamedPipe, SandboxError> {
+    let (handle, pipe_path) =
+        create_owner_only_named_pipe_raw(pipe_name, FILE_FLAG_FIRST_PIPE_INSTANCE, 1)?;
     Ok(OwnedNamedPipe { handle, pipe_path })
+}
+
+/// Creates an asynchronous overlapped server Named Pipe instance (`\\.\pipe\<pipe_name>`)
+/// bound with `PIPE_REJECT_REMOTE_CLIENTS`, `PIPE_UNLIMITED_INSTANCES` (255), and a protected
+/// owner-only DACL (`D:P(A;;GA;;;{user_sid})`), wrapped as a Tokio [`NamedPipeServer`].
+pub fn create_owner_only_async_named_pipe(
+    pipe_name: &str,
+    first_instance: bool,
+) -> Result<NamedPipeServer, SandboxError> {
+    validate_pipe_name(pipe_name)?;
+    tokio::runtime::Handle::try_current().map_err(|err| {
+        SandboxError::Transport(format!(
+            "create_owner_only_async_named_pipe('{pipe_name}') requires an active Tokio runtime: {err}"
+        ))
+    })?;
+    let open_flags = FILE_FLAG_OVERLAPPED
+        | if first_instance {
+            FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            0
+        };
+    let (handle, pipe_path) =
+        create_owner_only_named_pipe_raw(pipe_name, open_flags, PIPE_UNLIMITED_INSTANCES)?;
+    let raw_handle = handle.into_raw();
+    // SAFETY: `raw_handle` is a newly created, uniquely owned overlapped server Named Pipe handle
+    // not yet registered with any I/O completion port. `NamedPipeServer::from_raw_handle`
+    // unconditionally wraps `raw_handle` in `mio::windows::NamedPipe` (`Handle::new`) before
+    // `PollEvented::new`, so it closes the handle even if Tokio registration returns `Err`.
+    unsafe { NamedPipeServer::from_raw_handle(raw_handle as RawHandle) }.map_err(|err| {
+        SandboxError::Transport(format!(
+            "NamedPipeServer::from_raw_handle('{pipe_path}') failed: {err}"
+        ))
+    })
+}
+
+/// Verifies against the Windows kernel that a restricted token with the owner's user SID disabled
+/// (while keeping all non-owner group SIDs active) receives `ERROR_ACCESS_DENIED` when opening
+/// `\\.\pipe\<pipe_name>`.
+///
+/// Runs impersonation strictly on a dedicated ephemeral OS worker thread so the caller thread's
+/// security token is never modified.
+pub fn verify_non_owner_named_pipe_denied(pipe_name: &str) -> Result<(), SandboxError> {
+    validate_pipe_name(pipe_name)?;
+    let owned_name = pipe_name.to_owned();
+    let handle = std::thread::Builder::new()
+        .name("minipod-pipe-acl-probe".to_owned())
+        .spawn(move || verify_non_owner_named_pipe_denied_on_worker(&owned_name))
+        .map_err(|err| {
+            SandboxError::Internal(format!(
+                "failed to spawn Windows named pipe ACL probe thread: {err}"
+            ))
+        })?;
+
+    handle.join().map_err(|_| {
+        SandboxError::Internal("Windows named pipe ACL probe thread panicked".to_owned())
+    })?
+}
+
+fn verify_non_owner_named_pipe_denied_on_worker(pipe_name: &str) -> Result<(), SandboxError> {
+    struct RevertToSelfGuard;
+    impl Drop for RevertToSelfGuard {
+        fn drop(&mut self) {
+            // SAFETY: Restores the worker thread's security context on every return/panic path.
+            let _ = unsafe { RevertToSelf() };
+        }
+    }
+
+    let mut raw_process_token: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentProcess()` returns a pseudo-handle; `raw_process_token` receives an owned token handle.
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY,
+            &mut raw_process_token,
+        )
+    };
+    if ok == 0 {
+        return Err(win32_error("OpenProcessToken(TOKEN_DUPLICATE | TOKEN_QUERY)"));
+    }
+    let process_token = OwnedHandle::from_raw(raw_process_token)?;
+    let token_user_buf = query_token_user_buf(&process_token)?;
+    // SAFETY: `query_token_user_buf` verified alignment and size for `TOKEN_USER`.
+    let token_user = unsafe { &*(token_user_buf.as_ptr().cast::<TOKEN_USER>()) };
+    let sids_to_disable = [SID_AND_ATTRIBUTES {
+        Sid: token_user.User.Sid,
+        Attributes: 0,
+    }];
+
+    let mut raw_restricted: HANDLE = ptr::null_mut();
+    // SAFETY: `process_token` is valid; `sids_to_disable` points into `token_user_buf` which outlives this call.
+    let ok = unsafe {
+        CreateRestrictedToken(
+            process_token.as_raw(),
+            0,
+            sids_to_disable.len() as u32,
+            sids_to_disable.as_ptr(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            &mut raw_restricted,
+        )
+    };
+    if ok == 0 {
+        return Err(win32_error("CreateRestrictedToken"));
+    }
+    let restricted_token = OwnedHandle::from_raw(raw_restricted)?;
+
+    let mut raw_imp: HANDLE = ptr::null_mut();
+    // SAFETY: `restricted_token` is an owned primary token duplicated into a `SecurityImpersonation` impersonation token.
+    let ok = unsafe {
+        DuplicateTokenEx(
+            restricted_token.as_raw(),
+            TOKEN_IMPERSONATE | TOKEN_QUERY,
+            ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut raw_imp,
+        )
+    };
+    if ok == 0 {
+        return Err(win32_error("DuplicateTokenEx(TokenImpersonation)"));
+    }
+    let imp_token = OwnedHandle::from_raw(raw_imp)?;
+
+    let pipe_path = format!(r"\\.\pipe\{pipe_name}");
+    let wide_path = to_wide_null(OsStr::new(&pipe_path))?;
+
+    // SAFETY: `imp_token` is an owned impersonation token; immediately guarded by `RevertToSelfGuard`.
+    let ok = unsafe { ImpersonateLoggedOnUser(imp_token.as_raw()) };
+    if ok == 0 {
+        return Err(win32_error("ImpersonateLoggedOnUser"));
+    }
+    let _revert_guard = RevertToSelfGuard;
+
+    // SAFETY: `wide_path` is NUL-terminated; handle is non-inheritable.
+    let raw = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            ptr::null_mut(),
+        )
+    };
+    if raw != INVALID_HANDLE_VALUE {
+        if !raw.is_null() {
+            // SAFETY: `raw` is a valid opened handle that must be closed immediately.
+            unsafe {
+                CloseHandle(raw);
+            }
+        }
+        return Err(SandboxError::PolicyViolation(format!(
+            "restricted non-owner token was unexpectedly permitted to open named pipe '{pipe_path}'"
+        )));
+    }
+
+    // SAFETY: Reading thread-local Win32 error immediately after `CreateFileW` returned `INVALID_HANDLE_VALUE`.
+    let err = unsafe { GetLastError() };
+    if err == ERROR_ACCESS_DENIED {
+        Ok(())
+    } else {
+        Err(SandboxError::Transport(format!(
+            "expected ERROR_ACCESS_DENIED (5) probing named pipe '{pipe_path}' as restricted non-owner, got Win32 error {err}: {}",
+            io::Error::from_raw_os_error(err as i32)
+        )))
+    }
 }
 
 /// Connects to an existing local Named Pipe (`\\.\pipe\<pipe_name>`) using `SECURITY_IDENTIFICATION`
@@ -732,12 +924,12 @@ pub fn create_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn inspect_object_sddl(handle: &OwnedHandle) -> Result<String, SandboxError> {
+fn inspect_raw_handle_sddl(raw_handle: HANDLE) -> Result<String, SandboxError> {
     let mut raw_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `handle` is an open Win32 handle; `GetSecurityInfo` allocates `raw_sd` via `LocalAlloc`.
+    // SAFETY: `raw_handle` is an open Win32 kernel handle; `GetSecurityInfo` allocates `raw_sd` via `LocalAlloc`.
     let status = unsafe {
         GetSecurityInfo(
-            handle.as_raw(),
+            raw_handle,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -755,6 +947,10 @@ fn inspect_object_sddl(handle: &OwnedHandle) -> Result<String, SandboxError> {
     }
     let _sd_guard = LocalAllocGuard(raw_sd);
     sd_to_dacl_sddl(raw_sd)
+}
+
+fn inspect_object_sddl(handle: &OwnedHandle) -> Result<String, SandboxError> {
+    inspect_raw_handle_sddl(handle.as_raw())
 }
 
 /// Inspects the DACL SDDL string for a filesystem path (including `AF_UNIX` socket files).
@@ -1242,6 +1438,163 @@ mod tests {
         fs::create_dir(&insecure_dir).expect("create standard inherited temp dir");
         assert!(matches!(
             create_owner_only_dir(&insecure_dir),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_named_pipe_supports_multiple_clients_blocks_squatting_and_denies_restricted_non_owner(
+    ) {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
+        use tokio::sync::Barrier;
+
+        let user_sid = current_user_sid_string().expect("current user SID");
+        let pipe_name = unique_pipe_name("async");
+        let pipe_path = format!(r"\\.\pipe\{pipe_name}");
+
+        let server1 =
+            create_owner_only_async_named_pipe(&pipe_name, true).expect("create first pipe instance");
+
+        let sddl = inspect_raw_handle_sddl(server1.as_raw_handle().cast())
+            .expect("inspect async pipe SDDL");
+        validate_owner_only_dacl(&sddl, &user_sid, true, &pipe_path)
+            .expect("async pipe DACL must grant access strictly to owner SID");
+        for forbidden in ["WD", "AN", "BU", "AU", "SY", "BA"] {
+            assert!(
+                !sddl.contains(forbidden),
+                "async pipe SDDL '{sddl}' must not contain '{forbidden}'"
+            );
+        }
+
+        // Duplicate first_instance=true must fail to block squatting / replacement servers.
+        assert!(matches!(
+            create_owner_only_async_named_pipe(&pipe_name, true),
+            Err(SandboxError::Transport(_))
+        ));
+
+        // Second concurrent instance with first_instance=false must succeed.
+        let server2 = create_owner_only_async_named_pipe(&pipe_name, false)
+            .expect("create second pipe instance");
+
+        // Kernel must reject a restricted non-owner token with ERROR_ACCESS_DENIED (5).
+        verify_non_owner_named_pipe_denied(&pipe_name)
+            .expect("kernel must deny restricted non-owner token");
+
+        let mut client1 = ClientOptions::new()
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&pipe_path)
+            .expect("open async pipe client 1");
+        let mut client2 = ClientOptions::new()
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&pipe_path)
+            .expect("open async pipe client 2");
+
+        let barrier = Arc::new(Barrier::new(2));
+        async fn serve_echo(
+            mut server: NamedPipeServer,
+            barrier: Arc<Barrier>,
+        ) -> io::Result<()> {
+            server.connect().await?;
+            let mut req = [0u8; 8];
+            server.read_exact(&mut req).await?;
+            // Ensure both server instances hold live concurrent client sessions simultaneously.
+            barrier.wait().await;
+            let mut resp = [0u8; 13];
+            resp[..5].copy_from_slice(b"echo:");
+            resp[5..].copy_from_slice(&req);
+            server.write_all(&resp).await?;
+            server.flush().await
+        }
+
+        let s1 = tokio::spawn(serve_echo(server1, Arc::clone(&barrier)));
+        let s2 = tokio::spawn(serve_echo(server2, barrier));
+
+        let c1 = tokio::spawn(async move {
+            client1.write_all(b"client-1").await?;
+            let mut resp = [0u8; 13];
+            client1.read_exact(&mut resp).await?;
+            assert_eq!(&resp, b"echo:client-1");
+            io::Result::Ok(())
+        });
+        let c2 = tokio::spawn(async move {
+            client2.write_all(b"client-2").await?;
+            let mut resp = [0u8; 13];
+            client2.read_exact(&mut resp).await?;
+            assert_eq!(&resp, b"echo:client-2");
+            io::Result::Ok(())
+        });
+
+        let (r_s1, r_s2, r_c1, r_c2) = tokio::join!(s1, s2, c1, c2);
+        r_s1.expect("server task 1 join").expect("server task 1 io");
+        r_s2.expect("server task 2 join").expect("server task 2 io");
+        r_c1.expect("client task 1 join").expect("client task 1 io");
+        r_c2.expect("client task 2 join").expect("client task 2 io");
+    }
+
+    #[test]
+    fn async_named_pipe_closes_handle_if_tokio_registration_fails() {
+        let pipe_name = unique_pipe_name("no-rt");
+        // Calling outside any Tokio runtime must return a clean Transport error without panicking.
+        assert!(matches!(
+            create_owner_only_async_named_pipe(&pipe_name, true),
+            Err(SandboxError::Transport(_))
+        ));
+
+        // Inside a Tokio runtime without an I/O driver (`enable_io` omitted), CreateNamedPipeW
+        // succeeds and NamedPipeServer::from_raw_handle unwinds inside PollEvented::new;
+        // mio's OwnedHandle drop must still close the pipe handle without leaking.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build Tokio runtime without IO driver");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = rt.enter();
+            create_owner_only_async_named_pipe(&pipe_name, true)
+        }));
+        assert!(
+            matches!(res, Err(_) | Ok(Err(SandboxError::Transport(_)))),
+            "expected registration failure without Tokio IO driver"
+        );
+        let _sync_server = create_owner_only_named_pipe(&pipe_name)
+            .expect("handle must not leak when NamedPipeServer::from_raw_handle fails");
+    }
+
+    #[test]
+    fn verify_non_owner_named_pipe_denied_detects_permissive_dacl_and_missing_pipe() {
+        let missing_name = unique_pipe_name("missing");
+        assert!(matches!(
+            verify_non_owner_named_pipe_denied(&missing_name),
+            Err(SandboxError::Transport(_))
+        ));
+
+        let weak_name = unique_pipe_name("weak-wd");
+        let pipe_path = format!(r"\\.\pipe\{weak_name}");
+        let wide_path = to_wide_null(OsStr::new(&pipe_path)).expect("wide pipe path");
+        let sd = sddl_to_security_descriptor("D:P(A;;GA;;;WD)").expect("world-allow SDDL");
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.as_ptr(),
+            bInheritHandle: 0,
+        };
+        // SAFETY: `wide_path` is NUL-terminated and `sa` points to a valid `SECURITY_DESCRIPTOR`.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide_path.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                PIPE_BUFFER_BYTES,
+                PIPE_BUFFER_BYTES,
+                0,
+                &sa,
+            )
+        };
+        let _weak_pipe = OwnedHandle::from_raw(raw).expect("create weak test pipe");
+
+        assert!(matches!(
+            verify_non_owner_named_pipe_denied(&weak_name),
             Err(SandboxError::PolicyViolation(_))
         ));
     }

@@ -20,6 +20,10 @@ pub use ipc::{
     validate_pipe_name, validate_socket_path, AgentIpcEndpoint, IpcListener, IpcReadHalf,
     IpcStream, IpcWriteHalf, MAX_UNIX_SOCKET_PATH_BYTES,
 };
+#[cfg(unix)]
+pub use ipc::{verify_non_owner_unix_socket_denied, CrossUserIpcCheck};
+#[cfg(windows)]
+pub use ipc::{create_owner_only_async_named_pipe, verify_non_owner_named_pipe_denied};
 pub use launch::{QemuLaunchConfig, AGENT_VIRTIO_PORT_NAME};
 pub use process::{
     kill_verified_orphan_process, millicores_to_windows_cpu_rate, parse_proc_self_cgroup_v2,

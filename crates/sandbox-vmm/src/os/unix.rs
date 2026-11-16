@@ -4,6 +4,8 @@
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read, Write};
+use std::mem::zeroed;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{
     DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
@@ -11,6 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,23 +31,16 @@ use crate::process::{
 };
 pub use crate::process::{parse_proc_self_cgroup_v2, parse_proc_statm_rss_bytes};
 
-/// Ensures `path` exists as a non-symlink directory owned by the current user with `0700` mode.
-///
-/// Creates the directory with mode `0700` if missing; if it already exists, inspects
-/// `symlink_metadata` and rejects symlinks, non-directories, non-`0700` permissions, and
-/// mismatched owner UIDs.
-pub fn ensure_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
-    match DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(err) => {
-            return Err(SandboxError::Transport(format!(
-                "failed to create owner-only directory '{}': {err}",
-                path.display()
-            )));
-        }
-    }
+/// Outcome of probing kernel cross-user access denial on an owner-only Unix domain socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossUserIpcCheck {
+    /// OS kernel rejected `connect()` from the unprivileged UID/GID with `EACCES`.
+    KernelRejectedAccess,
+    /// Current process is unprivileged (`geteuid() != 0`) and cannot drop to a second UID/GID.
+    SkippedUnprivilegedNoSetuid { reason: String },
+}
 
+fn validate_owner_only_dir_metadata(path: &Path) -> Result<u32, SandboxError> {
     let meta = fs::symlink_metadata(path).map_err(|err| {
         SandboxError::Transport(format!(
             "failed to inspect directory '{}': {err}",
@@ -83,7 +79,252 @@ pub fn ensure_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
         )));
     }
 
-    Ok(())
+    Ok(expected_uid)
+}
+
+/// Ensures `path` exists as a non-symlink directory owned by the current user with `0700` mode.
+///
+/// Creates the directory with mode `0700` if missing; if it already exists, inspects
+/// `symlink_metadata` and rejects symlinks, non-directories, non-`0700` permissions, and
+/// mismatched owner UIDs.
+pub fn ensure_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(SandboxError::Transport(format!(
+                "failed to create owner-only directory '{}': {err}",
+                path.display()
+            )));
+        }
+    }
+
+    validate_owner_only_dir_metadata(path).map(|_| ())
+}
+
+/// Verifies that `socket_path` sits in a non-symlink `0700` owner-only directory, is a
+/// non-symlink `0600` socket owned by the current user, and—when running as root
+/// (`geteuid() == 0`)—is rejected with `EACCES` (13) by the OS kernel when a forked
+/// unprivileged child (`unprivileged_uid`/`unprivileged_gid`, cleared supplementary groups)
+/// attempts `connect(AF_UNIX)`.
+pub fn verify_non_owner_unix_socket_denied(
+    socket_path: &Path,
+    unprivileged_uid: u32,
+    unprivileged_gid: u32,
+) -> Result<CrossUserIpcCheck, SandboxError> {
+    validate_socket_path(socket_path)?;
+    let parent = socket_path.parent().ok_or_else(|| {
+        SandboxError::InvalidSpec(format!(
+            "socket path '{}' must have a parent runtime directory",
+            socket_path.display()
+        ))
+    })?;
+    let owner_uid = validate_owner_only_dir_metadata(parent)?;
+
+    let sock_meta = fs::symlink_metadata(socket_path).map_err(|err| {
+        SandboxError::Transport(format!(
+            "failed to inspect Unix socket '{}': {err}",
+            socket_path.display()
+        ))
+    })?;
+    if sock_meta.file_type().is_symlink() {
+        return Err(SandboxError::PolicyViolation(format!(
+            "refusing Unix socket '{}': symlinks are not allowed",
+            socket_path.display()
+        )));
+    }
+    if !sock_meta.file_type().is_socket() {
+        return Err(SandboxError::PolicyViolation(format!(
+            "refusing Unix socket '{}': path exists and is not a Unix domain socket",
+            socket_path.display()
+        )));
+    }
+    let sock_mode = sock_meta.mode() & 0o777;
+    if sock_mode != 0o600 {
+        return Err(SandboxError::PolicyViolation(format!(
+            "Unix socket '{}' has insecure permissions {:04o}, expected 0600",
+            socket_path.display(),
+            sock_mode
+        )));
+    }
+    if sock_meta.uid() != owner_uid {
+        return Err(SandboxError::PolicyViolation(format!(
+            "Unix socket '{}' is owned by uid {}, expected uid {}",
+            socket_path.display(),
+            sock_meta.uid(),
+            owner_uid
+        )));
+    }
+
+    // SAFETY: `geteuid()` is a thread-safe POSIX query returning the caller's effective UID.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        return Ok(CrossUserIpcCheck::SkippedUnprivilegedNoSetuid {
+            reason: format!(
+                "effective uid is {euid} (non-root); kernel cross-user probe for uid={unprivileged_uid} requires root/CAP_SETUID"
+            ),
+        });
+    }
+    if unprivileged_uid == euid || unprivileged_uid == owner_uid {
+        return Err(SandboxError::InvalidSpec(format!(
+            "unprivileged_uid ({unprivileged_uid}) must differ from owner uid ({owner_uid})"
+        )));
+    }
+
+    let path_bytes = socket_path.as_os_str().as_bytes();
+    // SAFETY: `libc::sockaddr_un` is a C POD struct zero-initialized before populating fields.
+    let mut addr: libc::sockaddr_un = unsafe { zeroed() };
+    if path_bytes.is_empty() || path_bytes.len() >= addr.sun_path.len() || path_bytes.contains(&0)
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "socket path '{}' ({} bytes) exceeds sun_path capacity ({} bytes max)",
+            socket_path.display(),
+            path_bytes.len(),
+            addr.sun_path.len().saturating_sub(1)
+        )));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, &byte) in addr.sun_path.iter_mut().zip(path_bytes.iter()) {
+        *dst = byte as libc::c_char;
+    }
+    let sun_path_offset = (&addr.sun_path as *const _ as usize) - (&addr as *const _ as usize);
+    let addr_len = (sun_path_offset + path_bytes.len() + 1) as libc::socklen_t;
+
+    // SAFETY: Child executes strictly async-signal-safe `libc` calls (`setgroups`, `setgid`,
+    // `setuid`, `socket`, `connect`, `close`, `_exit`) using stack-allocated `addr` with no
+    // heap allocations or mutexes.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(SandboxError::Internal(format!(
+            "fork() failed during Unix IPC cross-user probe: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    if pid == 0 {
+        // SAFETY: Freshly forked child branch; terminates unconditionally via `libc::_exit`.
+        unsafe {
+            unix_probe_child_exec(
+                unprivileged_uid as libc::uid_t,
+                unprivileged_gid as libc::gid_t,
+                &addr,
+                addr_len,
+            );
+        }
+    }
+
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: `pid > 0` is our newly forked child; `status` is valid stack storage.
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc == pid {
+            break;
+        }
+        if rc == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SandboxError::Internal(format!(
+                "waitpid({pid}) failed during Unix IPC cross-user probe: {err}"
+            )));
+        }
+    }
+
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        if code == libc::EACCES {
+            return Ok(CrossUserIpcCheck::KernelRejectedAccess);
+        }
+        if code == 0 {
+            return Err(SandboxError::PolicyViolation(format!(
+                "unprivileged uid={unprivileged_uid} gid={unprivileged_gid} unexpectedly connected to Unix socket '{}'",
+                socket_path.display()
+            )));
+        }
+        return Err(SandboxError::PolicyViolation(format!(
+            "expected kernel EACCES ({}) connecting to Unix socket '{}' as uid={unprivileged_uid} gid={unprivileged_gid}, child exited with code {code}",
+            libc::EACCES,
+            socket_path.display()
+        )));
+    }
+
+    Err(SandboxError::PolicyViolation(format!(
+        "Unix IPC cross-user probe child exited abnormally (status={status:#x})"
+    )))
+}
+
+unsafe fn unix_probe_child_exec(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    addr: &libc::sockaddr_un,
+    addr_len: libc::socklen_t,
+) -> ! {
+    // Distinct sentinel codes (251..=255) ensure setup errors never masquerade as EACCES (13).
+    const EXIT_SETGROUPS_FAILED: libc::c_int = 251;
+    const EXIT_SETGID_FAILED: libc::c_int = 252;
+    const EXIT_SETUID_FAILED: libc::c_int = 253;
+    const EXIT_SOCKET_FAILED: libc::c_int = 254;
+    const EXIT_UNEXPECTED_ERRNO: libc::c_int = 255;
+
+    if libc::setgroups(0, ptr::null()) != 0 {
+        libc::_exit(EXIT_SETGROUPS_FAILED);
+    }
+    if libc::setgid(gid) != 0 {
+        libc::_exit(EXIT_SETGID_FAILED);
+    }
+    if libc::setuid(uid) != 0 {
+        libc::_exit(EXIT_SETUID_FAILED);
+    }
+    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    if fd < 0 {
+        libc::_exit(EXIT_SOCKET_FAILED);
+    }
+    let rc = libc::connect(
+        fd,
+        (addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+        addr_len,
+    );
+    if rc == 0 {
+        let _ = libc::close(fd);
+        libc::_exit(0);
+    }
+    let err = current_errno();
+    let _ = libc::close(fd);
+    if err > 0 && err < 250 {
+        libc::_exit(err);
+    }
+    libc::_exit(EXIT_UNEXPECTED_ERRNO);
+}
+
+#[inline]
+unsafe fn current_errno() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        *libc::__errno_location()
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        *libc::__error()
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
 }
 
 /// Host-bound Unix domain stream listener for QEMU `-chardev socket,...,server=off`.
@@ -949,6 +1190,57 @@ mod tests {
         server.write_all(b"xyz").expect("server write");
         drop(server);
         client_thread.join().expect("client finishes");
+    }
+
+    #[test]
+    fn unix_control_socket_denies_second_user_when_running_as_root() {
+        let dir = CleanupDir::unique("xuser");
+        ensure_owner_only_dir(&dir.0).expect("create 0700 runtime dir");
+        let sock_path = dir.0.join("control.sock");
+
+        let _listener = UnixListener::bind(&sock_path).expect("bind UnixListener");
+        fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 control socket");
+
+        let outcome = verify_non_owner_unix_socket_denied(&sock_path, 65534, 65534)
+            .expect("verify non-owner access denial");
+        // SAFETY: `geteuid()` is a thread-safe POSIX query.
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(outcome, CrossUserIpcCheck::KernelRejectedAccess);
+        } else {
+            assert!(matches!(
+                outcome,
+                CrossUserIpcCheck::SkippedUnprivilegedNoSetuid { .. }
+            ));
+        }
+
+        // Permissive socket mode (0644) must be rejected immediately.
+        fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644 control socket");
+        assert!(matches!(
+            verify_non_owner_unix_socket_denied(&sock_path, 65534, 65534),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600))
+            .expect("restore 0600 control socket");
+
+        // Permissive parent directory mode (0755) must be rejected immediately.
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 runtime dir");
+        assert!(matches!(
+            verify_non_owner_unix_socket_denied(&sock_path, 65534, 65534),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700))
+            .expect("restore 0700 runtime dir");
+
+        // Symlink socket path must be rejected immediately.
+        let link_sock = dir.0.join("link.sock");
+        symlink(&sock_path, &link_sock).expect("create symlink to socket");
+        assert!(matches!(
+            verify_non_owner_unix_socket_denied(&link_sock, 65534, 65534),
+            Err(SandboxError::PolicyViolation(_))
+        ));
     }
 
     #[test]

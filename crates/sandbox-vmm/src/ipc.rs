@@ -25,8 +25,14 @@ use sandbox_core::SandboxError;
 
 #[cfg(unix)]
 use crate::os::unix::{UnixIpcListener, UnixIpcStream};
+#[cfg(unix)]
+pub use crate::os::unix::{verify_non_owner_unix_socket_denied, CrossUserIpcCheck};
 #[cfg(windows)]
 use crate::os::windows::{WindowsUnixListener, WindowsUnixStream};
+#[cfg(windows)]
+pub use crate::os::windows::{
+    create_owner_only_async_named_pipe, verify_non_owner_named_pipe_denied,
+};
 
 /// Maximum UTF-8 byte length for a portable `AF_UNIX` socket path (`sun_path` on macOS is
 /// 104 bytes including the trailing NUL terminator, so paths must be strictly `< 104` bytes).
