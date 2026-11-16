@@ -422,13 +422,11 @@ impl LocalRuntimeManager {
                 break;
             }
 
-            let warm_expires_ms = expires_at_unix_ms(boot_spec.lease_ttl);
             let booted = match self
                 .boot_sandbox_with_journal(
                     sandbox_id.clone(),
                     &boot_spec,
                     JournalLifecycleState::Warm,
-                    warm_expires_ms,
                 )
                 .await
             {
@@ -992,6 +990,7 @@ struct BootedSandbox {
     prepared: PreparedOverlay,
     artifact_paths: Vec<PathBuf>,
     capabilities: CapabilityReport,
+    expires_at: Instant,
     egress_rx: Option<tokio::sync::mpsc::Receiver<TunnelStream>>,
 }
 
@@ -1022,7 +1021,6 @@ impl LocalRuntimeManager {
         sandbox_id: SandboxId,
         spec: &SandboxSpec,
         target_state: JournalLifecycleState,
-        target_expires_ms: u64,
     ) -> Result<BootedSandbox, SandboxError> {
         let work_dir = self.sandboxes_dir.join(sandbox_id.as_str());
         let work_dir_for_create = work_dir.clone();
@@ -1118,6 +1116,8 @@ impl LocalRuntimeManager {
             std::slice::from_ref(&prepared.overlay_path),
             &work_dir,
         );
+        // Anchor lease expiry after VM boot succeeds so cold-boot latency does not consume `spec.lease_ttl`.
+        let target_expires_ms = expires_at_unix_ms(spec.lease_ttl);
 
         if let Err(err) = self
             .write_journal_async(JournalRecord {
@@ -1149,12 +1149,14 @@ impl LocalRuntimeManager {
             return Err(err);
         }
 
+        let expires_at = Instant::now() + spec.lease_ttl;
         Ok(BootedSandbox {
             session,
             work_dir,
             prepared,
             artifact_paths: all_artifacts,
             capabilities: boot.capabilities,
+            expires_at,
             egress_rx: boot.egress_rx,
         })
     }
@@ -1217,6 +1219,7 @@ impl LocalRuntimeManager {
             prepared: warm.prepared,
             artifact_paths: warm.artifact_paths,
             capabilities: warm.boot_capabilities,
+            expires_at,
             egress_rx,
         };
         let lease = self.register_active_sandbox(
@@ -1503,18 +1506,16 @@ impl RuntimeManager for LocalRuntimeManager {
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
-        let expires_at = Instant::now() + spec.lease_ttl;
-        let active_expires_ms = expires_at_unix_ms(spec.lease_ttl);
 
         let booted = self
             .boot_sandbox_with_journal(
                 sandbox_id.clone(),
                 &spec,
                 JournalLifecycleState::Active,
-                active_expires_ms,
             )
             .await?;
 
+        let expires_at = booted.expires_at;
         let lease =
             self.register_active_sandbox(sandbox_id, &spec, booted, expires_at, permit, false);
         self.warm_pool.record_cold_spawn();
@@ -2208,6 +2209,7 @@ mod tests {
     #[derive(Default)]
     struct MockVmRuntimeState {
         fail_boot: bool,
+        boot_delay: Option<Duration>,
         graceful_succeeds: bool,
         enable_egress_channel: bool,
         next_pid: u32,
@@ -2238,7 +2240,7 @@ mod tests {
     #[async_trait::async_trait]
     impl VmRuntimePort for MockVmRuntime {
         async fn boot_vm(&self, config: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
-            let (pid, token, graceful, fail, enable_egress) = {
+            let (pid, token, graceful, fail, boot_delay, enable_egress) = {
                 let mut st = lock_unpoisoned(&self.state);
                 st.next_pid += 1;
                 (
@@ -2246,9 +2248,13 @@ mod tests {
                     u64::from(st.next_pid) * 17,
                     st.graceful_succeeds,
                     st.fail_boot,
+                    st.boot_delay,
                     st.enable_egress_channel && config.spec.network != NetworkPolicy::Isolated,
                 )
             };
+            if let Some(delay) = boot_delay {
+                tokio::time::sleep(delay).await;
+            }
             if fail {
                 return Err(SandboxError::AccelerationUnavailable(
                     "simulated boot failure".into(),
@@ -4021,5 +4027,23 @@ mod tests {
             mgr.active_sandbox_network(&lease.id),
             Err(SandboxError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_anchors_lease_ttl_after_boot_completes() {
+        let tmp = TestTempDir::new("mgr-post-boot-ttl");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        lock_unpoisoned(&vm.state).boot_delay = Some(Duration::from_millis(90));
+        let mgr = LocalRuntimeManager::new(base_config(tmp.path().to_path_buf()), overlay, vm)
+            .unwrap();
+
+        // Boot takes ~90ms (> 60ms TTL). Lease TTL must begin after boot finishes so the caller
+        // receives a live lease rather than an already-expired one.
+        let lease = mgr.spawn(valid_spec(Duration::from_millis(60))).await.unwrap();
+        mgr.renew_lease(&lease.id, Duration::from_millis(120))
+            .await
+            .expect("lease must not be pre-expired by VM boot latency");
+        mgr.destroy(&lease.id).await.unwrap();
     }
 }

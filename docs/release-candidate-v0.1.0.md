@@ -50,7 +50,7 @@
 | --- | --- | --- | --- | --- |
 | `cpu_quota` | `HardLimit` when `host_cpu_quota_Millicores` set (Job Object `CpuRateControlInformation`), else `BestEffort` | `HardLimit` when delegated cgroup v2 `cpu.max` writable; `Unsupported` if set without delegation; `BestEffort` if unset | `Unsupported` if set, else `BestEffort` | `LocalRuntimeManager` never claims `HardLimit` when OS enforcement is unavailable. |
 | `host_rss` | `HardLimit` when `host_rss_budget_mb` set (`JOB_OBJECT_LIMIT_JOB_MEMORY`), else `BestEffort` | `HardLimit` when delegated cgroup v2 `memory.max` writable; `Unsupported` if set without delegation; `BestEffort` if unset | `Unsupported` if set, else `BestEffort` | Combined with `AdmissionController` host RSS reservations + `WorkingSetSize` / `/proc/<pid>/statm` sampling; never relies on guest ballooning. |
-| `host_storage` | `HardLimit` (qcow2 overlay size + `sandboxes/<id>` physical measurement against `host_storage_budget_mb`) | `HardLimit` | `HardLimit` | Enforced on `spawn`, `copy_in`, and periodic budget sweeps. |
+| `host_storage` | `HardLimit` when `virtual_disk_mb + 16 MiB <= host_storage_budget_mb` (else `BestEffort`) | Same | Same | Enforced via physical `sandboxes/<id>` + qcow2 measurement on `spawn`, `copy_in`, and periodic budget sweeps. |
 | `egress_filter` | `HardLimit` (`Isolated`, `InternetOnly`, `DomainAllowList`); `Unsupported` (`Unrestricted`) | Same | Same | Guest runs with `-nic none`; non-isolated traffic traverses `HostEgressProxy`. |
 
 ### 2.6 Post-MVP Deferrals (`BRD.md` Section 4.1, 4.2, 6)

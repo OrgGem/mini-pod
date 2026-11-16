@@ -1346,7 +1346,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::MetadataExt;
             let ControlEndpoint::UnixSocket(ref sock_path) = endpoint else {
                 unreachable!()
             };
