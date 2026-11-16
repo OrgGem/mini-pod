@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use sandbox_protocol::{
     read_frame, write_frame, Frame, Lane, Message, PriorityFrameQueue, ProtocolError,
-    StreamChannel, StreamId, MAX_FRAME_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    StreamChannel, StreamId, INITIAL_STREAM_CREDIT_BYTES, MAX_FRAME_PAYLOAD_BYTES,
+    PROTOCOL_VERSION,
 };
 
 use crate::copy_tar::{run_copy_in, run_copy_out, ActiveCopyIn};
@@ -35,6 +36,8 @@ const PORT_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Maximum raw `StreamData` payload bytes per frame (`MAX_FRAME_PAYLOAD_BYTES` minus 2-byte header).
 const MAX_STREAM_DATA_CHUNK_BYTES: usize = MAX_FRAME_PAYLOAD_BYTES as usize - 2;
+/// Session-wide ceiling (`4 MiB`) on queued `Lane::Data` frames inside [`OutboundQueue`].
+const MAX_OUTBOUND_DATA_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 struct OutboundState {
@@ -62,6 +65,14 @@ impl OutboundQueue {
 
     pub(crate) fn push_frame(&self, frame: Frame) -> Result<(), ProtocolError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if frame.header.lane == Lane::Data {
+            while !state.closed
+                && state.queue.data_len() > 0
+                && state.queue.data_bytes() >= MAX_OUTBOUND_DATA_QUEUE_BYTES
+            {
+                state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+        }
         if state.closed {
             return Err(closed_error(&state));
         }
@@ -174,6 +185,19 @@ impl OutboundQueue {
         Ok(())
     }
 
+    pub(crate) fn seed_default_credit(
+        &self,
+        stream_id: StreamId,
+        channel: StreamChannel,
+        bytes: u32,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .credits
+            .entry((stream_id, channel as u8))
+            .or_insert_with(|| u64::from(bytes));
+    }
+
     pub(crate) fn grant_credit(&self, stream_id: StreamId, channel: StreamChannel, bytes: u32) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -211,6 +235,12 @@ impl OutboundQueue {
                 }
                 if state.aborted_streams.contains(&stream_id) {
                     return Ok(());
+                }
+                if state.queue.data_len() > 0
+                    && state.queue.data_bytes() >= MAX_OUTBOUND_DATA_QUEUE_BYTES
+                {
+                    state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+                    continue;
                 }
                 let remaining = bytes.len() - offset;
                 match state.credits.get_mut(&(stream_id, channel as u8)) {
@@ -450,6 +480,16 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         )));
                         break;
                     }
+                    outbound.seed_default_credit(
+                        stream_id,
+                        StreamChannel::Stdout,
+                        INITIAL_STREAM_CREDIT_BYTES,
+                    );
+                    outbound.seed_default_credit(
+                        stream_id,
+                        StreamChannel::Stderr,
+                        INITIAL_STREAM_CREDIT_BYTES,
+                    );
                     let (handle, stdin_rx) = ActiveExec::new(stream_id);
                     active_execs
                         .lock()
@@ -524,7 +564,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                                 .get(&stream_id)
                                 .cloned();
                             if let Some(tunnel_handle) = tunnel_target {
-                                tunnel_handle.push_stdin(data, eof);
+                                tunnel_handle.push_stdin(data, eof, &outbound);
                             }
                         }
                     }
@@ -591,6 +631,11 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         )));
                         break;
                     }
+                    outbound.seed_default_credit(
+                        stream_id,
+                        StreamChannel::Stdout,
+                        INITIAL_STREAM_CREDIT_BYTES,
+                    );
                     let worker_outbound = outbound.clone();
                     workers.push(scope.spawn(move || {
                         run_copy_out(stream_id, src_guest, max_bytes, worker_outbound);
@@ -616,6 +661,11 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                             break;
                         }
                     } else {
+                        outbound.seed_default_credit(
+                            stream_id,
+                            StreamChannel::Stdout,
+                            INITIAL_STREAM_CREDIT_BYTES,
+                        );
                         let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
                         active_tunnels
                             .lock()
@@ -2309,6 +2359,10 @@ mod tests {
                         break;
                     }
                 }
+                Message::StreamCredit {
+                    channel: StreamChannel::Stdin,
+                    ..
+                } => {}
                 other => panic!("unexpected tunnel response: {other:?}"),
             }
         }
@@ -2422,7 +2476,21 @@ mod tests {
             },
         )
         .unwrap();
-        let disabled_ack = read_frame(&mut host_rx).unwrap();
+        let disabled_ack = loop {
+            let frame = read_frame(&mut host_rx).unwrap();
+            if frame.header.stream_id == guest_sid
+                && matches!(
+                    frame.decode_message().unwrap(),
+                    Message::StreamCredit {
+                        channel: StreamChannel::Stdin,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            break frame;
+        };
         assert_eq!(disabled_ack.header.stream_id, StreamId(0));
         assert_eq!(
             disabled_ack.decode_message().unwrap(),

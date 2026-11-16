@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -14,15 +14,16 @@ use sandbox_core::{
     NetworkPolicy, SandboxError,
 };
 use sandbox_protocol::{
-    is_guest_stream_id, read_frame, write_frame, ExecTargetWire, Frame, Message,
+    is_guest_stream_id, read_frame, write_frame, ExecTargetWire, Frame, Lane, Message,
     PriorityFrameQueue, StreamChannel, StreamId, StreamTargetWire, HOST_STREAM_ID_MAX,
+    INITIAL_STREAM_CREDIT_BYTES,
 };
 use sandbox_runtime::{
     validate_guest_path, ExecOutputChunk, ExecStream, OutputStreamKind, TunnelStream,
     TunnelStreamHandle, VmBootConfig, VmBootOutcome, VmRuntimePort, VmSessionPort,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 
 use crate::accel::{
     discover_qemu_binary_for_arch, probe_available_accelerators_for_arch, Accelerator,
@@ -41,8 +42,10 @@ use crate::spike::{
 };
 
 const MAX_HOST_STREAM_CHUNK_BYTES: usize = 64 * 1024;
-const TUNNEL_INBOUND_CHANNEL_CAPACITY: usize = 256;
-const EGRESS_ACCEPT_CHANNEL_CAPACITY: usize = 128;
+const MAX_OUTBOUND_DATA_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STREAM_INBOUND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACTIVE_GUEST_EGRESS_STREAMS: usize = 64;
+const EGRESS_ACCEPT_CHANNEL_CAPACITY: usize = 64;
 const DEFAULT_EGRESS_PROXY_PORT: u16 = 3128;
 
 /// Configuration for [`QemuVmDriver`].
@@ -426,6 +429,7 @@ struct OutboundQueueState {
 struct OutboundQueue {
     state: Mutex<OutboundQueueState>,
     cv: Condvar,
+    space_notify: Notify,
 }
 
 impl OutboundQueue {
@@ -437,10 +441,12 @@ impl OutboundQueue {
                 error: None,
             }),
             cv: Condvar::new(),
+            space_notify: Notify::new(),
         }
     }
 
-    fn enqueue(&self, frame: Frame) -> Result<(), SandboxError> {
+    fn enqueue_control(&self, frame: Frame) -> Result<(), SandboxError> {
+        debug_assert_eq!(frame.header.lane, Lane::Control);
         let mut guard = lock_unpoisoned(&self.state);
         if guard.closed {
             return Err(SandboxError::Transport(
@@ -455,6 +461,35 @@ impl OutboundQueue {
         Ok(())
     }
 
+    async fn enqueue_data(&self, frame: Frame) -> Result<(), SandboxError> {
+        debug_assert_eq!(frame.header.lane, Lane::Data);
+        let mut pending = Some(frame);
+        loop {
+            let notified = self.space_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut guard = lock_unpoisoned(&self.state);
+                if guard.closed {
+                    return Err(SandboxError::Transport(
+                        guard
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "QEMU IPC transport is closed".to_owned()),
+                    ));
+                }
+                if guard.queue.data_len() == 0
+                    || guard.queue.data_bytes() < MAX_OUTBOUND_DATA_QUEUE_BYTES
+                {
+                    guard.queue.push(pending.take().expect("frame present"));
+                    self.cv.notify_one();
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn close(&self, reason: Option<String>) {
         let mut guard = lock_unpoisoned(&self.state);
         guard.closed = true;
@@ -462,12 +497,18 @@ impl OutboundQueue {
             guard.error = reason;
         }
         self.cv.notify_all();
+        self.space_notify.notify_waiters();
     }
 
     fn pop_blocking(&self) -> Option<Frame> {
         let mut guard = lock_unpoisoned(&self.state);
         loop {
             if let Some(frame) = guard.queue.pop() {
+                let was_data = frame.header.lane == Lane::Data;
+                drop(guard);
+                if was_data {
+                    self.space_notify.notify_waiters();
+                }
                 return Some(frame);
             }
             if guard.closed {
@@ -481,6 +522,119 @@ impl OutboundQueue {
     }
 }
 
+struct StdinCreditState {
+    available: u64,
+    closed: bool,
+}
+
+struct StdinCreditWindow {
+    state: Mutex<StdinCreditState>,
+    notify: Notify,
+}
+
+impl StdinCreditWindow {
+    fn new(initial_bytes: u32) -> Self {
+        Self {
+            state: Mutex::new(StdinCreditState {
+                available: u64::from(initial_bytes),
+                closed: false,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    fn grant(&self, bytes: u32) {
+        if bytes == 0 {
+            return;
+        }
+        let mut guard = lock_unpoisoned(&self.state);
+        if !guard.closed {
+            guard.available = guard.available.saturating_add(u64::from(bytes));
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn close(&self) {
+        let mut guard = lock_unpoisoned(&self.state);
+        guard.closed = true;
+        self.notify.notify_waiters();
+    }
+
+    /// Cancel-safe wait for at least 1 byte of `Stdin` credit without deducting it yet.
+    async fn wait_available(&self, max_chunk: usize) -> Option<usize> {
+        if max_chunk == 0 {
+            return Some(0);
+        }
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let guard = lock_unpoisoned(&self.state);
+                if guard.closed {
+                    return None;
+                }
+                if guard.available > 0 {
+                    let allowed = usize::try_from(guard.available).unwrap_or(usize::MAX);
+                    return Some(max_chunk.min(allowed));
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn consume(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut guard = lock_unpoisoned(&self.state);
+        guard.available = guard.available.saturating_sub(bytes as u64);
+    }
+}
+
+struct GuestEgressPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+impl GuestEgressPermit {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Arc<Self>> {
+        let mut cur = counter.load(Ordering::Acquire);
+        loop {
+            if cur >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Arc::new(Self {
+                        counter: Arc::clone(counter),
+                    }));
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+impl Drop for GuestEgressPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum ExecInbound {
+    Output {
+        channel: StreamChannel,
+        chunk: ExecOutputChunk,
+    },
+    Exit(ExecExitStatus),
+    Abort(SandboxError),
+}
+
 enum TunnelInbound {
     Data { data: Vec<u8>, eof: bool },
     RemoteClose,
@@ -488,11 +642,13 @@ enum TunnelInbound {
 
 enum StreamHandler {
     Exec {
-        output_tx: mpsc::Sender<ExecOutputChunk>,
-        exit_tx: Option<oneshot::Sender<Result<ExecExitStatus, SandboxError>>>,
+        inbound_tx: mpsc::UnboundedSender<ExecInbound>,
+        queued_bytes: Arc<AtomicUsize>,
+        stdin_credits: Arc<StdinCreditWindow>,
         done_tx: Option<oneshot::Sender<()>>,
     },
     CopyIn {
+        stdin_credits: Arc<StdinCreditWindow>,
         reply_tx: Option<oneshot::Sender<Result<u64, SandboxError>>>,
     },
     CopyOut {
@@ -502,7 +658,9 @@ enum StreamHandler {
     },
     Tunnel {
         connect_tx: Option<oneshot::Sender<Result<(), SandboxError>>>,
-        inbound_tx: mpsc::Sender<TunnelInbound>,
+        inbound_tx: mpsc::UnboundedSender<TunnelInbound>,
+        queued_bytes: Arc<AtomicUsize>,
+        stdin_credits: Arc<StdinCreditWindow>,
     },
 }
 
@@ -524,6 +682,7 @@ pub struct QemuVmSession {
     egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
     pending_network_ack: Arc<NetworkAckSlot>,
     network_cfg_lock: AsyncMutex<()>,
+    session_closed_tx: watch::Sender<Option<String>>,
     transport_closed: Arc<AtomicBool>,
     alive: AtomicBool,
     next_stream_id: AtomicU32,
@@ -533,6 +692,10 @@ impl Drop for QemuVmSession {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         self.outbound.close(Some("session dropped".to_owned()));
+        let _ = self
+            .session_closed_tx
+            .send(Some("session dropped".to_owned()));
+        fail_all_pending_ops(&self.ops, &self.pending_network_ack, "session dropped");
         if let Some(shutdown_half) = lock_unpoisoned(&self.stream_shutdown).as_ref() {
             let _ = shutdown_half.shutdown();
         }
@@ -565,7 +728,9 @@ impl QemuVmSession {
         let ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let egress_tx = Arc::new(Mutex::new(egress_tx));
+        let active_guest_egress = Arc::new(AtomicUsize::new(0));
         let pending_network_ack: Arc<NetworkAckSlot> = Arc::new(Mutex::new(None));
+        let (session_closed_tx, _) = watch::channel(None);
         let transport_closed = Arc::new(AtomicBool::new(false));
         let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
@@ -573,6 +738,7 @@ impl QemuVmSession {
         let writer_ops = Arc::clone(&ops);
         let writer_pending_ack = Arc::clone(&pending_network_ack);
         let writer_closed = Arc::clone(&transport_closed);
+        let writer_session_closed = session_closed_tx.clone();
         let writer_thread = thread::Builder::new()
             .name(format!("minipod-vmm-tx-{pid}"))
             .spawn(move || {
@@ -582,6 +748,7 @@ impl QemuVmSession {
                     writer_ops,
                     writer_pending_ack,
                     writer_closed,
+                    writer_session_closed,
                 );
             })
             .map_err(|err| SandboxError::Internal(format!("spawn VMM writer thread: {err}")))?;
@@ -591,6 +758,7 @@ impl QemuVmSession {
         let reader_pending_ack = Arc::clone(&pending_network_ack);
         let reader_closed = Arc::clone(&transport_closed);
         let reader_egress_tx = Arc::clone(&egress_tx);
+        let reader_session_closed = session_closed_tx.clone();
         let reader_thread = thread::Builder::new()
             .name(format!("minipod-vmm-rx-{pid}"))
             .spawn(move || {
@@ -601,6 +769,8 @@ impl QemuVmSession {
                     reader_pending_ack,
                     reader_closed,
                     reader_egress_tx,
+                    active_guest_egress,
+                    reader_session_closed,
                     tokio_handle,
                 );
             })
@@ -621,6 +791,7 @@ impl QemuVmSession {
             egress_tx,
             pending_network_ack,
             network_cfg_lock: AsyncMutex::new(()),
+            session_closed_tx,
             transport_closed,
             alive: AtomicBool::new(true),
             next_stream_id: AtomicU32::new(1),
@@ -663,10 +834,20 @@ impl QemuVmSession {
         }
     }
 
-    fn enqueue_message(&self, stream_id: StreamId, msg: &Message) -> Result<(), SandboxError> {
+    fn enqueue_control_message(&self, stream_id: StreamId, msg: &Message) -> Result<(), SandboxError> {
         let frame = Frame::from_message(stream_id, msg)
             .map_err(|err| protocol_err("encoding protocol frame", err))?;
-        self.outbound.enqueue(frame)
+        self.outbound.enqueue_control(frame)
+    }
+
+    async fn enqueue_data_message(
+        &self,
+        stream_id: StreamId,
+        msg: &Message,
+    ) -> Result<(), SandboxError> {
+        let frame = Frame::from_message(stream_id, msg)
+            .map_err(|err| protocol_err("encoding protocol frame", err))?;
+        self.outbound.enqueue_data(frame).await
     }
 
     fn ensure_transport_ready(&self) -> Result<(), SandboxError> {
@@ -680,6 +861,14 @@ impl QemuVmSession {
 
     fn teardown_ipc_and_threads(&self) {
         self.outbound.close(None);
+        let _ = self
+            .session_closed_tx
+            .send(Some("QEMU VM session terminated".to_owned()));
+        fail_all_pending_ops(
+            &self.ops,
+            &self.pending_network_ack,
+            "QEMU VM session terminated",
+        );
         if let Some(shutdown_half) = lock_unpoisoned(&self.stream_shutdown).take() {
             let _ = shutdown_half.shutdown();
             drop(shutdown_half);
@@ -691,11 +880,6 @@ impl QemuVmSession {
             let _ = handle.join();
         }
         drop(lock_unpoisoned(&self.endpoint).take());
-        fail_all_pending_ops(
-            &self.ops,
-            &self.pending_network_ack,
-            "QEMU VM session terminated",
-        );
     }
 }
 
@@ -778,6 +962,9 @@ impl VmSessionPort for QemuVmSession {
 
         let stream_id = self.allocate_stream_id()?;
         let (exec_stream, handle) = ExecStream::channel(stream_id);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
         let (done_tx, done_rx) = oneshot::channel();
 
         {
@@ -785,8 +972,9 @@ impl VmSessionPort for QemuVmSession {
             ops.insert(
                 stream_id,
                 StreamHandler::Exec {
-                    output_tx: handle.output_tx,
-                    exit_tx: handle.exit_tx,
+                    inbound_tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    stdin_credits: Arc::clone(&stdin_credits),
                     done_tx: Some(done_tx),
                 },
             );
@@ -802,17 +990,41 @@ impl VmSessionPort for QemuVmSession {
             stdout_budget_bytes: req.stdout_budget_bytes,
             stderr_budget_bytes: req.stderr_budget_bytes,
         };
-        if let Err(err) = self.enqueue_message(stream_id, &start_msg) {
+        if let Err(err) = self.enqueue_control_message(stream_id, &start_msg) {
             lock_unpoisoned(&self.ops).remove(&stream_id);
             return Err(err);
         }
+
+        let out_outbound = Arc::clone(&self.outbound);
+        let session_closed_rx = self.session_closed_tx.subscribe();
+        let output_tx = handle.output_tx;
+        let exit_tx = handle.exit_tx;
+        tokio::spawn(async move {
+            pump_exec_output(
+                stream_id,
+                out_outbound,
+                inbound_rx,
+                queued_bytes,
+                output_tx,
+                exit_tx,
+                session_closed_rx,
+            )
+            .await;
+        });
 
         let outbound = Arc::clone(&self.outbound);
         let mut stdin_rx = handle.stdin_rx;
         let mut cancel_rx = handle.cancel_rx;
         tokio::spawn(async move {
-            pump_exec_stdin_and_cancel(stream_id, outbound, &mut stdin_rx, &mut cancel_rx, done_rx)
-                .await;
+            pump_exec_stdin_and_cancel(
+                stream_id,
+                outbound,
+                stdin_credits,
+                &mut stdin_rx,
+                &mut cancel_rx,
+                done_rx,
+            )
+            .await;
         });
 
         Ok(exec_stream)
@@ -829,7 +1041,9 @@ impl VmSessionPort for QemuVmSession {
         let stream_id = self.allocate_stream_id()?;
         let (tunnel_stream, tunnel_handle) = TunnelStream::channel(stream_id);
         let (connect_tx, connect_rx) = oneshot::channel();
-        let (inbound_tx, inbound_rx) = mpsc::channel(TUNNEL_INBOUND_CHANNEL_CAPACITY);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
 
         {
             let mut ops = lock_unpoisoned(&self.ops);
@@ -838,11 +1052,13 @@ impl VmSessionPort for QemuVmSession {
                 StreamHandler::Tunnel {
                     connect_tx: Some(connect_tx),
                     inbound_tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    stdin_credits: Arc::clone(&stdin_credits),
                 },
             );
         }
 
-        if let Err(err) = self.enqueue_message(stream_id, &Message::ConnectStart { target }) {
+        if let Err(err) = self.enqueue_control_message(stream_id, &Message::ConnectStart { target }) {
             lock_unpoisoned(&self.ops).remove(&stream_id);
             return Err(err);
         }
@@ -886,7 +1102,11 @@ impl VmSessionPort for QemuVmSession {
             Arc::clone(&self.outbound),
             Arc::clone(&self.ops),
             inbound_rx,
+            queued_bytes,
+            stdin_credits,
             tunnel_handle,
+            self.session_closed_tx.subscribe(),
+            None,
         );
 
         Ok(tunnel_stream)
@@ -925,7 +1145,7 @@ impl VmSessionPort for QemuVmSession {
         };
 
         self.ensure_transport_ready()?;
-        self.enqueue_message(
+        self.enqueue_control_message(
             StreamId(0),
             &Message::ConfigureNetwork {
                 enable_egress_proxy: true,
@@ -973,18 +1193,20 @@ impl VmSessionPort for QemuVmSession {
         self.ensure_transport_ready()?;
 
         let stream_id = self.allocate_stream_id()?;
+        let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut ops = lock_unpoisoned(&self.ops);
             ops.insert(
                 stream_id,
                 StreamHandler::CopyIn {
+                    stdin_credits: Arc::clone(&stdin_credits),
                     reply_tx: Some(reply_tx),
                 },
             );
         }
 
-        if let Err(err) = self.enqueue_message(
+        if let Err(err) = self.enqueue_control_message(
             stream_id,
             &Message::CopyInStart {
                 dst_guest: dst_guest.to_owned(),
@@ -996,32 +1218,48 @@ impl VmSessionPort for QemuVmSession {
         }
 
         if tar_bytes.is_empty() {
-            if let Err(err) = self.enqueue_message(
-                stream_id,
-                &Message::StreamData {
-                    channel: StreamChannel::Stdin,
-                    eof: true,
-                    data: Vec::new(),
-                },
-            ) {
+            if let Err(err) = self
+                .enqueue_data_message(
+                    stream_id,
+                    &Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof: true,
+                        data: Vec::new(),
+                    },
+                )
+                .await
+            {
                 lock_unpoisoned(&self.ops).remove(&stream_id);
                 return Err(err);
             }
         } else {
-            let total_chunks = tar_bytes.chunks(MAX_HOST_STREAM_CHUNK_BYTES).len();
-            for (idx, chunk) in tar_bytes.chunks(MAX_HOST_STREAM_CHUNK_BYTES).enumerate() {
-                let eof = idx + 1 == total_chunks;
-                if let Err(err) = self.enqueue_message(
-                    stream_id,
-                    &Message::StreamData {
-                        channel: StreamChannel::Stdin,
-                        eof,
-                        data: chunk.to_vec(),
-                    },
-                ) {
+            let mut offset = 0usize;
+            while offset < tar_bytes.len() {
+                let Some(allowance) = stdin_credits
+                    .wait_available(MAX_HOST_STREAM_CHUNK_BYTES)
+                    .await
+                else {
+                    break;
+                };
+                let take = (tar_bytes.len() - offset).min(allowance);
+                stdin_credits.consume(take);
+                let end = offset + take;
+                let eof = end == tar_bytes.len();
+                if let Err(err) = self
+                    .enqueue_data_message(
+                        stream_id,
+                        &Message::StreamData {
+                            channel: StreamChannel::Stdin,
+                            eof,
+                            data: tar_bytes[offset..end].to_vec(),
+                        },
+                    )
+                    .await
+                {
                     lock_unpoisoned(&self.ops).remove(&stream_id);
                     return Err(err);
                 }
+                offset = end;
             }
         }
 
@@ -1059,7 +1297,7 @@ impl VmSessionPort for QemuVmSession {
             );
         }
 
-        if let Err(err) = self.enqueue_message(
+        if let Err(err) = self.enqueue_control_message(
             stream_id,
             &Message::CopyOutStart {
                 src_guest: src_guest.to_owned(),
@@ -1083,7 +1321,7 @@ impl VmSessionPort for QemuVmSession {
             return Ok(true);
         }
 
-        let _ = self.enqueue_message(StreamId(0), &Message::Shutdown);
+        let _ = self.enqueue_control_message(StreamId(0), &Message::Shutdown);
 
         let maybe_process = lock_unpoisoned(&self.process).take();
         let Some(mut process) = maybe_process else {
@@ -1121,6 +1359,10 @@ impl VmSessionPort for QemuVmSession {
     async fn force_kill(&self) -> Result<(), SandboxError> {
         self.alive.store(false, Ordering::Release);
         self.outbound.close(Some("force_kill invoked".to_owned()));
+        let _ = self
+            .session_closed_tx
+            .send(Some("QEMU process killed".to_owned()));
+        fail_all_pending_ops(&self.ops, &self.pending_network_ack, "QEMU process killed");
         if let Some(shutdown_half) = lock_unpoisoned(&self.stream_shutdown).as_ref() {
             let _ = shutdown_half.shutdown();
         }
@@ -1138,8 +1380,6 @@ impl VmSessionPort for QemuVmSession {
         let writer = lock_unpoisoned(&self.writer_thread).take();
         let reader = lock_unpoisoned(&self.reader_thread).take();
         let endpoint = lock_unpoisoned(&self.endpoint).take();
-        let ops = Arc::clone(&self.ops);
-        let pending_network_ack = Arc::clone(&self.pending_network_ack);
 
         tokio::task::spawn_blocking(move || {
             if let Some(half) = shutdown_half {
@@ -1153,7 +1393,6 @@ impl VmSessionPort for QemuVmSession {
                 let _ = handle.join();
             }
             drop(endpoint);
-            fail_all_pending_ops(&ops, &pending_network_ack, "QEMU process killed");
         })
         .await
         .map_err(|err| SandboxError::Internal(format!("force_kill cleanup failed: {err}")))?;
@@ -1174,7 +1413,7 @@ impl Drop for TunnelConnectGuard<'_> {
         if self.armed {
             lock_unpoisoned(self.ops).remove(&self.stream_id);
             if let Ok(frame) = Frame::from_message(self.stream_id, &Message::StreamClose) {
-                let _ = self.outbound.enqueue(frame);
+                let _ = self.outbound.enqueue_control(frame);
             }
         }
     }
@@ -1195,52 +1434,208 @@ impl Drop for NetworkConfigureGuard<'_> {
     }
 }
 
+fn send_stream_credit(
+    outbound: &OutboundQueue,
+    stream_id: StreamId,
+    channel: StreamChannel,
+    mut bytes: usize,
+) {
+    while bytes > 0 {
+        let chunk = bytes.min(u32::MAX as usize);
+        if let Ok(frame) = Frame::from_message(
+            stream_id,
+            &Message::StreamCredit {
+                channel,
+                bytes: chunk as u32,
+            },
+        ) {
+            if outbound.enqueue_control(frame).is_err() {
+                break;
+            }
+        }
+        bytes -= chunk;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_exec_output(
+    stream_id: StreamId,
+    outbound: Arc<OutboundQueue>,
+    mut inbound_rx: mpsc::UnboundedReceiver<ExecInbound>,
+    queued_bytes: Arc<AtomicUsize>,
+    output_tx: mpsc::Sender<ExecOutputChunk>,
+    mut exit_tx: Option<oneshot::Sender<Result<ExecExitStatus, SandboxError>>>,
+    mut session_closed_rx: watch::Receiver<Option<String>>,
+) {
+    let mut output_tx = Some(output_tx);
+    loop {
+        if let Some(reason) = session_closed_rx.borrow().clone() {
+            if let Some(tx) = exit_tx.take() {
+                let _ = tx.send(Err(SandboxError::Transport(reason)));
+            }
+            return;
+        }
+
+        let item = tokio::select! {
+            biased;
+            changed = session_closed_rx.changed() => {
+                let reason = changed
+                    .ok()
+                    .and_then(|()| session_closed_rx.borrow().clone())
+                    .unwrap_or_else(|| "QEMU VM session terminated".to_owned());
+                if let Some(tx) = exit_tx.take() {
+                    let _ = tx.send(Err(SandboxError::Transport(reason)));
+                }
+                return;
+            }
+            maybe_item = inbound_rx.recv() => match maybe_item {
+                Some(item) => item,
+                None => {
+                    if let Some(tx) = exit_tx.take() {
+                        let _ = tx.send(Err(SandboxError::Transport(
+                            "execution stream closed before reporting exit status".to_owned(),
+                        )));
+                    }
+                    return;
+                }
+            }
+        };
+
+        match item {
+            ExecInbound::Output { channel, chunk } => {
+                let len = chunk.data.len();
+                if let Some(tx) = output_tx.as_ref() {
+                    let send_res = tokio::select! {
+                        biased;
+                        changed = session_closed_rx.changed() => {
+                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            let reason = changed
+                                .ok()
+                                .and_then(|()| session_closed_rx.borrow().clone())
+                                .unwrap_or_else(|| "QEMU VM session terminated".to_owned());
+                            if let Some(exit) = exit_tx.take() {
+                                let _ = exit.send(Err(SandboxError::Transport(reason)));
+                            }
+                            return;
+                        }
+                        res = tx.send(chunk) => res,
+                    };
+                    if send_res.is_err() {
+                        output_tx = None;
+                    }
+                }
+                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                send_stream_credit(&outbound, stream_id, channel, len);
+            }
+            ExecInbound::Exit(status) => {
+                drop(output_tx.take());
+                if let Some(tx) = exit_tx.take() {
+                    let _ = tx.send(Ok(status));
+                }
+                return;
+            }
+            ExecInbound::Abort(err) => {
+                drop(output_tx.take());
+                if let Some(tx) = exit_tx.take() {
+                    let _ = tx.send(Err(err));
+                }
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_tunnel_pumps(
     rt: &tokio::runtime::Handle,
     stream_id: StreamId,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
-    inbound_rx: mpsc::Receiver<TunnelInbound>,
+    inbound_rx: mpsc::UnboundedReceiver<TunnelInbound>,
+    queued_bytes: Arc<AtomicUsize>,
+    stdin_credits: Arc<StdinCreditWindow>,
     tunnel_handle: TunnelStreamHandle,
+    session_closed_rx: watch::Receiver<Option<String>>,
+    egress_permit: Option<Arc<GuestEgressPermit>>,
 ) {
     let (remote_eof_tx, remote_eof_rx) = oneshot::channel();
     let (remote_abort_tx, remote_abort_rx) = oneshot::channel();
 
+    let inbound_outbound = Arc::clone(&outbound);
+    let inbound_permit = egress_permit.clone();
+    let inbound_session_closed = session_closed_rx.clone();
     rt.spawn(async move {
+        let _permit = inbound_permit;
         pump_tunnel_inbound(
+            stream_id,
+            inbound_outbound,
             inbound_rx,
+            queued_bytes,
             tunnel_handle.write_half,
             remote_eof_tx,
             remote_abort_tx,
+            inbound_session_closed,
         )
         .await;
     });
     rt.spawn(async move {
+        let _permit = egress_permit;
         pump_tunnel_outbound(
             stream_id,
             outbound,
             ops,
+            stdin_credits,
             tunnel_handle.read_half,
             tunnel_handle.drop_rx,
             remote_eof_rx,
             remote_abort_rx,
+            session_closed_rx,
         )
         .await;
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_tunnel_inbound(
-    mut inbound_rx: mpsc::Receiver<TunnelInbound>,
+    stream_id: StreamId,
+    outbound: Arc<OutboundQueue>,
+    mut inbound_rx: mpsc::UnboundedReceiver<TunnelInbound>,
+    queued_bytes: Arc<AtomicUsize>,
     mut write_half: WriteHalf<DuplexStream>,
     remote_eof_tx: oneshot::Sender<()>,
     remote_abort_tx: oneshot::Sender<()>,
+    mut session_closed_rx: watch::Receiver<Option<String>>,
 ) {
     let mut remote_eof_tx = Some(remote_eof_tx);
-    while let Some(item) = inbound_rx.recv().await {
+    loop {
+        if session_closed_rx.borrow().is_some() {
+            break;
+        }
+        let item = tokio::select! {
+            biased;
+            _ = session_closed_rx.changed() => break,
+            maybe_item = inbound_rx.recv() => match maybe_item {
+                Some(item) => item,
+                None => break,
+            }
+        };
         match item {
             TunnelInbound::Data { data, eof } => {
-                if !data.is_empty() && write_half.write_all(&data).await.is_err() {
-                    break;
+                let len = data.len();
+                if len > 0 {
+                    let write_res = tokio::select! {
+                        biased;
+                        _ = session_closed_rx.changed() => {
+                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            break;
+                        }
+                        res = write_half.write_all(&data) => res,
+                    };
+                    queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                    if write_res.is_err() {
+                        break;
+                    }
+                    send_stream_credit(&outbound, stream_id, StreamChannel::Stdout, len);
                 }
                 if eof {
                     if let Some(tx) = remote_eof_tx.take() {
@@ -1262,14 +1657,17 @@ async fn pump_tunnel_inbound(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_tunnel_outbound(
     stream_id: StreamId,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    stdin_credits: Arc<StdinCreditWindow>,
     mut read_half: ReadHalf<DuplexStream>,
     drop_rx: oneshot::Receiver<bool>,
     remote_eof_rx: oneshot::Receiver<()>,
     mut remote_abort_rx: oneshot::Receiver<()>,
+    mut session_closed_rx: watch::Receiver<Option<String>>,
 ) {
     let mut buf = vec![0u8; MAX_HOST_STREAM_CHUNK_BYTES];
     let mut stdin_eof = false;
@@ -1278,8 +1676,14 @@ async fn pump_tunnel_outbound(
     let mut remote_eof_rx = Some(remote_eof_rx);
 
     while !(stdin_eof && remote_eof) {
+        if session_closed_rx.borrow().is_some() {
+            break;
+        }
         tokio::select! {
             biased;
+            _ = session_closed_rx.changed() => {
+                break;
+            }
             _ = &mut remote_abort_rx => {
                 break;
             }
@@ -1307,14 +1711,18 @@ async fn pump_tunnel_outbound(
                 // before client TCP FIN), keep draining `read_half` until `stdin_eof`.
                 if !graceful_write {
                     if let Ok(frame) = Frame::from_message(stream_id, &Message::StreamClose) {
-                        let _ = outbound.enqueue(frame);
+                        let _ = outbound.enqueue_control(frame);
                     }
                     break;
                 }
             }
-            read_res = read_half.read(&mut buf), if !stdin_eof => {
+            read_res = async {
+                let cap = stdin_credits.wait_available(MAX_HOST_STREAM_CHUNK_BYTES).await?;
+                Some(read_half.read(&mut buf[..cap]).await)
+            }, if !stdin_eof => {
                 match read_res {
-                    Ok(0) => {
+                    None => break,
+                    Some(Ok(0)) => {
                         if let Ok(frame) = Frame::from_message(
                             stream_id,
                             &Message::StreamData {
@@ -1323,11 +1731,12 @@ async fn pump_tunnel_outbound(
                                 data: Vec::new(),
                             },
                         ) {
-                            let _ = outbound.enqueue(frame);
+                            let _ = outbound.enqueue_data(frame).await;
                         }
                         stdin_eof = true;
                     }
-                    Ok(n) => {
+                    Some(Ok(n)) => {
+                        stdin_credits.consume(n);
                         if let Ok(frame) = Frame::from_message(
                             stream_id,
                             &Message::StreamData {
@@ -1336,23 +1745,25 @@ async fn pump_tunnel_outbound(
                                 data: buf[..n].to_vec(),
                             },
                         ) {
-                            if outbound.enqueue(frame).is_err() {
+                            if outbound.enqueue_data(frame).await.is_err() {
                                 break;
                             }
                         }
                     }
-                    Err(_) => break,
+                    Some(Err(_)) => break,
                 }
             }
         }
     }
 
+    stdin_credits.close();
     lock_unpoisoned(&ops).remove(&stream_id);
 }
 
 async fn pump_exec_stdin_and_cancel(
     stream_id: StreamId,
     outbound: Arc<OutboundQueue>,
+    stdin_credits: Arc<StdinCreditWindow>,
     stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
     cancel_rx: &mut mpsc::Receiver<()>,
     mut done_rx: oneshot::Receiver<()>,
@@ -1361,24 +1772,73 @@ async fn pump_exec_stdin_and_cancel(
     let mut cancel_open = true;
     loop {
         tokio::select! {
+            biased;
             _ = &mut done_rx => break,
+            maybe_cancel = cancel_rx.recv(), if cancel_open => {
+                match maybe_cancel {
+                    Some(()) => {
+                        if let Ok(frame) = Frame::from_message(stream_id, &Message::ExecCancel) {
+                            if outbound.enqueue_control(frame).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        cancel_open = false;
+                        if !stdin_open {
+                            break;
+                        }
+                    }
+                }
+            }
             maybe_stdin = stdin_rx.recv(), if stdin_open => {
                 match maybe_stdin {
                     Some(data) => {
-                        for chunk in data.chunks(MAX_HOST_STREAM_CHUNK_BYTES) {
+                        let mut offset = 0usize;
+                        while offset < data.len() {
+                            let allowance = tokio::select! {
+                                biased;
+                                _ = &mut done_rx => return,
+                                maybe_cancel = cancel_rx.recv(), if cancel_open => {
+                                    match maybe_cancel {
+                                        Some(()) => {
+                                            if let Ok(frame) = Frame::from_message(stream_id, &Message::ExecCancel) {
+                                                if outbound.enqueue_control(frame).is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        None => {
+                                            cancel_open = false;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                cap = stdin_credits.wait_available(MAX_HOST_STREAM_CHUNK_BYTES) => {
+                                    match cap {
+                                        Some(cap) => cap,
+                                        None => return,
+                                    }
+                                }
+                            };
+                            let take = (data.len() - offset).min(allowance);
+                            stdin_credits.consume(take);
+                            let end = offset + take;
                             let Ok(frame) = Frame::from_message(
                                 stream_id,
                                 &Message::StreamData {
                                     channel: StreamChannel::Stdin,
                                     eof: false,
-                                    data: chunk.to_vec(),
+                                    data: data[offset..end].to_vec(),
                                 },
                             ) else {
                                 return;
                             };
-                            if outbound.enqueue(frame).is_err() {
+                            if outbound.enqueue_data(frame).await.is_err() {
                                 return;
                             }
+                            offset = end;
                         }
                     }
                     None => {
@@ -1391,26 +1851,9 @@ async fn pump_exec_stdin_and_cancel(
                                 data: Vec::new(),
                             },
                         ) {
-                            let _ = outbound.enqueue(frame);
+                            let _ = outbound.enqueue_data(frame).await;
                         }
                         if !cancel_open {
-                            break;
-                        }
-                    }
-                }
-            }
-            maybe_cancel = cancel_rx.recv(), if cancel_open => {
-                match maybe_cancel {
-                    Some(()) => {
-                        if let Ok(frame) = Frame::from_message(stream_id, &Message::ExecCancel) {
-                            if outbound.enqueue(frame).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    None => {
-                        cancel_open = false;
-                        if !stdin_open {
                             break;
                         }
                     }
@@ -1426,12 +1869,14 @@ fn run_writer_loop(
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
     pending_network_ack: Arc<NetworkAckSlot>,
     transport_closed: Arc<AtomicBool>,
+    session_closed_tx: watch::Sender<Option<String>>,
 ) {
     while let Some(frame) = outbound.pop_blocking() {
         if let Err(err) = write_frame(&mut write_half, &frame) {
             let msg = format!("writing protocol frame failed: {err}");
             transport_closed.store(true, Ordering::Release);
             outbound.close(Some(msg.clone()));
+            let _ = session_closed_tx.send(Some(msg.clone()));
             let _ = write_half.shutdown();
             fail_all_pending_ops(&ops, &pending_network_ack, &msg);
             return;
@@ -1439,6 +1884,7 @@ fn run_writer_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_reader_loop(
     mut read_half: IpcReadHalf,
     outbound: Arc<OutboundQueue>,
@@ -1446,6 +1892,8 @@ fn run_reader_loop(
     pending_network_ack: Arc<NetworkAckSlot>,
     transport_closed: Arc<AtomicBool>,
     egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
+    active_guest_egress: Arc<AtomicUsize>,
+    session_closed_tx: watch::Sender<Option<String>>,
     tokio_handle: Option<tokio::runtime::Handle>,
 ) {
     loop {
@@ -1455,6 +1903,7 @@ fn run_reader_loop(
                 let msg = format!("reading protocol frame failed: {err}");
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some(msg.clone()));
+                let _ = session_closed_tx.send(Some(msg.clone()));
                 fail_all_pending_ops(&ops, &pending_network_ack, &msg);
                 return;
             }
@@ -1467,6 +1916,7 @@ fn run_reader_loop(
                 let reason = format!("decoding protocol frame failed: {err}");
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some(reason.clone()));
+                let _ = session_closed_tx.send(Some(reason.clone()));
                 fail_all_pending_ops(&ops, &pending_network_ack, &reason);
                 return;
             }
@@ -1474,70 +1924,123 @@ fn run_reader_loop(
 
         match msg {
             Message::StreamData { channel, eof, data } => {
-                enum DataDispatch {
-                    Exec(mpsc::Sender<ExecOutputChunk>, OutputStreamKind),
-                    Tunnel(mpsc::Sender<TunnelInbound>),
-                }
-
-                let dispatch = {
-                    let mut map = lock_unpoisoned(&ops);
-                    match map.get_mut(&stream_id) {
-                        Some(StreamHandler::Exec { output_tx, .. }) => {
-                            let kind = match channel {
-                                StreamChannel::Stdout => Some(OutputStreamKind::Stdout),
-                                StreamChannel::Stderr => Some(OutputStreamKind::Stderr),
-                                StreamChannel::Stdin => None,
-                            };
-                            kind.filter(|_| !data.is_empty())
-                                .map(|stream_kind| DataDispatch::Exec(output_tx.clone(), stream_kind))
-                        }
-                        Some(StreamHandler::CopyOut {
-                            max_bytes,
-                            buffer,
-                            ..
-                        }) if channel == StreamChannel::Stdout => {
-                            let limit = *max_bytes;
-                            let new_len = (buffer.len() as u64).saturating_add(data.len() as u64);
-                            if new_len > limit {
-                                if let Some(StreamHandler::CopyOut { mut reply_tx, .. }) =
-                                    map.remove(&stream_id)
+                let mut map = lock_unpoisoned(&ops);
+                match map.get_mut(&stream_id) {
+                    Some(StreamHandler::Exec {
+                        inbound_tx,
+                        queued_bytes,
+                        ..
+                    }) => {
+                        let kind = match channel {
+                            StreamChannel::Stdout => Some(OutputStreamKind::Stdout),
+                            StreamChannel::Stderr => Some(OutputStreamKind::Stderr),
+                            StreamChannel::Stdin => None,
+                        };
+                        if let Some(stream_kind) = kind.filter(|_| !data.is_empty()) {
+                            let len = data.len();
+                            let prev = queued_bytes.fetch_add(len, Ordering::AcqRel);
+                            if prev.saturating_add(len) > MAX_STREAM_INBOUND_BUFFER_BYTES {
+                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                                if let Some(StreamHandler::Exec {
+                                    inbound_tx,
+                                    stdin_credits,
+                                    mut done_tx,
+                                    ..
+                                }) = map.remove(&stream_id)
                                 {
-                                    if let Some(tx) = reply_tx.take() {
-                                        let _ = tx.send(Err(SandboxError::BudgetExceeded(
-                                            format!(
-                                                "copy_out payload exceeded max_bytes ({limit})"
-                                            ),
-                                        )));
+                                    stdin_credits.close();
+                                    if let Some(tx) = done_tx.take() {
+                                        let _ = tx.send(());
                                     }
+                                    let _ = inbound_tx.send(ExecInbound::Abort(
+                                        SandboxError::Transport(format!(
+                                            "guest exceeded stream credit window on stream {stream_id}"
+                                        )),
+                                    ));
                                 }
-                            } else {
-                                buffer.extend_from_slice(&data);
+                                drop(map);
+                                if let Ok(cancel) =
+                                    Frame::from_message(stream_id, &Message::ExecCancel)
+                                {
+                                    let _ = outbound.enqueue_control(cancel);
+                                }
+                            } else if inbound_tx
+                                .send(ExecInbound::Output {
+                                    channel,
+                                    chunk: ExecOutputChunk {
+                                        stream: stream_kind,
+                                        data,
+                                    },
+                                })
+                                .is_err()
+                            {
+                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
                             }
-                            None
                         }
-                        Some(StreamHandler::Tunnel { inbound_tx, .. })
-                            if channel == StreamChannel::Stdout =>
-                        {
-                            if !data.is_empty() || eof {
-                                Some(DataDispatch::Tunnel(inbound_tx.clone()))
-                            } else {
-                                None
+                    }
+                    Some(StreamHandler::CopyOut {
+                        max_bytes,
+                        buffer,
+                        ..
+                    }) if channel == StreamChannel::Stdout => {
+                        let limit = *max_bytes;
+                        let chunk_len = data.len();
+                        let new_len = (buffer.len() as u64).saturating_add(chunk_len as u64);
+                        if new_len > limit {
+                            if let Some(StreamHandler::CopyOut { mut reply_tx, .. }) =
+                                map.remove(&stream_id)
+                            {
+                                if let Some(tx) = reply_tx.take() {
+                                    let _ = tx.send(Err(SandboxError::BudgetExceeded(format!(
+                                        "copy_out payload exceeded max_bytes ({limit})"
+                                    ))));
+                                }
+                            }
+                        } else {
+                            buffer.extend_from_slice(&data);
+                            drop(map);
+                            send_stream_credit(
+                                &outbound,
+                                stream_id,
+                                StreamChannel::Stdout,
+                                chunk_len,
+                            );
+                        }
+                    }
+                    Some(StreamHandler::Tunnel {
+                        inbound_tx,
+                        queued_bytes,
+                        ..
+                    }) if channel == StreamChannel::Stdout => {
+                        if !data.is_empty() || eof {
+                            let len = data.len();
+                            let prev = queued_bytes.fetch_add(len, Ordering::AcqRel);
+                            if prev.saturating_add(len) > MAX_STREAM_INBOUND_BUFFER_BYTES {
+                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                                if let Some(StreamHandler::Tunnel {
+                                    inbound_tx,
+                                    stdin_credits,
+                                    ..
+                                }) = map.remove(&stream_id)
+                                {
+                                    stdin_credits.close();
+                                    let _ = inbound_tx.send(TunnelInbound::RemoteClose);
+                                }
+                                drop(map);
+                                if let Ok(close_frame) =
+                                    Frame::from_message(stream_id, &Message::StreamClose)
+                                {
+                                    let _ = outbound.enqueue_control(close_frame);
+                                }
+                            } else if inbound_tx
+                                .send(TunnelInbound::Data { data, eof })
+                                .is_err()
+                            {
+                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
                             }
                         }
-                        _ => None,
                     }
-                };
-                match dispatch {
-                    Some(DataDispatch::Exec(tx, stream_kind)) => {
-                        let _ = tx.blocking_send(ExecOutputChunk {
-                            stream: stream_kind,
-                            data,
-                        });
-                    }
-                    Some(DataDispatch::Tunnel(tx)) => {
-                        let _ = tx.blocking_send(TunnelInbound::Data { data, eof });
-                    }
-                    None => {}
+                    _ => {}
                 }
             }
             Message::ExecExit {
@@ -1548,29 +2051,32 @@ fn run_reader_loop(
             } => {
                 let removed = lock_unpoisoned(&ops).remove(&stream_id);
                 if let Some(StreamHandler::Exec {
-                    output_tx,
-                    mut exit_tx,
+                    inbound_tx,
+                    stdin_credits,
                     mut done_tx,
+                    ..
                 }) = removed
                 {
-                    if let Some(tx) = exit_tx.take() {
-                        let _ = tx.send(Ok(ExecExitStatus {
-                            code,
-                            timed_out,
-                            stdout_truncated,
-                            stderr_truncated,
-                        }));
-                    }
+                    stdin_credits.close();
                     if let Some(tx) = done_tx.take() {
                         let _ = tx.send(());
                     }
-                    drop(output_tx);
+                    let _ = inbound_tx.send(ExecInbound::Exit(ExecExitStatus {
+                        code,
+                        timed_out,
+                        stdout_truncated,
+                        stderr_truncated,
+                    }));
                 }
             }
             Message::CopyDone { bytes_transferred } => {
                 let removed = lock_unpoisoned(&ops).remove(&stream_id);
                 match removed {
-                    Some(StreamHandler::CopyIn { mut reply_tx }) => {
+                    Some(StreamHandler::CopyIn {
+                        stdin_credits,
+                        mut reply_tx,
+                    }) => {
+                        stdin_credits.close();
                         if let Some(tx) = reply_tx.take() {
                             let _ = tx.send(Ok(bytes_transferred));
                         }
@@ -1600,7 +2106,11 @@ fn run_reader_loop(
                 let removed = lock_unpoisoned(&ops).remove(&stream_id);
                 let err = map_guest_copy_error(&message);
                 match removed {
-                    Some(StreamHandler::CopyIn { mut reply_tx }) => {
+                    Some(StreamHandler::CopyIn {
+                        stdin_credits,
+                        mut reply_tx,
+                    }) => {
+                        stdin_credits.close();
                         if let Some(tx) = reply_tx.take() {
                             let _ = tx.send(Err(err));
                         }
@@ -1626,12 +2136,15 @@ fn run_reader_loop(
                 if let Some(StreamHandler::Tunnel {
                     mut connect_tx,
                     inbound_tx,
+                    stdin_credits,
+                    ..
                 }) = removed
                 {
+                    stdin_credits.close();
                     if let Some(tx) = connect_tx.take() {
                         let _ = tx.send(Err(SandboxError::Transport(message)));
                     } else {
-                        let _ = inbound_tx.blocking_send(TunnelInbound::RemoteClose);
+                        let _ = inbound_tx.send(TunnelInbound::RemoteClose);
                     }
                 }
             }
@@ -1640,19 +2153,30 @@ fn run_reader_loop(
                 if let Some(StreamHandler::Tunnel {
                     mut connect_tx,
                     inbound_tx,
+                    stdin_credits,
+                    ..
                 }) = removed
                 {
+                    stdin_credits.close();
                     if let Some(tx) = connect_tx.take() {
                         let _ = tx.send(Err(SandboxError::Transport(
                             "guest closed tunnel stream before ConnectAck".to_owned(),
                         )));
                     } else {
-                        let _ = inbound_tx.blocking_send(TunnelInbound::RemoteClose);
+                        let _ = inbound_tx.send(TunnelInbound::RemoteClose);
                     }
                 }
             }
             Message::EgressOpen => {
-                handle_egress_open(stream_id, &egress_tx, &tokio_handle, &outbound, &ops);
+                handle_egress_open(
+                    stream_id,
+                    &egress_tx,
+                    &active_guest_egress,
+                    &session_closed_tx,
+                    &tokio_handle,
+                    &outbound,
+                    &ops,
+                );
             }
             Message::ConfigureNetworkAck { proxy_port } if stream_id == StreamId(0) => {
                 let ack_tx = lock_unpoisoned(&pending_network_ack).take();
@@ -1662,14 +2186,29 @@ fn run_reader_loop(
             }
             Message::Ping { seq } => {
                 if let Ok(frame) = Frame::from_message(stream_id, &Message::Pong { seq }) {
-                    let _ = outbound.enqueue(frame);
+                    let _ = outbound.enqueue_control(frame);
                 }
             }
             Message::Shutdown => {
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some("guest VM shut down".to_owned()));
+                let _ = session_closed_tx.send(Some("guest VM shut down".to_owned()));
                 fail_all_pending_ops(&ops, &pending_network_ack, "guest VM shut down");
                 return;
+            }
+            Message::StreamCredit {
+                channel: StreamChannel::Stdin,
+                bytes,
+            } => {
+                let map = lock_unpoisoned(&ops);
+                match map.get(&stream_id) {
+                    Some(StreamHandler::Exec { stdin_credits, .. })
+                    | Some(StreamHandler::CopyIn { stdin_credits, .. })
+                    | Some(StreamHandler::Tunnel { stdin_credits, .. }) => {
+                        stdin_credits.grant(bytes);
+                    }
+                    _ => {}
+                }
             }
             Message::StreamCredit { .. } | Message::Pong { .. } => {}
             other => {
@@ -1679,6 +2218,7 @@ fn run_reader_loop(
                 );
                 transport_closed.store(true, Ordering::Release);
                 outbound.close(Some(reason.clone()));
+                let _ = session_closed_tx.send(Some(reason.clone()));
                 fail_all_pending_ops(&ops, &pending_network_ack, &reason);
                 return;
             }
@@ -1689,13 +2229,15 @@ fn run_reader_loop(
 fn handle_egress_open(
     stream_id: StreamId,
     egress_tx: &Mutex<Option<mpsc::Sender<TunnelStream>>>,
+    active_guest_egress: &Arc<AtomicUsize>,
+    session_closed_tx: &watch::Sender<Option<String>>,
     tokio_handle: &Option<tokio::runtime::Handle>,
     outbound: &Arc<OutboundQueue>,
     ops: &Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
 ) {
     let reject = |msg: String| {
         if let Ok(frame) = Frame::from_message(stream_id, &Message::ConnectError { message: msg }) {
-            let _ = outbound.enqueue(frame);
+            let _ = outbound.enqueue_control(frame);
         }
     };
 
@@ -1717,8 +2259,17 @@ fn handle_egress_open(
         return;
     }
 
+    let Some(permit) =
+        GuestEgressPermit::try_acquire(active_guest_egress, MAX_ACTIVE_GUEST_EGRESS_STREAMS)
+    else {
+        reject("too many concurrent guest egress streams".to_owned());
+        return;
+    };
+
     let (client_stream, tunnel_handle) = TunnelStream::channel(stream_id);
-    let (inbound_tx, inbound_rx) = mpsc::channel(TUNNEL_INBOUND_CHANNEL_CAPACITY);
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
 
     match tx.try_send(client_stream) {
         Ok(()) => {
@@ -1727,10 +2278,12 @@ fn handle_egress_open(
                 StreamHandler::Tunnel {
                     connect_tx: None,
                     inbound_tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    stdin_credits: Arc::clone(&stdin_credits),
                 },
             );
             if let Ok(frame) = Frame::from_message(stream_id, &Message::ConnectAck) {
-                if outbound.enqueue(frame).is_err() {
+                if outbound.enqueue_control(frame).is_err() {
                     lock_unpoisoned(ops).remove(&stream_id);
                     return;
                 }
@@ -1741,7 +2294,11 @@ fn handle_egress_open(
                 Arc::clone(outbound),
                 Arc::clone(ops),
                 inbound_rx,
+                queued_bytes,
+                stdin_credits,
                 tunnel_handle,
+                session_closed_tx.subscribe(),
+                Some(permit),
             );
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1771,19 +2328,24 @@ fn fail_all_pending_ops(
     for handler in drained {
         match handler {
             StreamHandler::Exec {
-                output_tx,
-                mut exit_tx,
+                inbound_tx,
+                stdin_credits,
                 mut done_tx,
+                ..
             } => {
-                if let Some(tx) = exit_tx.take() {
-                    let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
-                }
+                stdin_credits.close();
                 if let Some(tx) = done_tx.take() {
                     let _ = tx.send(());
                 }
-                drop(output_tx);
+                let _ = inbound_tx.send(ExecInbound::Abort(SandboxError::Transport(
+                    reason.to_owned(),
+                )));
             }
-            StreamHandler::CopyIn { mut reply_tx } => {
+            StreamHandler::CopyIn {
+                stdin_credits,
+                mut reply_tx,
+            } => {
+                stdin_credits.close();
                 if let Some(tx) = reply_tx.take() {
                     let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
                 }
@@ -1796,11 +2358,15 @@ fn fail_all_pending_ops(
             StreamHandler::Tunnel {
                 mut connect_tx,
                 inbound_tx,
+                stdin_credits,
+                ..
             } => {
+                stdin_credits.close();
                 if let Some(tx) = connect_tx.take() {
                     let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
+                } else {
+                    let _ = inbound_tx.send(TunnelInbound::RemoteClose);
                 }
-                drop(inbound_tx);
             }
         }
     }
@@ -2410,6 +2976,10 @@ mod tests {
                             break;
                         }
                     }
+                    Message::StreamCredit {
+                        channel: StreamChannel::Stdout,
+                        ..
+                    } => {}
                     other => panic!("unexpected frame on guest side: {other:?}"),
                 }
             }
@@ -2527,6 +3097,10 @@ mod tests {
                             break;
                         }
                     }
+                    Message::StreamCredit {
+                        channel: StreamChannel::Stdout,
+                        ..
+                    } => {}
                     other => panic!("expected Stdin StreamData, got {other:?}"),
                 }
             }
@@ -2821,6 +3395,10 @@ mod tests {
                             break;
                         }
                     }
+                    Message::StreamCredit {
+                        channel: StreamChannel::Stdout,
+                        ..
+                    } => {}
                     other => panic!("unexpected frame on guest side: {other:?}"),
                 }
             }
@@ -3020,5 +3598,216 @@ mod tests {
         assert!(lock_unpoisoned(&session2.pending_network_ack).is_none());
 
         guest_thread2.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_exec_stream_does_not_block_sibling_exec_or_force_kill() {
+        let listener = AgentIpcEndpoint::bind_temp("drv-stall").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            while let Ok(frame) = read_frame(&mut client) {
+                let sid = frame.header.stream_id;
+                match frame.decode_message().unwrap() {
+                    Message::ExecStart { argv, .. } => {
+                        if argv.first().map(String::as_str) == Some("flood") {
+                            // Emit 300 chunks without waiting so caller's 256-slot output_rx fills up.
+                            for _ in 0..300 {
+                                if write_frame(
+                                    &mut client,
+                                    &Frame::from_message(
+                                        sid,
+                                        &Message::StreamData {
+                                            channel: StreamChannel::Stdout,
+                                            eof: false,
+                                            data: vec![b'F'; 256],
+                                        },
+                                    )
+                                    .unwrap(),
+                                )
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        } else {
+                            let _ = write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::StreamData {
+                                        channel: StreamChannel::Stdout,
+                                        eof: true,
+                                        data: b"fast-ok".to_vec(),
+                                    },
+                                )
+                                .unwrap(),
+                            );
+                            let _ = write_frame(
+                                &mut client,
+                                &Frame::from_message(
+                                    sid,
+                                    &Message::ExecExit {
+                                        code: Some(0),
+                                        timed_out: false,
+                                        stdout_truncated: false,
+                                        stderr_truncated: false,
+                                    },
+                                )
+                                .unwrap(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::from_test_stream(host_stream, Duration::from_secs(2)).unwrap();
+
+        // 1. Start stalled stream and intentionally NEVER read `stalled.next_output()`.
+        let mut stalled = session
+            .exec_stream(ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec!["flood".into()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(10),
+                stdout_budget_bytes: 1024 * 1024,
+                stderr_budget_bytes: 4096,
+            })
+            .await
+            .unwrap();
+
+        // Give guest time to push all 300 chunks past OUTPUT_CHANNEL_CAPACITY (256).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 2. Sibling exec on the same session must still complete promptly without transport stall.
+        let sibling = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.exec_stream(ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec!["echo".into()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(5),
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            }),
+        )
+        .await
+        .expect("sibling exec_stream must not stall")
+        .unwrap();
+        let sibling_out = tokio::time::timeout(Duration::from_secs(2), sibling.collect())
+            .await
+            .expect("sibling collect must not stall")
+            .unwrap();
+        assert_eq!(sibling_out.stdout, b"fast-ok");
+        assert_eq!(sibling_out.exit.code, Some(0));
+
+        // 3. `force_kill` must unblock immediately even while `stalled` has full unread channels.
+        tokio::time::timeout(Duration::from_secs(2), session.force_kill())
+            .await
+            .expect("force_kill must not hang on stalled stream")
+            .unwrap();
+
+        let stalled_exit = tokio::time::timeout(Duration::from_secs(1), stalled.wait_exit())
+            .await
+            .expect("stalled wait_exit must resolve immediately after force_kill");
+        assert!(matches!(stalled_exit, Err(SandboxError::Transport(_))));
+
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn egress_open_caps_concurrent_guest_streams_and_releases_permits_on_close() {
+        use sandbox_protocol::GUEST_STREAM_ID_BIT;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-egress-cap").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let (over_cap_tx, over_cap_rx) = oneshot::channel();
+        let (reopened_tx, reopened_rx) = oneshot::channel();
+        let (close_first_tx, close_first_rx) = oneshot::channel();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            for seq in 1..=(MAX_ACTIVE_GUEST_EGRESS_STREAMS as u32) {
+                let sid = StreamId(GUEST_STREAM_ID_BIT | seq);
+                write_frame(
+                    &mut client,
+                    &Frame::from_message(sid, &Message::EgressOpen).unwrap(),
+                )
+                .unwrap();
+                let ack = read_frame(&mut client).unwrap();
+                assert_eq!(ack.header.stream_id, sid);
+                assert_eq!(ack.decode_message().unwrap(), Message::ConnectAck);
+            }
+
+            // Stream #65 must be rejected immediately with ConnectError.
+            let extra_sid =
+                StreamId(GUEST_STREAM_ID_BIT | (MAX_ACTIVE_GUEST_EGRESS_STREAMS as u32 + 1));
+            write_frame(
+                &mut client,
+                &Frame::from_message(extra_sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+            let rej = read_frame(&mut client).unwrap();
+            assert_eq!(rej.header.stream_id, extra_sid);
+            assert!(matches!(
+                rej.decode_message().unwrap(),
+                Message::ConnectError { message } if message.contains("too many concurrent")
+            ));
+            let _ = over_cap_tx.send(());
+
+            // Wait for host to drop one stream, then verify a new EgressOpen succeeds.
+            let _ = close_first_rx.blocking_recv();
+            loop {
+                let frame = read_frame(&mut client).unwrap();
+                if matches!(frame.decode_message().unwrap(), Message::StreamClose) {
+                    break;
+                }
+            }
+            let retry_sid =
+                StreamId(GUEST_STREAM_ID_BIT | (MAX_ACTIVE_GUEST_EGRESS_STREAMS as u32 + 2));
+            write_frame(
+                &mut client,
+                &Frame::from_message(retry_sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+            let ack2 = read_frame(&mut client).unwrap();
+            assert_eq!(ack2.header.stream_id, retry_sid);
+            assert_eq!(ack2.decode_message().unwrap(), Message::ConnectAck);
+            let _ = reopened_tx.send(());
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let (session, mut egress_rx) =
+            QemuVmSession::from_test_stream_with_egress(host_stream, Duration::from_secs(2))
+                .unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_ACTIVE_GUEST_EGRESS_STREAMS {
+            held.push(egress_rx.recv().await.unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(2), over_cap_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Drop one held TunnelStream and confirm its permit is released so retry_sid is accepted.
+        drop(held.pop());
+        let _ = close_first_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), reopened_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
     }
 }

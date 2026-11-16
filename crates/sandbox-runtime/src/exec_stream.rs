@@ -111,20 +111,48 @@ impl ExecStream {
     }
 
     /// Waits for the execution's terminal [`ExecExitStatus`] or transport/execution failure.
+    ///
+    /// If the caller has not drained `stdout`/`stderr` via [`Self::next_output`], unread output
+    /// chunks are discarded while awaiting exit so bounded output channels cannot deadlock the
+    /// producer before `ExecExit` is delivered.
     pub async fn wait_exit(&mut self) -> Result<ExecExitStatus, SandboxError> {
         if let Some(res) = &self.cached_exit {
             return res.clone();
         }
-        let Some(rx) = self.exit_rx.take() else {
+        let Some(mut rx) = self.exit_rx.take() else {
             return Err(SandboxError::Internal(
                 "execution exit status receiver unavailable".to_owned(),
             ));
         };
-        let res = match rx.await {
+
+        let res = match rx.try_recv() {
             Ok(status) => status,
-            Err(_) => Err(SandboxError::Transport(
+            Err(oneshot::error::TryRecvError::Closed) => Err(SandboxError::Transport(
                 "execution stream terminated before reporting exit status".to_owned(),
             )),
+            Err(oneshot::error::TryRecvError::Empty) => loop {
+                tokio::select! {
+                    biased;
+                    exit_res = &mut rx => {
+                        break match exit_res {
+                            Ok(status) => status,
+                            Err(_) => Err(SandboxError::Transport(
+                                "execution stream terminated before reporting exit status".to_owned(),
+                            )),
+                        };
+                    }
+                    chunk = self.output_rx.recv() => {
+                        if chunk.is_none() {
+                            break match rx.await {
+                                Ok(status) => status,
+                                Err(_) => Err(SandboxError::Transport(
+                                    "execution stream terminated before reporting exit status".to_owned(),
+                                )),
+                            };
+                        }
+                    }
+                }
+            },
         };
         self.cached_exit = Some(res.clone());
         res
@@ -296,5 +324,35 @@ mod tests {
             stream.wait_exit().await,
             Err(SandboxError::Transport(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn exec_stream_wait_exit_drains_unread_output_above_channel_capacity() {
+        let (mut stream, handle) = ExecStream::channel(StreamId(23));
+
+        let producer = tokio::spawn(async move {
+            for _ in 0..(OUTPUT_CHANNEL_CAPACITY + 32) {
+                handle
+                    .send_output(ExecOutputChunk {
+                        stream: OutputStreamKind::Stdout,
+                        data: b"x".to_vec(),
+                    })
+                    .await
+                    .expect("wait_exit must drain output_rx so producer does not deadlock");
+            }
+            handle.finish(Ok(ExecExitStatus {
+                code: Some(0),
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }));
+        });
+
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), stream.wait_exit())
+            .await
+            .expect("wait_exit must not hang when output exceeds channel capacity")
+            .unwrap();
+        assert_eq!(exit.code, Some(0));
+        producer.await.unwrap();
     }
 }

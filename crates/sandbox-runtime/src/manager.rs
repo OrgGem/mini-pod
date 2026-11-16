@@ -42,6 +42,7 @@ use crate::{is_symlink_or_reparse, map_fs_error, RuntimeManager};
 
 const MAX_GUEST_PATH_BYTES: usize = 4096;
 const EGRESS_PROXY_PORT: u16 = 3128;
+const MAX_CONCURRENT_EGRESS_STREAMS: usize = 64;
 
 /// Configuration for [`LocalRuntimeManager`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +168,10 @@ fn spawn_egress_acceptor(
                 maybe_stream = rx.recv() => {
                     match maybe_stream {
                         Some(stream) => {
+                            if tasks.len() >= MAX_CONCURRENT_EGRESS_STREAMS {
+                                drop(stream);
+                                continue;
+                            }
                             let proxy = Arc::clone(&proxy);
                             tasks.spawn(async move {
                                 proxy.handle_stream(stream).await;

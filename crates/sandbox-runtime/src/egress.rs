@@ -4,8 +4,10 @@
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use sandbox_core::{domain_matches_rule, normalize_egress_domain, NetworkPolicy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -15,6 +17,9 @@ const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
 const MAX_HEADER_COUNT: usize = 128;
 const MAX_CHUNK_LINE_BYTES: usize = 4096;
 const STREAM_COPY_BUF_BYTES: usize = 16 * 1024;
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Returns `true` if `ip` belongs to any non-global, private, loopback, link-local,
 /// multicast, reserved, documentation, or tunneled/mapped special-purpose range.
@@ -142,9 +147,111 @@ pub struct TcpUpstreamDialer;
 #[async_trait::async_trait]
 impl UpstreamDialer for TcpUpstreamDialer {
     async fn connect(&self, addr: SocketAddr) -> io::Result<BoxedUpstreamStream> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = tokio::time::timeout(DEFAULT_UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "upstream TCP connect timed out"))??;
         let _ = stream.set_nodelay(true);
         Ok(Box::pin(stream))
+    }
+}
+
+struct ActivityTracker {
+    origin: Instant,
+    last_active_ns: AtomicU64,
+    connected: AtomicBool,
+}
+
+impl ActivityTracker {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_active_ns: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
+        }
+    }
+
+    fn record_activity(&self) {
+        let ns = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last_active_ns.store(ns, Ordering::Release);
+    }
+
+    fn mark_connected(&self) {
+        self.record_activity();
+        self.connected.store(true, Ordering::Release);
+    }
+
+    async fn wait_until_expired(&self, handshake_timeout: Duration, idle_timeout: Duration) {
+        loop {
+            if !self.connected.load(Ordering::Acquire) {
+                let elapsed = self.origin.elapsed();
+                if elapsed >= handshake_timeout {
+                    return;
+                }
+                let remaining = handshake_timeout.saturating_sub(elapsed);
+                tokio::time::sleep(remaining.min(idle_timeout).max(Duration::from_millis(5))).await;
+            } else {
+                let last = Duration::from_nanos(self.last_active_ns.load(Ordering::Acquire));
+                let idle = self.origin.elapsed().saturating_sub(last);
+                if idle >= idle_timeout {
+                    return;
+                }
+                tokio::time::sleep((idle_timeout - idle).max(Duration::from_millis(5))).await;
+            }
+        }
+    }
+}
+
+struct TrackedIo<S> {
+    inner: S,
+    tracker: Arc<ActivityTracker>,
+}
+
+impl<S> TrackedIo<S> {
+    fn new(inner: S, tracker: Arc<ActivityTracker>) -> Self {
+        Self { inner, tracker }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for TrackedIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            if buf.filled().len() > before {
+                this.tracker.record_activity();
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                this.tracker.record_activity();
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -154,6 +261,8 @@ pub struct HostEgressProxy {
     policy: NetworkPolicy,
     dns: Arc<dyn HostDnsResolver>,
     dialer: Arc<dyn UpstreamDialer>,
+    handshake_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 impl HostEgressProxy {
@@ -163,10 +272,29 @@ impl HostEgressProxy {
         dns: Arc<dyn HostDnsResolver>,
         dialer: Arc<dyn UpstreamDialer>,
     ) -> Self {
+        Self::with_timeouts(
+            policy,
+            dns,
+            dialer,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            DEFAULT_IDLE_TIMEOUT,
+        )
+    }
+
+    /// Builds a [`HostEgressProxy`] with explicit handshake and post-connect idle timeouts.
+    pub fn with_timeouts(
+        policy: NetworkPolicy,
+        dns: Arc<dyn HostDnsResolver>,
+        dialer: Arc<dyn UpstreamDialer>,
+        handshake_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             policy,
             dns,
             dialer,
+            handshake_timeout: handshake_timeout.max(Duration::from_millis(1)),
+            idle_timeout: idle_timeout.max(Duration::from_millis(1)),
         }
     }
 
@@ -185,6 +313,25 @@ impl HostEgressProxy {
             return;
         }
 
+        let tracker = Arc::new(ActivityTracker::new());
+        let mut tracked = TrackedIo::new(&mut stream, Arc::clone(&tracker));
+        let handshake_timeout = self.handshake_timeout;
+        let idle_timeout = self.idle_timeout;
+
+        let completed = tokio::select! {
+            biased;
+            () = tracker.wait_until_expired(handshake_timeout, idle_timeout) => false,
+            () = self.handle_tracked_stream(&mut tracked, Arc::clone(&tracker)) => true,
+        };
+        if !completed {
+            let _ = stream.shutdown().await;
+        }
+    }
+
+    async fn handle_tracked_stream<S>(&self, mut stream: S, tracker: Arc<ActivityTracker>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         let mut first = [0u8; 1];
         match stream.read(&mut first).await {
             Ok(0) | Err(_) => return,
@@ -192,10 +339,10 @@ impl HostEgressProxy {
         }
 
         if first[0] == 0x05 {
-            self.handle_socks5(stream).await;
+            self.handle_socks5(stream, tracker).await;
         } else {
             let prefixed = PrefixedStream::with_prefix(stream, vec![first[0]]);
-            self.handle_http(prefixed).await;
+            self.handle_http(prefixed, tracker).await;
         }
     }
 
@@ -290,11 +437,18 @@ impl HostEgressProxy {
             .collect())
     }
 
-    async fn connect_validated(&self, addrs: &[SocketAddr]) -> io::Result<BoxedUpstreamStream> {
+    async fn connect_validated(
+        &self,
+        addrs: &[SocketAddr],
+        tracker: &Arc<ActivityTracker>,
+    ) -> io::Result<TrackedIo<BoxedUpstreamStream>> {
         let mut last_err = None;
         for &addr in addrs {
             match self.dialer.connect(addr).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    tracker.mark_connected();
+                    return Ok(TrackedIo::new(stream, Arc::clone(tracker)));
+                }
                 Err(err) => last_err = Some(err),
             }
         }
@@ -303,7 +457,7 @@ impl HostEgressProxy {
         }))
     }
 
-    async fn handle_socks5<S>(&self, mut stream: S)
+    async fn handle_socks5<S>(&self, mut stream: S, tracker: Arc<ActivityTracker>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -407,7 +561,7 @@ impl HostEgressProxy {
             }
         };
 
-        let mut upstream = match self.connect_validated(&addrs).await {
+        let mut upstream = match self.connect_validated(&addrs, &tracker).await {
             Ok(up) => up,
             Err(err) => {
                 let code = match err.kind() {
@@ -428,7 +582,7 @@ impl HostEgressProxy {
         let _ = stream.shutdown().await;
     }
 
-    async fn handle_http<S>(&self, mut client: PrefixedStream<S>)
+    async fn handle_http<S>(&self, mut client: PrefixedStream<S>, tracker: Arc<ActivityTracker>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -461,9 +615,9 @@ impl HostEgressProxy {
         };
 
         if req.method == "CONNECT" {
-            self.handle_http_connect(client, req).await;
+            self.handle_http_connect(client, req, tracker).await;
         } else if is_supported_forward_method(&req.method) {
-            self.handle_http_forward(client, req).await;
+            self.handle_http_forward(client, req, tracker).await;
         } else {
             let _ = write_http_error(
                 &mut client,
@@ -475,8 +629,12 @@ impl HostEgressProxy {
         }
     }
 
-    async fn handle_http_connect<S>(&self, mut client: PrefixedStream<S>, req: HttpRequestHead)
-    where
+    async fn handle_http_connect<S>(
+        &self,
+        mut client: PrefixedStream<S>,
+        req: HttpRequestHead,
+        tracker: Arc<ActivityTracker>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         if req.body_mode != BodyMode::Empty {
@@ -536,7 +694,7 @@ impl HostEgressProxy {
             }
         };
 
-        let mut upstream = match self.connect_validated(&addrs).await {
+        let mut upstream = match self.connect_validated(&addrs, &tracker).await {
             Ok(up) => up,
             Err(_) => {
                 let _ = write_http_error(
@@ -569,8 +727,12 @@ impl HostEgressProxy {
         let _ = client.shutdown().await;
     }
 
-    async fn handle_http_forward<S>(&self, mut client: PrefixedStream<S>, req: HttpRequestHead)
-    where
+    async fn handle_http_forward<S>(
+        &self,
+        mut client: PrefixedStream<S>,
+        req: HttpRequestHead,
+        tracker: Arc<ActivityTracker>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let parsed_target = match parse_proxy_http_url(&req.raw_target) {
@@ -613,7 +775,7 @@ impl HostEgressProxy {
             }
         };
 
-        let upstream_stream = match self.connect_validated(&addrs).await {
+        let upstream_stream = match self.connect_validated(&addrs, &tracker).await {
             Ok(up) => up,
             Err(_) => {
                 let _ = write_http_error(
@@ -2303,5 +2465,70 @@ mod tests {
 
         assert_eq!(dns.call_count(), 2);
         assert_eq!(dialer.dialed(), vec![ip1, ip2, ip1]);
+    }
+
+    #[tokio::test]
+    async fn idle_handshake_and_idle_tunnel_streams_expire_within_configured_timeouts() {
+        let dns = MockDnsResolver::with_responses(vec![Ok(vec![SocketAddr::from((
+            [93, 184, 216, 34],
+            443,
+        ))])]);
+        let (mut peer_a, upstream_b) = tokio::io::duplex(4096);
+        let upstream_slot = Arc::new(std::sync::Mutex::new(Some(upstream_b)));
+        struct HoldOpenDialer(Arc<std::sync::Mutex<Option<tokio::io::DuplexStream>>>);
+        #[async_trait::async_trait]
+        impl UpstreamDialer for HoldOpenDialer {
+            async fn connect(&self, _addr: SocketAddr) -> io::Result<BoxedUpstreamStream> {
+                let s = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| io::Error::new(ErrorKind::Other, "already taken"))?;
+                Ok(Box::pin(s))
+            }
+        }
+
+        let proxy = HostEgressProxy::with_timeouts(
+            NetworkPolicy::InternetOnly,
+            dns,
+            Arc::new(HoldOpenDialer(upstream_slot)),
+            Duration::from_millis(60),
+            Duration::from_millis(80),
+        );
+
+        // 1. Silent stream sending zero bytes must be reaped by handshake_timeout.
+        let (mut idle_client, proxy_side) = tokio::io::duplex(1024);
+        let p1 = proxy.clone();
+        let h1 = tokio::spawn(async move {
+            p1.handle_stream(proxy_side).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), h1)
+            .await
+            .expect("silent stream must time out promptly")
+            .unwrap();
+        let mut probe = [0u8; 4];
+        assert_eq!(idle_client.read(&mut probe).await.unwrap(), 0);
+
+        // 2. Established CONNECT tunnel that goes idle must be reaped by idle_timeout.
+        let (mut tunnel_client, proxy_side2) = tokio::io::duplex(4096);
+        let p2 = proxy.clone();
+        let h2 = tokio::spawn(async move {
+            p2.handle_stream(proxy_side2).await;
+        });
+        tunnel_client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp_buf = [0u8; 64];
+        let n = tunnel_client.read(&mut resp_buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp_buf[..n]).starts_with("HTTP/1.1 200"));
+
+        // Keep peer_a open without sending anything; proxy must terminate after idle_timeout.
+        tokio::time::timeout(Duration::from_secs(1), h2)
+            .await
+            .expect("idle established tunnel must time out promptly")
+            .unwrap();
+        assert_eq!(peer_a.read(&mut probe).await.unwrap(), 0);
     }
 }

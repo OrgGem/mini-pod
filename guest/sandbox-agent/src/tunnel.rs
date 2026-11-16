@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use crate::OutboundQueue;
 
 const TUNNEL_READ_CHUNK_BYTES: usize = 64 * 1024;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TUNNEL_STDIN_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) enum TunnelInput {
     Data { data: Vec<u8>, eof: bool },
@@ -31,6 +33,7 @@ struct TunnelState {
 /// Active tunnel handle (host- or guest-initiated) supporting concurrent input, abort, and shutdown.
 pub(crate) struct ActiveTunnel {
     stream_id: StreamId,
+    queued_stdin_bytes: AtomicUsize,
     state: Mutex<TunnelState>,
 }
 
@@ -39,6 +42,7 @@ impl ActiveTunnel {
         let (stdin_tx, stdin_rx) = mpsc::channel();
         let handle = Arc::new(Self {
             stream_id,
+            queued_stdin_bytes: AtomicUsize::new(0),
             state: Mutex::new(TunnelState {
                 closed: false,
                 stdin_tx: Some(stdin_tx),
@@ -60,6 +64,7 @@ impl ActiveTunnel {
         let (connect_tx, connect_rx) = mpsc::channel();
         let handle = Arc::new(Self {
             stream_id,
+            queued_stdin_bytes: AtomicUsize::new(0),
             state: Mutex::new(TunnelState {
                 closed: false,
                 stdin_tx: Some(stdin_tx),
@@ -83,20 +88,38 @@ impl ActiveTunnel {
         }
     }
 
-    pub(crate) fn push_stdin(&self, data: Vec<u8>, eof: bool) {
+    pub(crate) fn push_stdin(&self, data: Vec<u8>, eof: bool, outbound: &OutboundQueue) {
+        let len = data.len();
+        let prev = self.queued_stdin_bytes.fetch_add(len, Ordering::AcqRel);
+        if prev.saturating_add(len) > MAX_TUNNEL_STDIN_BUFFER_BYTES {
+            self.queued_stdin_bytes.fetch_sub(len, Ordering::AcqRel);
+            self.close(outbound);
+            let _ = outbound.push_message(self.stream_id, &Message::StreamClose);
+            return;
+        }
+
         let tx = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.closed {
-                return;
-            }
-            if eof {
+                None
+            } else if eof {
                 guard.stdin_tx.take()
             } else {
                 guard.stdin_tx.clone()
             }
         };
-        if let Some(tx) = tx {
-            let _ = tx.send(TunnelInput::Data { data, eof });
+        let sent = match tx {
+            Some(tx) => tx.send(TunnelInput::Data { data, eof }).is_ok(),
+            None => false,
+        };
+        if !sent {
+            self.queued_stdin_bytes.fetch_sub(len, Ordering::AcqRel);
+        }
+    }
+
+    fn release_stdin_bytes(&self, len: usize) {
+        if len > 0 {
+            self.queued_stdin_bytes.fetch_sub(len, Ordering::AcqRel);
         }
     }
 
@@ -310,7 +333,7 @@ pub(crate) fn relay_tunnel_socket(
     thread::scope(|scope| {
         let writer_handle = Arc::clone(handle);
         let writer_thread = scope.spawn(move || {
-            pump_tunnel_writer(stdin_rx, &mut writer_sock, &writer_handle);
+            pump_tunnel_writer(stream_id, stdin_rx, &mut writer_sock, &writer_handle, outbound);
         });
 
         let read_res = pump_tunnel_reader(stream_id, &mut reader_sock, handle, outbound);
@@ -363,17 +386,26 @@ fn connect_target(
 }
 
 fn pump_tunnel_writer(
+    stream_id: StreamId,
     stdin_rx: mpsc::Receiver<TunnelInput>,
     writer: &mut TunnelSocket,
     handle: &ActiveTunnel,
+    outbound: &OutboundQueue,
 ) {
     while let Ok(TunnelInput::Data { data, eof }) = stdin_rx.recv() {
+        let len = data.len();
         if handle.is_closed() {
+            handle.release_stdin_bytes(len);
             break;
         }
-        if !data.is_empty() && writer.write_all(&data).is_err() {
+        if len > 0 && writer.write_all(&data).is_err() {
+            handle.release_stdin_bytes(len);
             let _ = writer.shutdown(Shutdown::Write);
             break;
+        }
+        handle.release_stdin_bytes(len);
+        if len > 0 && !eof {
+            let _ = outbound.send_stdin_credit(stream_id, len);
         }
         if eof {
             let _ = writer.shutdown(Shutdown::Write);
@@ -522,20 +554,27 @@ mod tests {
         });
 
         // Push request then half-close Stdin while server response hasn't finished yet.
-        handle.push_stdin(b"PING ".to_vec(), false);
-        handle.push_stdin(b"/health\n".to_vec(), true);
+        handle.push_stdin(b"PING ".to_vec(), false, &outbound);
+        handle.push_stdin(b"/health\n".to_vec(), true, &outbound);
 
         worker.join().unwrap();
         server.join().unwrap();
         outbound.finish_and_drain();
 
         let mut ack_seen = false;
+        let mut stdin_credit_bytes = 0u64;
         let mut received = Vec::new();
         let mut eof_seen = false;
         while let Some(frame) = outbound.pop_for_writer() {
             assert_eq!(frame.header.stream_id, stream_id);
             match frame.decode_message().unwrap() {
                 Message::ConnectAck => ack_seen = true,
+                Message::StreamCredit {
+                    channel: StreamChannel::Stdin,
+                    bytes,
+                } => {
+                    stdin_credit_bytes += u64::from(bytes);
+                }
                 Message::StreamData {
                     channel: StreamChannel::Stdout,
                     eof,
@@ -551,6 +590,7 @@ mod tests {
         }
 
         assert!(ack_seen);
+        assert_eq!(stdin_credit_bytes, 5);
         assert!(eof_seen);
         assert_eq!(received.len(), 70_005);
         assert!(received[..70_000].iter().all(|&b| b == b'A'));
@@ -654,5 +694,24 @@ mod tests {
         }
         assert!(outbound.pop_for_writer().is_none());
         assert!(!active_tunnels.lock().unwrap().contains_key(&stream_id));
+    }
+
+    #[test]
+    fn active_tunnel_aborts_and_emits_stream_close_when_stdin_buffer_exceeds_cap() {
+        let outbound = OutboundQueue::new();
+        let stream_id = StreamId(99);
+        let (handle, _stdin_rx) = ActiveTunnel::new(stream_id);
+
+        handle.push_stdin(vec![b'a'; 1024 * 1024], false, &outbound);
+        assert!(!handle.is_closed());
+
+        // Exceed MAX_TUNNEL_STDIN_BUFFER_BYTES (2 MiB) without consumer draining _stdin_rx.
+        handle.push_stdin(vec![b'b'; (1024 * 1024) + 1], false, &outbound);
+        assert!(handle.is_closed());
+
+        outbound.finish_and_drain();
+        let close_frame = outbound.pop_for_writer().expect("StreamClose expected");
+        assert_eq!(close_frame.header.stream_id, stream_id);
+        assert_eq!(close_frame.decode_message().unwrap(), Message::StreamClose);
     }
 }

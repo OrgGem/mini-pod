@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use sandbox_protocol::{
-    is_guest_stream_id, Message, ProtocolError, StreamId, GUEST_STREAM_ID_BIT,
-    HOST_STREAM_ID_MAX,
+    is_guest_stream_id, Message, ProtocolError, StreamChannel, StreamId, GUEST_STREAM_ID_BIT,
+    HOST_STREAM_ID_MAX, INITIAL_STREAM_CREDIT_BYTES,
 };
 
 use crate::tunnel::{relay_tunnel_socket, ActiveTunnel, TunnelSocket};
@@ -307,11 +307,17 @@ fn spawn_egress_connection(
         map.insert(guest_sid, Arc::clone(&handle));
     }
 
+    outbound.seed_default_credit(
+        guest_sid,
+        StreamChannel::Stdout,
+        INITIAL_STREAM_CREDIT_BYTES,
+    );
     if outbound.push_message(guest_sid, &Message::EgressOpen).is_err() {
         active_tunnels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&guest_sid);
+        outbound.clear_stream(guest_sid);
         handle.close(outbound);
         return None;
     }
@@ -487,8 +493,8 @@ mod tests {
         // Host sends > 64 KiB response back via Stdin and half-closes Stdin.
         {
             let handle = active_tunnels.lock().unwrap().get(&guest_sid).cloned().unwrap();
-            handle.push_stdin(vec![b'R'; 70_000], false);
-            handle.push_stdin(b"-END".to_vec(), true);
+            handle.push_stdin(vec![b'R'; 70_000], false, &outbound);
+            handle.push_stdin(b"-END".to_vec(), true, &outbound);
         }
 
         let mut resp = Vec::new();

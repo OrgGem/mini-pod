@@ -13,6 +13,8 @@ use std::{fmt, io};
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 12;
 pub const MAX_FRAME_PAYLOAD_BYTES: u32 = 1024 * 1024;
+/// Default initial per-channel byte credit window (`256 KiB`) for `Data` streams.
+pub const INITIAL_STREAM_CREDIT_BYTES: u32 = 256 * 1024;
 pub const HOST_STREAM_ID_MAX: u32 = 0x7fff_ffff;
 pub const GUEST_STREAM_ID_BIT: u32 = 0x8000_0000;
 
