@@ -53,6 +53,7 @@ pub trait VmSessionPort: Send + Sync {
     fn start_token(&self) -> u64;
     fn artifact_paths(&self) -> &[PathBuf];
     fn is_alive(&self) -> bool;
+    fn current_rss_bytes(&self) -> Option<u64>;
     async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError>;
     async fn open_tunnel(&self, target: StreamTargetWire) -> Result<TunnelStream, SandboxError>;
     async fn copy_in_tar(

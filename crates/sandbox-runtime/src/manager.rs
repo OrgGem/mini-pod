@@ -1064,6 +1064,10 @@ mod tests {
             self.state.alive.load(Ordering::Acquire)
         }
 
+        fn current_rss_bytes(&self) -> Option<u64> {
+            self.is_alive().then_some(64 * 1024 * 1024)
+        }
+
         async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError> {
             let (stream, handle) = ExecStream::channel(StreamId(1));
             tokio::spawn(async move {

@@ -12,89 +12,221 @@ use std::path::Path;
 use std::ptr;
 use std::time::Duration;
 
-use sandbox_core::SandboxError;
+use sandbox_core::{EnforcementLevel, SandboxError};
 use windows_sys::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
-    FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_NOT_SUPPORTED, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    CreateJobObjectW, JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    CreateProcessW, DeleteProcThreadAttributeList, GetActiveProcessorCount, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, ALL_PROCESSOR_GROUPS,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use crate::accel::classify_launch_error;
 use crate::os::windows::{to_wide_null, win32_error, OwnedHandle};
 use crate::process::{
-    ProcessExitStatus, ProcessLaunchSpec, ProcessStartIdentity, ProcessStdio,
+    ProcessExitStatus, ProcessLaunchSpec, ProcessResourceCapabilities, ProcessStartIdentity,
+    ProcessStdio,
 };
 
-pub use crate::process::quote_windows_command_line;
+pub use crate::process::{millicores_to_windows_cpu_rate, quote_windows_command_line};
 
 pub(crate) type PlatformConfinedProcess = WindowsConfinedProcess;
 
 const ORPHAN_TERMINATE_WAIT_MS: u32 = 10_000;
 
-/// RAII Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+/// RAII Win32 Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and optional
+/// hard CPU rate / job commit memory limits.
 ///
 /// Dropping this handle instructs the Windows kernel to terminate all processes (including any
 /// spawned descendants) assigned to the job.
 pub struct WindowsJobObject {
     handle: OwnedHandle,
+    capabilities: ProcessResourceCapabilities,
 }
 
 // SAFETY: Win32 Job Object kernel handles are safe to transfer and reference across threads;
 // handle closing happens once in `Drop` with exclusive `&mut self` access.
 unsafe impl Send for WindowsJobObject {}
-// SAFETY: Shared references only expose the raw kernel handle value; mutations/destruction
-// require ownership or `&mut self`.
+// SAFETY: Shared references only expose immutable capability metadata and the raw kernel handle;
+// mutations/destruction require ownership or `&mut self`.
 unsafe impl Sync for WindowsJobObject {}
 
 impl WindowsJobObject {
     /// Creates an anonymous Win32 Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set.
     pub fn new_kill_on_close() -> Result<Self, SandboxError> {
+        Self::new_with_limits(None, None)
+    }
+
+    /// Creates an anonymous Win32 Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+    /// applies optional hard CPU rate and job memory commit limits, recording the honestly
+    /// achieved [`ProcessResourceCapabilities`].
+    pub fn new_with_limits(
+        cpu_quota_millicores: Option<u32>,
+        memory_limit_bytes: Option<u64>,
+    ) -> Result<Self, SandboxError> {
+        if cpu_quota_millicores == Some(0) {
+            return Err(SandboxError::InvalidSpec(
+                "WindowsJobObject cpu_quota_millicores must be >= 1".to_owned(),
+            ));
+        }
+        if memory_limit_bytes == Some(0) {
+            return Err(SandboxError::InvalidSpec(
+                "WindowsJobObject memory_limit_bytes must be >= 1".to_owned(),
+            ));
+        }
+
         // SAFETY: Null security attributes and null name create a private anonymous Job Object.
         let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
         let handle = OwnedHandle::from_raw(raw).map_err(|err| {
             SandboxError::Internal(format!("CreateJobObjectW failed: {err}"))
         })?;
 
+        // Always enforce kill-on-close first as a mandatory Never-Cut invariant.
         // SAFETY: `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` is POD; zeroing initializes reserved fields.
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-        // SAFETY: `handle` is an open Job Object; `info` matches `JobObjectExtendedLimitInformation`.
-        let ok = unsafe {
+        let mut base_info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        base_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `handle` is an open Job Object; `base_info` matches `JobObjectExtendedLimitInformation`.
+        let base_ok = unsafe {
             SetInformationJobObject(
                 handle.as_raw(),
                 JobObjectExtendedLimitInformation,
-                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                (&base_info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
-        if ok == 0 {
+        if base_ok == 0 {
             return Err(win32_error("SetInformationJobObject(KILL_ON_JOB_CLOSE)"));
         }
 
-        Ok(Self { handle })
+        let host_rss = match memory_limit_bytes {
+            Some(bytes) => {
+                let limit = usize::try_from(bytes).map_err(|_| {
+                    SandboxError::InvalidSpec(format!(
+                        "memory_limit_bytes ({bytes}) exceeds addressable Win32 usize"
+                    ))
+                })?;
+                let mut mem_info = base_info;
+                mem_info.BasicLimitInformation.LimitFlags =
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY;
+                mem_info.JobMemoryLimit = limit;
+
+                // SAFETY: `handle` is an open Job Object; `mem_info` matches `JobObjectExtendedLimitInformation`.
+                let mem_ok = unsafe {
+                    SetInformationJobObject(
+                        handle.as_raw(),
+                        JobObjectExtendedLimitInformation,
+                        (&mem_info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    )
+                };
+                if mem_ok != 0 {
+                    EnforcementLevel::HardLimit
+                } else {
+                    let err = io::Error::last_os_error();
+                    if is_job_limit_access_or_unsupported(&err) {
+                        EnforcementLevel::Unsupported
+                    } else {
+                        return Err(SandboxError::Internal(format!(
+                            "SetInformationJobObject(JOB_MEMORY) failed: {err}"
+                        )));
+                    }
+                }
+            }
+            None => EnforcementLevel::BestEffort,
+        };
+
+        let cpu_quota = match cpu_quota_millicores {
+            Some(millicores) => {
+                let rate = millicores_to_windows_cpu_rate(millicores, host_logical_cpu_count());
+                // SAFETY: `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION` is POD; zeroing initializes union padding.
+                let mut cpu_info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { zeroed() };
+                cpu_info.ControlFlags =
+                    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+                cpu_info.Anonymous.CpuRate = rate;
+
+                // SAFETY: `handle` is an open Job Object; `cpu_info` matches `JobObjectCpuRateControlInformation`.
+                let cpu_ok = unsafe {
+                    SetInformationJobObject(
+                        handle.as_raw(),
+                        JobObjectCpuRateControlInformation,
+                        (&cpu_info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+                        size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                    )
+                };
+                if cpu_ok != 0 {
+                    EnforcementLevel::HardLimit
+                } else {
+                    let err = io::Error::last_os_error();
+                    if is_job_limit_access_or_unsupported(&err) {
+                        EnforcementLevel::Unsupported
+                    } else {
+                        return Err(SandboxError::Internal(format!(
+                            "SetInformationJobObject(CpuRateControl) failed: {err}"
+                        )));
+                    }
+                }
+            }
+            None => EnforcementLevel::BestEffort,
+        };
+
+        Ok(Self {
+            handle,
+            capabilities: ProcessResourceCapabilities {
+                cpu_quota,
+                host_rss,
+            },
+        })
     }
 
     /// Returns the underlying Win32 Job Object `HANDLE`.
     pub fn as_raw_handle(&self) -> HANDLE {
         self.handle.as_raw()
+    }
+
+    /// Returns the CPU and memory enforcement capabilities achieved on this Job Object.
+    pub fn capabilities(&self) -> ProcessResourceCapabilities {
+        self.capabilities
+    }
+}
+
+fn is_job_limit_access_or_unsupported(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code)
+            if code == ERROR_ACCESS_DENIED as i32
+                || code == ERROR_NOT_SUPPORTED as i32
+                || code == ERROR_INVALID_PARAMETER as i32
+    )
+}
+
+fn host_logical_cpu_count() -> usize {
+    // SAFETY: `ALL_PROCESSOR_GROUPS` returns active logical processors across all Windows processor groups.
+    let active = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    if active > 0 {
+        active as usize
+    } else {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
     }
 }
 
@@ -210,13 +342,14 @@ pub struct WindowsConfinedProcess {
     job: Option<WindowsJobObject>,
     process: OwnedHandle,
     identity: ProcessStartIdentity,
+    capabilities: ProcessResourceCapabilities,
     exited: Option<ProcessExitStatus>,
 }
 
 // SAFETY: `WindowsJobObject` and `OwnedHandle` wrap thread-safe Win32 kernel handles; all state
 // transitions require `&mut self` or exclusive ownership in `Drop`.
 unsafe impl Send for WindowsConfinedProcess {}
-// SAFETY: Shared references only inspect immutable `ProcessStartIdentity` (`Copy` values).
+// SAFETY: Shared references only inspect immutable `ProcessStartIdentity` and `ProcessResourceCapabilities`.
 unsafe impl Sync for WindowsConfinedProcess {}
 
 impl WindowsConfinedProcess {
@@ -228,6 +361,39 @@ impl WindowsConfinedProcess {
     /// Returns the PID and `GetProcessTimes` creation timestamp token.
     pub fn start_identity(&self) -> ProcessStartIdentity {
         self.identity
+    }
+
+    /// Returns the CPU and memory enforcement levels applied to this process's Job Object.
+    pub fn resource_capabilities(&self) -> ProcessResourceCapabilities {
+        self.capabilities
+    }
+
+    /// Samples the live working-set size (`PROCESS_MEMORY_COUNTERS::WorkingSetSize`) via
+    /// `GetProcessMemoryInfo`, or `None` if the process has already exited.
+    pub fn current_rss_bytes(&self) -> Option<u64> {
+        if self.exited.is_some() {
+            return None;
+        }
+        // SAFETY: `self.process.as_raw()` is an open Win32 process handle with `SYNCHRONIZE`.
+        if unsafe { WaitForSingleObject(self.process.as_raw(), 0) } != WAIT_TIMEOUT {
+            return None;
+        }
+        // SAFETY: `PROCESS_MEMORY_COUNTERS` is POD; `cb` is initialized to exact struct size.
+        let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
+        pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // SAFETY: `self.process.as_raw()` is an open process handle from `CreateProcessW` and `pmc`
+        // is valid writable stack storage.
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                self.process.as_raw(),
+                &mut pmc,
+                size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(pmc.WorkingSetSize as u64)
     }
 
     /// Non-blocking check for process exit.
@@ -317,12 +483,14 @@ impl Drop for WindowsConfinedProcess {
 pub fn spawn_in_job_with_handle_whitelist(
     spec: &WindowsSpawnSpec<'_>,
 ) -> Result<WindowsConfinedProcess, SandboxError> {
-    spawn_in_job_internal(spec, None)
+    spawn_in_job_internal(spec, None, None, None)
 }
 
 pub(crate) fn spawn_in_job_internal(
     spec: &WindowsSpawnSpec<'_>,
     unicode_env_block: Option<&[u16]>,
+    cpu_quota_millicores: Option<u32>,
+    memory_limit_bytes: Option<u64>,
 ) -> Result<WindowsConfinedProcess, SandboxError> {
     let wide_program = to_wide_null(spec.program.as_os_str())?;
     let mut wide_cmdline = quote_windows_command_line(spec.program, spec.args)?;
@@ -332,7 +500,8 @@ pub(crate) fn spawn_in_job_internal(
         .transpose()?;
 
     let mut handle_list = collect_whitelisted_handles(spec)?;
-    let job = WindowsJobObject::new_kill_on_close()?;
+    let job = WindowsJobObject::new_with_limits(cpu_quota_millicores, memory_limit_bytes)?;
+    let capabilities = job.capabilities();
     // `job_handles` and `handle_list` MUST outlive `attr_list` (DeleteProcThreadAttributeList).
     let mut job_handles = [job.as_raw_handle()];
 
@@ -404,6 +573,7 @@ pub(crate) fn spawn_in_job_internal(
             pid: pi.dwProcessId,
             start_token,
         },
+        capabilities,
         exited: None,
     })
 }
@@ -442,7 +612,12 @@ pub(crate) fn spawn_confined(spec: ProcessLaunchSpec) -> Result<WindowsConfinedP
         inherited_handles: &[],
         create_no_window: true,
     };
-    spawn_in_job_with_handle_whitelist(&win_spec)
+    spawn_in_job_internal(
+        &win_spec,
+        None,
+        spec.cpu_quota_millicores,
+        spec.memory_limit_bytes,
+    )
 }
 
 /// Verifies `GetProcessTimes` `ftCreationTime` matches `expected_start_token` before calling
@@ -872,6 +1047,26 @@ mod tests {
                 };
                 assert_ne!(ack_ok, 0);
             }
+            "oom_alloc" => {
+                println!("READY");
+                let _ = io::stdout().flush();
+
+                let mut blocks: Vec<Vec<u8>> = Vec::new();
+                for _ in 0..64 {
+                    let mut chunk = Vec::new();
+                    if chunk.try_reserve_exact(1024 * 1024).is_err() {
+                        println!("ALLOC_FAILED");
+                        let _ = io::stdout().flush();
+                        std::process::exit(77);
+                    }
+                    chunk.resize(1024 * 1024, 0xA5);
+                    std::hint::black_box(&chunk);
+                    blocks.push(chunk);
+                }
+                std::hint::black_box(&blocks);
+                println!("ALLOC_OK");
+                let _ = io::stdout().flush();
+            }
             other => panic!("unexpected {ROLE_ENV} value: {other}"),
         }
     }
@@ -905,8 +1100,8 @@ mod tests {
             inherited_handles: &inherited,
             create_no_window: true,
         };
-        let mut child =
-            spawn_in_job_internal(&spec, Some(&env_block)).expect("spawn probe child");
+        let mut child = spawn_in_job_internal(&spec, Some(&env_block), None, None)
+            .expect("spawn probe child");
 
         // Drop parent write ends so pipe reads observe EOF once child finishes.
         drop(write_a);
@@ -948,7 +1143,7 @@ mod tests {
             inherited_handles: &[],
             create_no_window: true,
         };
-        let confined = spawn_in_job_internal(&spec, Some(&env_block))
+        let confined = spawn_in_job_internal(&spec, Some(&env_block), None, None)
             .expect("spawn confined sleep_with_grandchild");
         drop(out_dup);
         drop(nul_in);
@@ -1131,5 +1326,169 @@ mod tests {
             captured.contains("confined-stderr-ok"),
             "expected captured stderr to contain 'confined-stderr-ok', got {captured:?}"
         );
+    }
+
+    #[test]
+    fn job_object_cpu_and_memory_limits_report_hard_limit_and_sample_live_rss() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let args = helper_args();
+        let env_block = build_unicode_env_block(&[(ROLE_ENV, "sleep")]);
+        let nul_in = open_inheritable_nul(true).expect("open NUL stdin");
+        let nul_out = open_inheritable_nul(false).expect("open NUL stdout");
+        let nul_err = open_inheritable_nul(false).expect("open NUL stderr");
+
+        let spec = WindowsSpawnSpec {
+            program: &exe,
+            args: &args,
+            current_dir: None,
+            stdin: Some(nul_in.as_raw()),
+            stdout: Some(nul_out.as_raw()),
+            stderr: Some(nul_err.as_raw()),
+            inherited_handles: &[],
+            create_no_window: true,
+        };
+
+        // 1. Uncapped spawn reports BestEffort for both capabilities and live RSS > 0.
+        let mut uncapped = spawn_in_job_internal(&spec, Some(&env_block), None, None)
+            .expect("spawn uncapped sleeper");
+        assert_eq!(
+            uncapped.resource_capabilities(),
+            ProcessResourceCapabilities {
+                cpu_quota: EnforcementLevel::BestEffort,
+                host_rss: EnforcementLevel::BestEffort,
+            }
+        );
+        let uncapped_rss = uncapped
+            .current_rss_bytes()
+            .expect("live child must report WorkingSetSize > 0");
+        assert!(uncapped_rss > 0, "expected RSS > 0, got {uncapped_rss}");
+        uncapped.kill_and_wait().expect("kill uncapped sleeper");
+        assert_eq!(uncapped.current_rss_bytes(), None);
+
+        // 2. Capped spawn (500 millicores + 64 MiB) reports HardLimit and live RSS > 0.
+        let mut capped = spawn_in_job_internal(
+            &spec,
+            Some(&env_block),
+            Some(500),
+            Some(64 * 1024 * 1024),
+        )
+        .expect("spawn CPU+memory capped sleeper");
+        let caps = capped.resource_capabilities();
+        assert_eq!(
+            caps.host_rss,
+            EnforcementLevel::HardLimit,
+            "expected HardLimit for JOB_OBJECT_LIMIT_JOB_MEMORY"
+        );
+        assert_eq!(
+            caps.cpu_quota,
+            EnforcementLevel::HardLimit,
+            "expected HardLimit for JobObjectCpuRateControlInformation"
+        );
+        let capped_rss = capped
+            .current_rss_bytes()
+            .expect("live capped child must report WorkingSetSize > 0");
+        assert!(capped_rss > 0, "expected RSS > 0, got {capped_rss}");
+        capped.kill_and_wait().expect("kill capped sleeper");
+        assert_eq!(capped.current_rss_bytes(), None);
+    }
+
+    #[test]
+    fn job_object_memory_cap_blocks_excess_allocation_without_affecting_host() {
+        let dir = CleanupDir::new("oom");
+        let out_path = dir.0.join("oom-stdout.log");
+        let out_file = File::create(&out_path).expect("create stdout capture file");
+        let out_dup = duplicate_inheritable_handle(&out_file).expect("dup stdout file");
+        let nul_in = open_inheritable_nul(true).expect("open NUL stdin");
+        let nul_err = open_inheritable_nul(false).expect("open NUL stderr");
+        drop(out_file);
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let args = helper_args();
+        let env_block = build_unicode_env_block(&[(ROLE_ENV, "oom_alloc")]);
+
+        let spec = WindowsSpawnSpec {
+            program: &exe,
+            args: &args,
+            current_dir: None,
+            stdin: Some(nul_in.as_raw()),
+            stdout: Some(out_dup.as_raw()),
+            stderr: Some(nul_err.as_raw()),
+            inherited_handles: &[],
+            create_no_window: true,
+        };
+        let mut confined = spawn_in_job_internal(
+            &spec,
+            Some(&env_block),
+            None,
+            Some(12 * 1024 * 1024),
+        )
+        .expect("spawn memory-capped allocator child");
+        drop(out_dup);
+        drop(nul_in);
+        drop(nul_err);
+
+        assert_eq!(
+            confined.resource_capabilities().host_rss,
+            EnforcementLevel::HardLimit
+        );
+
+        let status = confined
+            .wait_timeout(Duration::from_secs(10))
+            .expect("wait for memory-capped child")
+            .expect("memory-capped child must exit within 10s");
+        assert!(
+            !status.success(),
+            "allocating 64 MiB inside a 12 MiB Job Object must fail, got {status}"
+        );
+
+        let captured = fs::read_to_string(&out_path).unwrap_or_default();
+        assert!(
+            captured.contains("READY"),
+            "child must start and reach allocation loop before hitting cap; stdout={captured:?} status={status}"
+        );
+        assert!(
+            captured.contains("ALLOC_FAILED"),
+            "allocating 64 MiB inside 12 MiB Job Object must fail inside allocation loop; stdout={captured:?} status={status}"
+        );
+        assert_eq!(status, ProcessExitStatus::Exited(77));
+        assert!(
+            !captured.contains("ALLOC_OK"),
+            "child must not allocate 64 MiB inside a 12 MiB Job Object; stdout={captured:?}"
+        );
+    }
+
+    #[test]
+    fn confined_process_exposes_job_capabilities_and_live_rss_for_cmd() {
+        let comspec = std::env::var_os("COMSPEC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+
+        let mut spec = ProcessLaunchSpec::new(
+            &comspec,
+            vec![
+                "/D".into(),
+                "/C".into(),
+                "ping -n 3 127.0.0.1 > NUL".into(),
+            ],
+        );
+        spec.cpu_quota_millicores = Some(500);
+        spec.memory_limit_bytes = Some(64 * 1024 * 1024);
+
+        let mut proc = crate::process::ConfinedProcess::spawn(spec)
+            .expect("spawn cmd.exe with CPU and memory limits");
+        assert_eq!(
+            proc.resource_capabilities(),
+            ProcessResourceCapabilities {
+                cpu_quota: EnforcementLevel::HardLimit,
+                host_rss: EnforcementLevel::HardLimit,
+            }
+        );
+        let rss = proc
+            .current_rss_bytes()
+            .expect("live confined cmd.exe must report WorkingSetSize > 0");
+        assert!(rss > 0, "expected RSS > 0, got {rss}");
+
+        proc.kill_and_wait().expect("kill confined cmd.exe");
+        assert_eq!(proc.current_rss_bytes(), None);
     }
 }

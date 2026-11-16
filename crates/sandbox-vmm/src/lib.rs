@@ -22,8 +22,10 @@ pub use ipc::{
 };
 pub use launch::{QemuLaunchConfig, AGENT_VIRTIO_PORT_NAME};
 pub use process::{
-    kill_verified_orphan_process, parse_proc_stat_starttime, quote_windows_command_line,
-    ConfinedProcess, ProcessExitStatus, ProcessLaunchSpec, ProcessStartIdentity, ProcessStdio,
+    kill_verified_orphan_process, millicores_to_windows_cpu_rate, parse_proc_self_cgroup_v2,
+    parse_proc_stat_starttime, parse_proc_statm_rss_bytes, quote_windows_command_line,
+    ConfinedProcess, ProcessExitStatus, ProcessLaunchSpec, ProcessResourceCapabilities,
+    ProcessStartIdentity, ProcessStdio,
 };
 pub use sandbox_core::GuestArch;
 pub use spike::{SpikeBootConfig, SpikeExecOutput, SpikeSession};

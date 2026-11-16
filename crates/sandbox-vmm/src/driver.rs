@@ -249,6 +249,12 @@ fn boot_single_attempt(
 
     let mut launch_spec = ProcessLaunchSpec::new(qemu_bin, args);
     launch_spec.stderr = ProcessStdio::File(stderr_file);
+    launch_spec.cpu_quota_millicores = boot_cfg.spec.budget.host_cpu_quota_Millicores;
+    launch_spec.memory_limit_bytes = boot_cfg
+        .spec
+        .budget
+        .host_rss_budget_mb
+        .map(|mb| u64::from(mb) * 1024 * 1024);
     let mut process = ConfinedProcess::spawn(launch_spec)?;
 
     let boot_deadline = Instant::now() + driver_cfg.boot_timeout;
@@ -314,6 +320,7 @@ fn boot_single_attempt(
     }
 
     let identity = process.start_identity();
+    let proc_caps = process.resource_capabilities();
     let session = QemuVmSession::start(
         Some(process),
         Some(endpoint),
@@ -331,9 +338,9 @@ fn boot_single_attempt(
         artifact_paths,
         hardware_accelerated: accel.is_hardware(),
         capabilities: CapabilityReport {
-            cpu_quota: EnforcementLevel::Unsupported,
-            host_rss: EnforcementLevel::Unsupported,
-            host_storage: EnforcementLevel::Unsupported,
+            cpu_quota: proc_caps.cpu_quota,
+            host_rss: proc_caps.host_rss,
+            host_storage: EnforcementLevel::BestEffort,
             egress_filter: EnforcementLevel::HardLimit,
         },
     })
@@ -608,6 +615,16 @@ impl VmSessionPort for QemuVmSession {
         } else {
             !self.transport_closed.load(Ordering::Acquire)
         }
+    }
+
+    fn current_rss_bytes(&self) -> Option<u64> {
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        let proc_guard = lock_unpoisoned(&self.process);
+        proc_guard
+            .as_ref()
+            .and_then(ConfinedProcess::current_rss_bytes)
     }
 
     async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -1732,6 +1749,7 @@ mod tests {
             .graceful_shutdown(Duration::from_millis(500))
             .await
             .unwrap());
+        assert_eq!(session.current_rss_bytes(), None);
         guest_thread.join().unwrap();
     }
 

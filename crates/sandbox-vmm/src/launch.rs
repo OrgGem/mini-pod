@@ -33,7 +33,8 @@ impl QemuLaunchConfig {
     ///
     /// Uses `-chardev socket,id=agent0,path=<sock>,server=off` against a host-bound `AF_UNIX`
     /// listener inside an owner-only directory (see [`crate::ipc`] module docs for the Phase 1
-    /// Windows Named Pipe security finding).
+    /// Windows Named Pipe security finding) and always emits `-nic none` for zero-NIC guest
+    /// isolation across all [`NetworkPolicy`] modes.
     pub fn build_args(&self) -> Result<Vec<OsString>, SandboxError> {
         if self.vcpus == 0 {
             return Err(SandboxError::InvalidSpec(
@@ -46,7 +47,6 @@ impl QemuLaunchConfig {
             ));
         }
         validate_socket_path(&self.agent_socket_path)?;
-        validate_isolated_network(&self.network)?;
         let cleaned_root_disk = self
             .root_disk_qcow2
             .as_deref()
@@ -92,7 +92,11 @@ impl QemuLaunchConfig {
             }
         }
         args.push("-accel".into());
-        args.push(self.accelerator.as_qemu_arg().into());
+        let accel_arg = match self.accelerator {
+            Accelerator::Tcg => "tcg,tb-size=32",
+            other => other.as_qemu_arg(),
+        };
+        args.push(accel_arg.into());
         args.push("-smp".into());
         args.push(self.vcpus.to_string().into());
         args.push("-m".into());
@@ -228,7 +232,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-machine", "q35"]));
         assert!(!args.contains(&"-cpu".to_owned()));
         assert!(!args.contains(&"-drive".to_owned()));
-        assert!(args.windows(2).any(|w| w == ["-accel", "tcg"]));
+        assert!(args.windows(2).any(|w| w == ["-accel", "tcg,tb-size=32"]));
         assert!(args.windows(2).any(|w| w == ["-smp", "2"]));
         assert!(args.windows(2).any(|w| w == ["-m", "512M"]));
         assert!(args.windows(2).any(|w| w == ["-nic", "none"]));
@@ -255,7 +259,7 @@ mod tests {
         let tcg_args = as_strings(&tcg_cfg.build_args().expect("valid aarch64 tcg config"));
         assert!(tcg_args.windows(2).any(|w| w == ["-machine", "virt"]));
         assert!(tcg_args.windows(2).any(|w| w == ["-cpu", "cortex-a72"]));
-        assert!(tcg_args.windows(2).any(|w| w == ["-accel", "tcg"]));
+        assert!(tcg_args.windows(2).any(|w| w == ["-accel", "tcg,tb-size=32"]));
 
         for hw_accel in [Accelerator::Hvf, Accelerator::Kvm] {
             let mut hw_cfg = tcg_cfg.clone();
@@ -360,8 +364,9 @@ mod tests {
     }
 
     #[test]
-    fn build_args_rejects_non_isolated_network_policies_in_phase_1() {
-        let disallowed = [
+    fn build_args_allows_all_network_policies_and_always_emits_nic_none() {
+        let policies = [
+            NetworkPolicy::Isolated,
             NetworkPolicy::InternetOnly,
             NetworkPolicy::DomainAllowList {
                 rules: vec![EgressRule {
@@ -372,12 +377,17 @@ mod tests {
             NetworkPolicy::Unrestricted,
         ];
 
-        for policy in disallowed {
+        for policy in policies {
             let mut cfg = sample_config();
-            cfg.network = policy;
+            cfg.network = policy.clone();
+            let args = as_strings(&cfg.build_args().expect("build_args accepts all network policies"));
             assert!(
-                matches!(cfg.build_args(), Err(SandboxError::PolicyViolation(_))),
-                "non-isolated policy must be rejected until Phase 5 egress proxy"
+                args.windows(2).any(|w| w == ["-nic", "none"]),
+                "expected -nic none for network policy {policy:?}: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "-net" || a == "-netdev"),
+                "unexpected -net/-netdev flag for network policy {policy:?}: {args:?}"
             );
         }
     }

@@ -14,13 +14,19 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use sandbox_core::SandboxError;
+use sandbox_core::{EnforcementLevel, SandboxError};
 
 use crate::accel::classify_launch_error;
 use crate::ipc::validate_socket_path;
 #[cfg(target_os = "linux")]
-use crate::process::{parse_proc_stat_starttime, parse_proc_stat_state_and_starttime};
-use crate::process::{ProcessExitStatus, ProcessLaunchSpec, ProcessStartIdentity, ProcessStdio};
+use crate::process::{
+    millicores_to_cgroup_quota_us, parse_proc_stat_starttime, parse_proc_stat_state_and_starttime,
+};
+use crate::process::{
+    ProcessExitStatus, ProcessLaunchSpec, ProcessResourceCapabilities, ProcessStartIdentity,
+    ProcessStdio,
+};
+pub use crate::process::{parse_proc_self_cgroup_v2, parse_proc_statm_rss_bytes};
 
 /// Ensures `path` exists as a non-symlink directory owned by the current user with `0700` mode.
 ///
@@ -337,10 +343,14 @@ pub(crate) type PlatformConfinedProcess = UnixConfinedProcess;
 
 const UNIX_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Unix child process confined to its own process group (`pgid == pid`) via `setpgid(0, 0)`.
+/// Unix child process confined to its own process group (`pgid == pid`) via `setpgid(0, 0)`
+/// and optionally attached to a delegated Linux cgroup v2 leaf cgroup.
 pub struct UnixConfinedProcess {
     child: Child,
     identity: ProcessStartIdentity,
+    capabilities: ProcessResourceCapabilities,
+    #[cfg(target_os = "linux")]
+    cgroup_dir: Option<PathBuf>,
     exited: Option<ProcessExitStatus>,
     group_killed: bool,
 }
@@ -357,6 +367,42 @@ impl UnixConfinedProcess {
         self.identity
     }
 
+    /// Returns the honest CPU and memory enforcement levels active for this confined process.
+    pub fn resource_capabilities(&self) -> ProcessResourceCapabilities {
+        self.capabilities
+    }
+
+    /// Samples the live resident set size (`RSS`) in bytes via `/proc/<pid>/statm` on Linux,
+    /// returning `None` if the process has exited or on non-Linux Unix platforms.
+    pub fn current_rss_bytes(&self) -> Option<u64> {
+        if self.exited.is_some() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.identity.pid;
+            if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some((state, _)) = parse_proc_stat_state_and_starttime(&stat) {
+                    if state == 'Z' {
+                        return None;
+                    }
+                }
+            }
+            let statm = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+            // SAFETY: `sysconf(_SC_PAGESIZE)` is a read-only POSIX query returning OS page size.
+            let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if raw_page_size <= 0 {
+                return None;
+            }
+            let bytes = parse_proc_statm_rss_bytes(&statm, raw_page_size as u64)?;
+            (bytes > 0).then_some(bytes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Non-blocking check for process exit.
     pub fn try_wait(&mut self) -> Result<Option<ProcessExitStatus>, SandboxError> {
         if let Some(status) = self.exited {
@@ -366,6 +412,8 @@ impl UnixConfinedProcess {
             Ok(Some(status)) => {
                 let normalized = exit_status_from_std(status);
                 self.exited = Some(normalized);
+                #[cfg(target_os = "linux")]
+                self.try_remove_cgroup_dir_once();
                 Ok(Some(normalized))
             }
             Ok(None) => Ok(None),
@@ -420,13 +468,51 @@ impl UnixConfinedProcess {
             })?;
             self.exited = Some(exit_status_from_std(status));
         }
+        #[cfg(target_os = "linux")]
+        self.cleanup_cgroup_dir_with_retry();
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_remove_cgroup_dir_once(&mut self) {
+        if let Some(dir) = self.cgroup_dir.as_ref() {
+            match fs::remove_dir(dir) {
+                Ok(()) => {
+                    self.cgroup_dir = None;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    self.cgroup_dir = None;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_cgroup_dir_with_retry(&mut self) {
+        let Some(dir) = self.cgroup_dir.take() else {
+            return;
+        };
+        for attempt in 0..10 {
+            match fs::remove_dir(&dir) {
+                Ok(()) => return,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+                Err(err)
+                    if err.raw_os_error() == Some(libc::EBUSY) && attempt < 9 =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
     }
 }
 
 impl Drop for UnixConfinedProcess {
     fn drop(&mut self) {
         let _ = self.kill_and_wait();
+        #[cfg(target_os = "linux")]
+        self.cleanup_cgroup_dir_with_retry();
     }
 }
 
@@ -457,9 +543,32 @@ pub(crate) fn spawn_confined(spec: ProcessLaunchSpec) -> Result<UnixConfinedProc
     let pid = child.id();
     let start_token = read_process_start_token(pid);
 
+    #[cfg(target_os = "linux")]
+    let (cgroup_dir, capabilities) = attach_linux_cgroup_v2(
+        pid,
+        spec.cpu_quota_millicores,
+        spec.memory_limit_bytes,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let capabilities = ProcessResourceCapabilities {
+        cpu_quota: if spec.cpu_quota_millicores.is_some() {
+            EnforcementLevel::Unsupported
+        } else {
+            EnforcementLevel::BestEffort
+        },
+        host_rss: if spec.memory_limit_bytes.is_some() {
+            EnforcementLevel::Unsupported
+        } else {
+            EnforcementLevel::BestEffort
+        },
+    };
+
     Ok(UnixConfinedProcess {
         child,
         identity: ProcessStartIdentity { pid, start_token },
+        capabilities,
+        #[cfg(target_os = "linux")]
+        cgroup_dir,
         exited: None,
         group_killed: false,
     })
@@ -594,6 +703,166 @@ fn read_process_start_token(pid: u32) -> u64 {
         let _ = pid;
         0
     }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_dir_path(mount: &Path, cgroup_path: &str) -> PathBuf {
+    let rel = cgroup_path.trim_start_matches('/');
+    if rel.is_empty() {
+        mount.to_path_buf()
+    } else {
+        mount.join(rel)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn has_cgroup_controller(list: &str, name: &str) -> bool {
+    list.split_ascii_whitespace().any(|token| token == name)
+}
+
+#[cfg(target_os = "linux")]
+fn is_writable_file(path: &Path) -> bool {
+    OpenOptions::new().write(true).open(path).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn attach_linux_cgroup_v2(
+    pid: u32,
+    cpu_quota_millicores: Option<u32>,
+    memory_limit_bytes: Option<u64>,
+) -> (Option<PathBuf>, ProcessResourceCapabilities) {
+    let fallback_caps = ProcessResourceCapabilities {
+        cpu_quota: if cpu_quota_millicores.is_some() {
+            EnforcementLevel::Unsupported
+        } else {
+            EnforcementLevel::BestEffort
+        },
+        host_rss: if memory_limit_bytes.is_some() {
+            EnforcementLevel::Unsupported
+        } else {
+            EnforcementLevel::BestEffort
+        },
+    };
+
+    if cpu_quota_millicores.is_none() && memory_limit_bytes.is_none() {
+        return (None, fallback_caps);
+    }
+
+    let cgroup_mount = Path::new("/sys/fs/cgroup");
+    if !cgroup_mount.join("cgroup.controllers").is_file() {
+        return (None, fallback_caps);
+    }
+
+    let Ok(self_cgroup_raw) = fs::read_to_string("/proc/self/cgroup") else {
+        return (None, fallback_caps);
+    };
+    let Some(self_cgroup_rel) = parse_proc_self_cgroup_v2(&self_cgroup_raw) else {
+        return (None, fallback_caps);
+    };
+    let self_cg_dir = cgroup_v2_dir_path(cgroup_mount, &self_cgroup_rel);
+
+    let mut candidates = Vec::with_capacity(2);
+    candidates.push(self_cg_dir.clone());
+    if self_cg_dir != cgroup_mount {
+        if let Some(parent) = self_cg_dir.parent() {
+            if parent.starts_with(cgroup_mount) {
+                candidates.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    for candidate in candidates {
+        if let Some((dir, caps)) = try_attach_in_cgroup_parent(
+            &candidate,
+            pid,
+            cpu_quota_millicores,
+            memory_limit_bytes,
+        ) {
+            return (Some(dir), caps);
+        }
+    }
+
+    (None, fallback_caps)
+}
+
+#[cfg(target_os = "linux")]
+fn try_attach_in_cgroup_parent(
+    parent_cg: &Path,
+    pid: u32,
+    cpu_req: Option<u32>,
+    mem_req: Option<u64>,
+) -> Option<(PathBuf, ProcessResourceCapabilities)> {
+    static CGROUP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let procs_path = parent_cg.join("cgroup.procs");
+    let subtree_path = parent_cg.join("cgroup.subtree_control");
+    if !is_writable_file(&procs_path) {
+        return None;
+    }
+
+    let subtree_before = fs::read_to_string(&subtree_path).ok()?;
+    let need_enable_cpu = cpu_req.is_some() && !has_cgroup_controller(&subtree_before, "cpu");
+    let need_enable_mem = mem_req.is_some() && !has_cgroup_controller(&subtree_before, "memory");
+    if (need_enable_cpu || need_enable_mem) && !is_writable_file(&subtree_path) {
+        return None;
+    }
+
+    let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let child_cg = parent_cg.join(format!("minipod-{}-{pid}-{seq}", std::process::id()));
+    if fs::create_dir(&child_cg).is_err() {
+        return None;
+    }
+
+    if need_enable_cpu {
+        let _ = fs::write(&subtree_path, "+cpu");
+    }
+    if need_enable_mem {
+        let _ = fs::write(&subtree_path, "+memory");
+    }
+
+    let mut cpu_level = if cpu_req.is_some() {
+        EnforcementLevel::Unsupported
+    } else {
+        EnforcementLevel::BestEffort
+    };
+    if let Some(millicores) = cpu_req {
+        let cpu_max_path = child_cg.join("cpu.max");
+        let quota_line = format!("{} 100000", millicores_to_cgroup_quota_us(millicores));
+        if cpu_max_path.is_file() && fs::write(&cpu_max_path, quota_line).is_ok() {
+            cpu_level = EnforcementLevel::HardLimit;
+        }
+    }
+
+    let mut host_rss_level = if mem_req.is_some() {
+        EnforcementLevel::Unsupported
+    } else {
+        EnforcementLevel::BestEffort
+    };
+    if let Some(bytes) = mem_req {
+        let mem_max_path = child_cg.join("memory.max");
+        if mem_max_path.is_file() && fs::write(&mem_max_path, bytes.to_string()).is_ok() {
+            let _ = fs::write(child_cg.join("memory.swap.max"), "0");
+            host_rss_level = EnforcementLevel::HardLimit;
+        }
+    }
+
+    if cpu_level != EnforcementLevel::HardLimit && host_rss_level != EnforcementLevel::HardLimit {
+        let _ = fs::remove_dir(&child_cg);
+        return None;
+    }
+
+    if fs::write(child_cg.join("cgroup.procs"), pid.to_string()).is_err() {
+        let _ = fs::remove_dir(&child_cg);
+        return None;
+    }
+
+    Some((
+        child_cg,
+        ProcessResourceCapabilities {
+            cpu_quota: cpu_level,
+            host_rss: host_rss_level,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -800,5 +1069,91 @@ mod tests {
         let status = child.wait().expect("reap killed sleep");
         assert!(!status.success());
         assert_eq!(kill_verified_orphan_process(pid, token), Ok(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_live_rss_sampling_and_cgroup_v2_capabilities_are_honest() {
+        // 1. Uncapped confined child reports BestEffort capabilities and live RSS > 0 until killed.
+        let mut uncapped = spawn_confined(ProcessLaunchSpec::new("/bin/sleep", vec!["20".into()]))
+            .expect("spawn uncapped sleep");
+        assert_eq!(
+            uncapped.resource_capabilities(),
+            ProcessResourceCapabilities {
+                cpu_quota: EnforcementLevel::BestEffort,
+                host_rss: EnforcementLevel::BestEffort,
+            }
+        );
+        let rss = uncapped
+            .current_rss_bytes()
+            .expect("live Linux child must report RSS > 0 from /proc/<pid>/statm");
+        assert!(rss > 0, "expected RSS > 0, got {rss}");
+        uncapped.kill_and_wait().expect("kill uncapped sleep");
+        assert_eq!(uncapped.current_rss_bytes(), None);
+
+        // 2. Capped confined child honestly reports HardLimit (if delegated) or Unsupported (if not).
+        let mut spec = ProcessLaunchSpec::new("/bin/sleep", vec!["20".into()]);
+        spec.cpu_quota_millicores = Some(500);
+        spec.memory_limit_bytes = Some(64 * 1024 * 1024);
+
+        let mut capped = spawn_confined(spec).expect("spawn resource-capped sleep");
+        let caps = capped.resource_capabilities();
+        assert!(
+            matches!(
+                caps.cpu_quota,
+                EnforcementLevel::HardLimit | EnforcementLevel::Unsupported
+            ),
+            "unexpected cpu_quota capability when quota requested: {:?}",
+            caps.cpu_quota
+        );
+        assert!(
+            matches!(
+                caps.host_rss,
+                EnforcementLevel::HardLimit | EnforcementLevel::Unsupported
+            ),
+            "unexpected host_rss capability when memory limit requested: {:?}",
+            caps.host_rss
+        );
+
+        let capped_rss = capped
+            .current_rss_bytes()
+            .expect("live capped Linux child must report RSS > 0");
+        assert!(capped_rss > 0);
+
+        let maybe_cg_dir = capped.cgroup_dir.clone();
+        if caps.cpu_quota == EnforcementLevel::HardLimit
+            || caps.host_rss == EnforcementLevel::HardLimit
+        {
+            let cg_dir = maybe_cg_dir
+                .as_ref()
+                .expect("HardLimit requires active child cgroup dir");
+            assert!(cg_dir.is_dir(), "expected cgroup dir '{}' to exist", cg_dir.display());
+            let child_cg_raw = fs::read_to_string(format!("/proc/{}/cgroup", capped.id()))
+                .expect("read child /proc/<pid>/cgroup");
+            let child_cg_rel =
+                parse_proc_self_cgroup_v2(&child_cg_raw).expect("parse child cgroup v2 path");
+            let expected_name = cg_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .expect("child cgroup dir name");
+            assert!(
+                child_cg_rel.ends_with(expected_name),
+                "expected child cgroup '{child_cg_rel}' to end with '{expected_name}'"
+            );
+        } else {
+            assert!(
+                maybe_cg_dir.is_none(),
+                "Unsupported enforcement must not leave an unused cgroup directory"
+            );
+        }
+
+        capped.kill_and_wait().expect("kill capped sleep");
+        if let Some(cg_dir) = maybe_cg_dir {
+            assert!(
+                !cg_dir.exists(),
+                "child cgroup dir '{}' must be removed after kill_and_wait",
+                cg_dir.display()
+            );
+        }
     }
 }

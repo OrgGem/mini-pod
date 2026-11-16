@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sandbox_core::SandboxError;
+use sandbox_core::{EnforcementLevel, SandboxError};
 
 #[cfg(unix)]
 use crate::os::unix as platform;
@@ -73,6 +73,13 @@ pub enum ProcessStdio {
     File(File),
 }
 
+/// Host OS enforcement levels actually achieved for a spawned [`ConfinedProcess`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessResourceCapabilities {
+    pub cpu_quota: EnforcementLevel,
+    pub host_rss: EnforcementLevel,
+}
+
 /// Launch specification for spawning a confined host child process (such as QEMU).
 #[derive(Debug)]
 pub struct ProcessLaunchSpec {
@@ -82,10 +89,13 @@ pub struct ProcessLaunchSpec {
     pub stdin: ProcessStdio,
     pub stdout: ProcessStdio,
     pub stderr: ProcessStdio,
+    pub cpu_quota_millicores: Option<u32>,
+    pub memory_limit_bytes: Option<u64>,
 }
 
 impl ProcessLaunchSpec {
-    /// Creates a [`ProcessLaunchSpec`] with all stdio streams defaulted to [`ProcessStdio::Null`].
+    /// Creates a [`ProcessLaunchSpec`] with all stdio streams defaulted to [`ProcessStdio::Null`]
+    /// and no explicit CPU/memory limits.
     pub fn new(program: impl Into<PathBuf>, args: Vec<OsString>) -> Self {
         Self {
             program: program.into(),
@@ -94,6 +104,8 @@ impl ProcessLaunchSpec {
             stdin: ProcessStdio::Null,
             stdout: ProcessStdio::Null,
             stderr: ProcessStdio::Null,
+            cpu_quota_millicores: None,
+            memory_limit_bytes: None,
         }
     }
 }
@@ -116,6 +128,16 @@ impl ConfinedProcess {
                 "confined process program path must not be empty".to_owned(),
             ));
         }
+        if spec.cpu_quota_millicores == Some(0) {
+            return Err(SandboxError::InvalidSpec(
+                "confined process cpu_quota_millicores must be >= 1".to_owned(),
+            ));
+        }
+        if spec.memory_limit_bytes == Some(0) {
+            return Err(SandboxError::InvalidSpec(
+                "confined process memory_limit_bytes must be >= 1".to_owned(),
+            ));
+        }
         platform::spawn_confined(spec).map(|inner| Self { inner })
     }
 
@@ -127,6 +149,17 @@ impl ConfinedProcess {
     /// Returns the captured PID + creation-time token for journaled orphan verification.
     pub fn start_identity(&self) -> ProcessStartIdentity {
         self.inner.start_identity()
+    }
+
+    /// Returns the honest host OS CPU and memory enforcement capabilities applied to this process.
+    pub fn resource_capabilities(&self) -> ProcessResourceCapabilities {
+        self.inner.resource_capabilities()
+    }
+
+    /// Samples the live resident set size (`RSS` / working set) in bytes for this process, or
+    /// `None` if the process has exited or the host OS does not report it.
+    pub fn current_rss_bytes(&self) -> Option<u64> {
+        self.inner.current_rss_bytes()
     }
 
     /// Non-blocking poll for child termination.
@@ -281,6 +314,64 @@ pub fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
     parse_proc_stat_state_and_starttime(stat).map(|(_, starttime)| starttime)
 }
 
+/// Converts a host CPU quota in millicores (`1000` = 1 logical CPU) into a Windows Job Object
+/// `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::CpuRate` value (`1..=10_000` in `0.01%` units of
+/// total host logical CPUs).
+///
+/// Formula: `((u64::from(millicores) * 10_000) / (logical_cpus.max(1) as u64 * 1000)).clamp(1, 10_000)`.
+pub fn millicores_to_windows_cpu_rate(millicores: u32, logical_cpus: usize) -> u32 {
+    let total_millicores = (logical_cpus.max(1) as u64).saturating_mul(1000);
+    let rate = (u64::from(millicores) * 10_000) / total_millicores;
+    rate.clamp(1, 10_000) as u32
+}
+
+/// Converts a host CPU quota in millicores (`1000` = 1 CPU core) into a Linux cgroup v2 `cpu.max`
+/// microsecond quota over a `100_000` us (`100 ms`) period, clamping to the kernel minimum `1000` us.
+pub fn millicores_to_cgroup_quota_us(millicores: u32) -> u64 {
+    (u64::from(millicores) * 100).max(1000)
+}
+
+/// Extracts the cgroup v2 unified hierarchy path (`0::<path>`) from `/proc/self/cgroup`.
+///
+/// Rejects malformed lines, relative paths, NUL bytes, and `..` path traversal components.
+pub fn parse_proc_self_cgroup_v2(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        let mut parts = trimmed.splitn(3, ':');
+        let Some(hier_id) = parts.next() else {
+            continue;
+        };
+        let Some(controllers) = parts.next() else {
+            continue;
+        };
+        let Some(path) = parts.next() else {
+            continue;
+        };
+        if hier_id != "0" || !controllers.is_empty() {
+            continue;
+        }
+        if !path.starts_with('/')
+            || path.contains('\0')
+            || path.split('/').any(|seg| seg == "..")
+        {
+            return None;
+        }
+        return Some(path.to_owned());
+    }
+    None
+}
+
+/// Parses Linux `/proc/<pid>/statm` and returns resident set size in bytes (`resident_pages * page_size`).
+pub fn parse_proc_statm_rss_bytes(statm: &str, page_size: u64) -> Option<u64> {
+    if page_size == 0 {
+        return None;
+    }
+    let mut fields = statm.split_ascii_whitespace();
+    let _total_pages = fields.next()?.parse::<u64>().ok()?;
+    let resident_pages = fields.next()?.parse::<u64>().ok()?;
+    resident_pages.checked_mul(page_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,14 +472,118 @@ mod tests {
     }
 
     #[test]
-    fn confined_process_rejects_empty_and_missing_program() {
+    fn confined_process_rejects_empty_missing_program_and_zero_limits() {
         let empty = ConfinedProcess::spawn(ProcessLaunchSpec::new("", vec![]));
         assert!(matches!(empty, Err(SandboxError::InvalidSpec(_))));
+
+        let mut zero_cpu = ProcessLaunchSpec::new("qemu-system-x86_64", vec![]);
+        zero_cpu.cpu_quota_millicores = Some(0);
+        assert!(matches!(
+            ConfinedProcess::spawn(zero_cpu),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        let mut zero_mem = ProcessLaunchSpec::new("qemu-system-x86_64", vec![]);
+        zero_mem.memory_limit_bytes = Some(0);
+        assert!(matches!(
+            ConfinedProcess::spawn(zero_mem),
+            Err(SandboxError::InvalidSpec(_))
+        ));
 
         let missing = ConfinedProcess::spawn(ProcessLaunchSpec::new(
             PathBuf::from("nonexistent-minipod-binary-xyz-98765"),
             vec![],
         ));
         assert!(matches!(missing, Err(SandboxError::NotFound(_))));
+    }
+
+    #[test]
+    fn millicores_to_windows_cpu_rate_scales_and_clamps_correctly() {
+        // 1000 millicores on 4 logical CPUs = 25.00% -> 2500.
+        assert_eq!(millicores_to_windows_cpu_rate(1000, 4), 2500);
+        // 500 millicores on 4 logical CPUs = 12.50% -> 1250.
+        assert_eq!(millicores_to_windows_cpu_rate(500, 4), 1250);
+        // 1000 millicores on 1 logical CPU = 100.00% -> 10_000.
+        assert_eq!(millicores_to_windows_cpu_rate(1000, 1), 10_000);
+        // Sub-0.01% positive quota clamps cleanly to minimum 1 instead of 0.
+        assert_eq!(millicores_to_windows_cpu_rate(1, 16), 1);
+        // Over-provisioned quota clamps cleanly to 10_000 (100%).
+        assert_eq!(millicores_to_windows_cpu_rate(8000, 4), 10_000);
+        // Zero logical CPUs degrades safely to 1 without dividing by zero.
+        assert_eq!(millicores_to_windows_cpu_rate(500, 0), 5000);
+        // Huge logical CPU count never overflows multiplication.
+        assert_eq!(millicores_to_windows_cpu_rate(500, usize::MAX), 1);
+    }
+
+    #[test]
+    fn millicores_to_cgroup_quota_us_converts_and_enforces_kernel_minimum() {
+        assert_eq!(millicores_to_cgroup_quota_us(1000), 100_000);
+        assert_eq!(millicores_to_cgroup_quota_us(500), 50_000);
+        assert_eq!(millicores_to_cgroup_quota_us(2500), 250_000);
+        assert_eq!(millicores_to_cgroup_quota_us(10), 1_000);
+        assert_eq!(millicores_to_cgroup_quota_us(1), 1_000);
+    }
+
+    #[test]
+    fn parse_proc_self_cgroup_v2_extracts_unified_path_and_rejects_malformed() {
+        assert_eq!(
+            parse_proc_self_cgroup_v2("0::/\n"),
+            Some("/".to_owned())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup_v2(
+                "12:pids:/user.slice\n11:memory:/user.slice\n0::/user.slice/user-1000.slice/session-2.scope\n"
+            ),
+            Some("/user.slice/user-1000.slice/session-2.scope".to_owned())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup_v2("0::/path:with:colons\r\n"),
+            Some("/path:with:colons".to_owned())
+        );
+
+        for invalid in [
+            "",
+            "12:memory:/\n11:cpu:/\n",
+            "0:cpu:/user.slice\n",
+            "0::relative/path\n",
+            "0::\n",
+            "0::/user.slice/../escape\n",
+            "0::/bad\0path\n",
+        ] {
+            assert_eq!(
+                parse_proc_self_cgroup_v2(invalid),
+                None,
+                "expected None for cgroup input {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_proc_statm_rss_bytes_computes_rss_and_rejects_malformed() {
+        assert_eq!(
+            parse_proc_statm_rss_bytes("125432 45120 12000 100 0 38000 0\n", 4096),
+            Some(45120 * 4096)
+        );
+        assert_eq!(
+            parse_proc_statm_rss_bytes("100 25", 16_384),
+            Some(25 * 16_384)
+        );
+        assert_eq!(
+            parse_proc_statm_rss_bytes("0 0 0 0 0 0 0\n", 4096),
+            Some(0)
+        );
+
+        for bad in ["", "1234\n", "abc 100 0\n", "100 xyz 0\n"] {
+            assert_eq!(
+                parse_proc_statm_rss_bytes(bad, 4096),
+                None,
+                "expected None for statm {bad:?}"
+            );
+        }
+        assert_eq!(parse_proc_statm_rss_bytes("100 25", 0), None);
+        assert_eq!(
+            parse_proc_statm_rss_bytes(&format!("100 {} 0", u64::MAX), 4096),
+            None
+        );
     }
 }
