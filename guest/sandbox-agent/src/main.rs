@@ -1778,6 +1778,78 @@ mod tests {
         shutdown_test_session(host_rx, host_tx, agent);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exec_scope_kills_setsid_detached_child_on_deadline() {
+        let tmp = TestTempDir::new("setsid-kill");
+        let pid_file = tmp.path().join("setsid.pid");
+        let marker_file = tmp.path().join("escaped.marker");
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        let script = format!(
+            "setsid sh -c 'sleep 1; echo survived > \"{}\"' </dev/null >/dev/null 2>&1 & echo $! > '{}'; wait",
+            marker_file.display(),
+            pid_file.display(),
+        );
+        send_message(
+            &mut host_tx,
+            StreamId(21),
+            &Message::ExecStart {
+                target: ExecTargetWire::Guest,
+                argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline_ms: 250,
+                stdout_budget_bytes: 4096,
+                stderr_budget_bytes: 4096,
+            },
+        )
+        .unwrap();
+
+        let (_, _, stdout_eof, stderr_eof, exit_msg) =
+            collect_exec_response(&mut host_rx, StreamId(21));
+        assert!(stdout_eof && stderr_eof);
+        assert_eq!(
+            exit_msg,
+            Message::ExecExit {
+                code: None,
+                timed_out: true,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+        );
+
+        let detached_pid: i32 = fs::read_to_string(&pid_file)
+            .expect("setsid child wrote pid before 250ms deadline")
+            .trim()
+            .parse()
+            .unwrap();
+        let is_running = |pid: i32| -> bool {
+            let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+                return false;
+            };
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("State:") {
+                    return !rest.trim_start().starts_with('Z');
+                }
+            }
+            true
+        };
+        assert!(
+            !is_running(detached_pid),
+            "setsid detached PID {detached_pid} must be dead before ExecExit is reported"
+        );
+
+        thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !marker_file.exists(),
+            "detached setsid child must not write marker after deadline"
+        );
+
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
     #[test]
     fn stream_credit_enforces_stdout_backpressure() {
         let (mut host_rx, mut host_tx, agent) = start_test_session();

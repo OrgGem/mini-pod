@@ -93,6 +93,8 @@ struct ExecState {
     stderr_done: bool,
     #[cfg(unix)]
     pgid: Option<u32>,
+    #[cfg(unix)]
+    exec_scope: Option<Arc<supervisor_unix::ExecScope>>,
     #[cfg(not(unix))]
     child_handle: Option<Arc<Mutex<Option<Child>>>>,
 }
@@ -159,7 +161,7 @@ impl ExecControl {
 }
 
 #[cfg(unix)]
-type KillTarget = u32;
+type KillTarget = (u32, Arc<supervisor_unix::ExecScope>);
 #[cfg(not(unix))]
 type KillTarget = Arc<Mutex<Option<Child>>>;
 
@@ -174,8 +176,9 @@ fn take_kill_target_locked(state: &mut ExecState) -> Option<KillTarget> {
     #[cfg(unix)]
     {
         let pgid = state.pgid?;
+        let scope = state.exec_scope.as_ref()?.clone();
         state.killed_by_supervisor = true;
-        Some(pgid)
+        Some((pgid, scope))
     }
     #[cfg(not(unix))]
     {
@@ -188,7 +191,8 @@ fn take_kill_target_locked(state: &mut ExecState) -> Option<KillTarget> {
 fn execute_kill(target: KillTarget) {
     #[cfg(unix)]
     {
-        supervisor_unix::kill_process_group(target);
+        let (pgid, scope) = target;
+        scope.kill_all(pgid);
     }
     #[cfg(not(unix))]
     {
@@ -402,6 +406,9 @@ fn run_exec_inner(
         );
     }
 
+    #[cfg(unix)]
+    let exec_scope = Arc::new(supervisor_unix::ExecScope::prepare(stream_id));
+
     let (program_label, mut cmd) = match prepared {
         PreparedCommand::Guest {
             #[cfg(unix)]
@@ -418,7 +425,7 @@ fn run_exec_inner(
                 c.current_dir(dir);
             }
             #[cfg(unix)]
-            supervisor_unix::configure_command(&mut c, user);
+            supervisor_unix::configure_exec_command(&mut c, user, &exec_scope);
             (program.as_str(), c)
         }
         PreparedCommand::Container { args: podman_args } => {
@@ -440,13 +447,17 @@ fn run_exec_inner(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             #[cfg(unix)]
-            supervisor_unix::configure_command(&mut c, None);
+            supervisor_unix::configure_exec_command(&mut c, None, &exec_scope);
             (PODMAN_BIN, c)
         }
     };
 
     let mut child = match cmd.spawn() {
-        Ok(child) => child,
+        Ok(child) => {
+            #[cfg(unix)]
+            exec_scope.close_spawn_fd();
+            child
+        }
         Err(err) => {
             let code = if err.kind() == io::ErrorKind::PermissionDenied {
                 126
@@ -476,6 +487,7 @@ fn run_exec_inner(
         let immediate_kill = {
             let mut state = handle.control.state.lock().unwrap_or_else(|e| e.into_inner());
             state.pgid = Some(pgid);
+            state.exec_scope = Some(Arc::clone(&exec_scope));
             if state.cancelled {
                 state.killed_by_supervisor = true;
                 true
@@ -484,10 +496,12 @@ fn run_exec_inner(
             }
         };
         if immediate_kill {
-            supervisor_unix::kill_process_group(pgid);
+            exec_scope.kill_all(pgid);
         }
         supervise_spawned_unix(
             child,
+            pgid,
+            exec_scope,
             child_stdin,
             child_stdout,
             child_stderr,
@@ -537,6 +551,8 @@ fn run_exec_inner(
 #[allow(clippy::too_many_arguments)]
 fn supervise_spawned_unix(
     mut child: Child,
+    pgid: u32,
+    exec_scope: Arc<supervisor_unix::ExecScope>,
     child_stdin: Option<std::process::ChildStdin>,
     child_stdout: Option<std::process::ChildStdout>,
     child_stderr: Option<std::process::ChildStderr>,
@@ -588,6 +604,7 @@ fn supervise_spawned_unix(
         let _ = stdin_join.join();
     });
 
+    exec_scope.cleanup_after_reap(pgid);
     emit_final_exec_exit(outbound, stream_id, control)
 }
 
