@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
@@ -22,6 +23,8 @@ const COPY_CHUNK_BYTES: usize = 64 * 1024;
 const TAR_BLOCK_BYTES: u64 = 512;
 const TAR_TRAILER_BYTES: u64 = 1024;
 const MAX_COPY_IO_BUF: usize = 64 * 1024;
+
+static NEXT_GUEST_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) enum CopyInItem {
     Chunk { data: Vec<u8>, eof: bool },
@@ -156,8 +159,10 @@ fn execute_copy_in(
                     }
 
                     let file_path = prepare_parent_dirs_no_symlink(&dst_root, &rel)?;
+                    let parent_dir = file_path.parent().unwrap_or(&dst_root);
                     let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
-                    let mut out_file = open_extract_file_no_symlink(&file_path)?;
+                    validate_extract_destination_no_symlink(&file_path)?;
+                    let mut staged = StagedGuestExtractFile::create(parent_dir)?;
 
                     let mut copied: u64 = 0;
                     loop {
@@ -178,7 +183,7 @@ fn execute_copy_in(
                                 "copy_in extracted payload exceeds max_bytes ({running} > {max_bytes})"
                             ));
                         }
-                        out_file
+                        staged
                             .write_all(&copy_buf[..n])
                             .map_err(|err| format!("failed writing '{}': {err}", file_path.display()))?;
                     }
@@ -191,7 +196,7 @@ fn execute_copy_in(
                     extracted_bytes = extracted_bytes
                         .checked_add(copied)
                         .ok_or_else(|| "copy_in extracted byte count overflow".to_owned())?;
-                    apply_safe_file_mode(&out_file, mode)?;
+                    staged.commit(&file_path, mode)?;
                 }
                 tar::EntryType::Symlink => {
                     return Err(format!(
@@ -768,7 +773,93 @@ fn validate_tar_entry_path(raw_bytes: &[u8], entry_path: &Path) -> Result<Option
     }
 }
 
-fn open_extract_file_no_symlink(path: &Path) -> Result<File, String> {
+struct StagedGuestExtractFile {
+    tmp_path: PathBuf,
+    file: Option<File>,
+    armed: bool,
+}
+
+impl StagedGuestExtractFile {
+    fn create(parent_dir: &Path) -> Result<Self, String> {
+        for _ in 0..16 {
+            let seq = NEXT_GUEST_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = parent_dir.join(format!(
+                ".minipod-extract-{}-{seq}.tmp",
+                std::process::id()
+            ));
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            match opts.open(&tmp_path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        tmp_path,
+                        file: Some(file),
+                        armed: true,
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(format!(
+                        "failed to create staged extraction file '{}': {err}",
+                        tmp_path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "exhausted temporary extraction filenames in '{}'",
+            parent_dir.display()
+        ))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self.file.as_mut() {
+            Some(f) => f.write_all(bytes),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "staged extraction file already closed",
+            )),
+        }
+    }
+
+    fn commit(mut self, dst_path: &Path, mode: u32) -> Result<(), String> {
+        if let Some(file) = self.file.take() {
+            apply_safe_file_mode(&file, mode)?;
+            file.sync_data().map_err(|err| {
+                format!(
+                    "failed to sync staged extraction file '{}': {err}",
+                    self.tmp_path.display()
+                )
+            })?;
+        }
+        validate_extract_destination_no_symlink(dst_path)?;
+        fs::rename(&self.tmp_path, dst_path).map_err(|err| {
+            format!(
+                "failed to commit extracted file '{}': {err}",
+                dst_path.display()
+            )
+        })?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for StagedGuestExtractFile {
+    fn drop(&mut self) {
+        self.file.take();
+        if self.armed {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+fn validate_extract_destination_no_symlink(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if is_symlink_or_reparse(&meta) {
@@ -800,31 +891,11 @@ fn open_extract_file_no_symlink(path: &Path) -> Result<File, String> {
                     ));
                 }
             }
+            Ok(())
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("failed to inspect '{}': {err}", path.display())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to inspect '{}': {err}", path.display())),
     }
-
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = opts
-        .open(path)
-        .map_err(|err| format!("failed to open '{}' for write: {err}", path.display()))?;
-    let open_meta = file
-        .metadata()
-        .map_err(|err| format!("failed to inspect opened '{}': {err}", path.display()))?;
-    if is_symlink_or_reparse(&open_meta) || !open_meta.file_type().is_file() {
-        return Err(format!(
-            "opened destination '{}' is not a regular file",
-            path.display()
-        ));
-    }
-    Ok(file)
 }
 
 fn open_source_file_no_symlink(path: &Path) -> Result<File, String> {

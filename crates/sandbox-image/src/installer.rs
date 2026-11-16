@@ -1,10 +1,12 @@
 //! Anti-tamper bundle tree verification and atomic staging/swap installer.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use sandbox_core::SandboxError;
 use sha2::{Digest, Sha256};
@@ -111,6 +113,28 @@ pub fn install_bundle_atomic(
 /// anti-tamper directory walk (no symlinks, reparse points, hardlinks, or extra files), and
 /// exact SHA-256 + byte-size match for every declared artifact.
 pub fn verify_installed_bundle(
+    bundle_dir: &Path,
+    verifier: &BundleVerifier,
+) -> Result<InstalledBundle, SandboxError> {
+    for attempt in 0..4 {
+        recover_or_wait_promotion(bundle_dir)?;
+        match verify_installed_bundle_once(bundle_dir, verifier) {
+            Ok(bundle) => return Ok(bundle),
+            Err(SandboxError::NotFound(_))
+                if attempt < 3
+                    && promotion_intent_path(bundle_dir).is_some_and(|p| p.exists()) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    recover_or_wait_promotion(bundle_dir)?;
+    verify_installed_bundle_once(bundle_dir, verifier)
+}
+
+fn verify_installed_bundle_once(
     bundle_dir: &Path,
     verifier: &BundleVerifier,
 ) -> Result<InstalledBundle, SandboxError> {
@@ -572,6 +596,8 @@ fn atomic_swap_dir(
     bundle_id: &str,
     staging_guard: &mut TempDirGuard,
 ) -> Result<(), SandboxError> {
+    recover_or_wait_promotion(target_dir)?;
+
     match fs::symlink_metadata(target_dir) {
         Err(err) if err.kind() == ErrorKind::NotFound => {
             fs::rename(staging_dir, target_dir)
@@ -584,14 +610,41 @@ fn atomic_swap_dir(
             let parent = target_dir.parent().ok_or_else(|| {
                 SandboxError::Internal("target bundle directory has no parent".to_owned())
             })?;
-            let backup_dir = parent.join(format!(".backup-{bundle_id}-{}", next_temp_suffix()));
+            let backup_name = format!(".backup-{bundle_id}-{}", next_temp_suffix());
+            let backup_dir = parent.join(&backup_name);
+            let staging_name = staging_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    SandboxError::Internal("staging directory missing UTF-8 filename".to_owned())
+                })?;
 
-            fs::rename(target_dir, &backup_dir).map_err(|err| {
-                map_fs_error(target_dir, "move existing bundle directory to backup", err)
-            })?;
+            let intent_path = parent.join(format!(".promote-{bundle_id}.v1"));
+            let mut intent_file = open_promotion_intent_locked(&intent_path)?;
+            let intent_payload = format!("staging={staging_name}\nbackup={backup_name}\n");
+            intent_file
+                .set_len(0)
+                .and_then(|()| intent_file.seek(SeekFrom::Start(0)))
+                .and_then(|_| intent_file.write_all(intent_payload.as_bytes()))
+                .and_then(|()| intent_file.sync_all())
+                .map_err(|err| map_fs_error(&intent_path, "persist bundle promotion intent", err))?;
 
-            if let Err(promote_err) = fs::rename(staging_dir, target_dir) {
-                let rollback_res = fs::rename(&backup_dir, target_dir);
+            if let Err(err) = rename_with_brief_retry(target_dir, &backup_dir) {
+                drop(intent_file);
+                let _ = fs::remove_file(&intent_path);
+                return Err(map_fs_error(
+                    target_dir,
+                    "move existing bundle directory to backup",
+                    err,
+                ));
+            }
+
+            if let Err(promote_err) = rename_with_brief_retry(staging_dir, target_dir) {
+                let rollback_res = rename_with_brief_retry(&backup_dir, target_dir);
+                drop(intent_file);
+                if rollback_res.is_ok() {
+                    let _ = fs::remove_file(&intent_path);
+                }
                 return Err(match rollback_res {
                     Ok(()) => SandboxError::Internal(format!(
                         "failed to swap staged bundle '{}' into '{}' (rolled back previous bundle): {promote_err}",
@@ -608,7 +661,12 @@ fn atomic_swap_dir(
             }
 
             staging_guard.disarm();
-            fs::remove_dir_all(&backup_dir).map_err(|err| {
+            // Release promotion lock now that `target_dir` points to the new version, waking any
+            // concurrent readers waiting in `recover_or_wait_promotion`.
+            drop(intent_file);
+            let _ = fs::remove_file(&intent_path);
+
+            remove_dir_all_with_brief_retry(&backup_dir).map_err(|err| {
                 map_fs_error(&backup_dir, "remove backup bundle directory after swap", err)
             })?;
             Ok(())
@@ -619,6 +677,161 @@ fn atomic_swap_dir(
             err,
         )),
     }
+}
+
+fn promotion_intent_path(target_dir: &Path) -> Option<PathBuf> {
+    let parent = target_dir.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let name = target_dir.file_name()?.to_str()?;
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    Some(parent.join(format!(".promote-{name}.v1")))
+}
+
+fn open_promotion_intent_locked(intent_path: &Path) -> Result<File, SandboxError> {
+    if let Ok(meta) = fs::symlink_metadata(intent_path) {
+        validate_metadata_no_link(intent_path, &meta, false, false)?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(intent_path)
+        .map_err(|err| map_fs_error(intent_path, "open bundle promotion intent", err))?;
+    file.lock()
+        .map_err(|err| map_fs_error(intent_path, "lock bundle promotion intent", err))?;
+    Ok(file)
+}
+
+fn recover_or_wait_promotion(target_dir: &Path) -> Result<(), SandboxError> {
+    let Some(intent_path) = promotion_intent_path(target_dir) else {
+        return Ok(());
+    };
+    let meta = match fs::symlink_metadata(&intent_path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(map_fs_error(&intent_path, "inspect bundle promotion intent", err)),
+    };
+    validate_metadata_no_link(&intent_path, &meta, false, false)?;
+
+    let mut file = match OpenOptions::new().read(true).write(true).open(&intent_path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(map_fs_error(&intent_path, "open bundle promotion intent", err)),
+    };
+
+    match file.try_lock() {
+        Err(TryLockError::WouldBlock) => {
+            // An active installer holds the lock during its two-step rename; wait for completion.
+            let _ = file.lock_shared();
+            Ok(())
+        }
+        Err(TryLockError::Error(err)) => {
+            Err(map_fs_error(&intent_path, "probe bundle promotion lock", err))
+        }
+        Ok(()) => {
+            let mut text = String::new();
+            let _ = file.read_to_string(&mut text);
+            let mut staging_name: Option<String> = None;
+            let mut backup_name: Option<String> = None;
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("staging=") {
+                    staging_name = Some(rest.trim().to_owned());
+                } else if let Some(rest) = line.strip_prefix("backup=") {
+                    backup_name = Some(rest.trim().to_owned());
+                }
+            }
+
+            if let Some(parent) = target_dir.parent() {
+                let staging_path = staging_name
+                    .as_deref()
+                    .filter(|n| is_safe_sibling_dir_name(n))
+                    .map(|n| parent.join(n));
+                let backup_path = backup_name
+                    .as_deref()
+                    .filter(|n| is_safe_sibling_dir_name(n))
+                    .map(|n| parent.join(n));
+
+                if !target_dir.exists() {
+                    if let Some(ref sp) = staging_path {
+                        if sp.is_dir() {
+                            let _ = rename_with_brief_retry(sp, target_dir);
+                        }
+                    }
+                    if !target_dir.exists() {
+                        if let Some(ref bp) = backup_path {
+                            if bp.is_dir() {
+                                let _ = rename_with_brief_retry(bp, target_dir);
+                            }
+                        }
+                    }
+                }
+
+                if target_dir.exists() {
+                    if let Some(sp) = staging_path {
+                        if sp.exists() {
+                            let _ = remove_dir_all_with_brief_retry(&sp);
+                        }
+                    }
+                    if let Some(bp) = backup_path {
+                        if bp.exists() {
+                            let _ = remove_dir_all_with_brief_retry(&bp);
+                        }
+                    }
+                }
+            }
+
+            drop(file);
+            if target_dir.exists() {
+                let _ = fs::remove_file(&intent_path);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn is_safe_sibling_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+fn rename_with_brief_retry(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied && attempt < 9 => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("rename retries exhausted")))
+}
+
+fn remove_dir_all_with_brief_retry(path: &Path) -> io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied && attempt < 9 => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("remove_dir_all retries exhausted")))
 }
 
 struct TempDirGuard {
@@ -1047,5 +1260,99 @@ mod tests {
             verify_installed_bundle(installed.root_dir(), &verifier),
             Err(SandboxError::PolicyViolation(_))
         ));
+    }
+
+    #[test]
+    fn interrupted_promotion_crash_recovers_and_concurrent_readers_never_observe_missing_bundle() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let tmp = TestTempDir::new("promo-recovery-and-concurrency");
+        let src_v1 = tmp.path().join("src-v1");
+        let src_v2 = tmp.path().join("src-v2");
+        let install_root = tmp.path().join("installed");
+        fs::create_dir_all(&src_v1).unwrap();
+        fs::create_dir_all(&src_v2).unwrap();
+
+        let secret = [0x66u8; 32];
+        let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
+
+        write_signed_bundle(
+            &src_v1,
+            "minipod-rc-test",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v1"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v1"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v1"),
+            ],
+        );
+        write_signed_bundle(
+            &src_v2,
+            "minipod-rc-test",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v2-upgraded"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v2-upgraded"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v2-upgraded"),
+            ],
+        );
+
+        let installed = install_bundle_atomic(&src_v1, &install_root, &verifier).unwrap();
+        let target_dir = installed.root_dir().to_path_buf();
+
+        // 1. Simulate process crash right after renaming `target_dir` -> `.backup-*` before promoting `.staging-*`.
+        let backup_dir = install_root.join(".backup-minipod-rc-test-crashed");
+        let staging_dir = install_root.join(".staging-minipod-rc-test-crashed");
+        fs::rename(&target_dir, &backup_dir).unwrap();
+        // Copy valid v2 into staging_dir.
+        write_signed_bundle(
+            &staging_dir,
+            "minipod-rc-test",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v2-upgraded"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v2-upgraded"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v2-upgraded"),
+            ],
+        );
+        fs::write(
+            install_root.join(".promote-minipod-rc-test.v1"),
+            "staging=.staging-minipod-rc-test-crashed\nbackup=.backup-minipod-rc-test-crashed\n",
+        )
+        .unwrap();
+        assert!(!target_dir.exists());
+
+        let recovered = verify_installed_bundle(&target_dir, &verifier)
+            .expect("verify_installed_bundle must recover crashed promotion automatically");
+        assert_eq!(fs::read(recovered.kernel_path()).unwrap(), b"kernel-v2-upgraded");
+        assert!(!backup_dir.exists());
+        assert!(!staging_dir.exists());
+        assert!(!install_root.join(".promote-minipod-rc-test.v1").exists());
+
+        // 2. Concurrent readers loop during repeated live upgrades without ever observing NotFound.
+        let done = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let done_r = Arc::clone(&done);
+            let dir_r = target_dir.clone();
+            let ver_r = verifier.clone();
+            readers.push(thread::spawn(move || {
+                while !done_r.load(Ordering::Acquire) {
+                    verify_installed_bundle(&dir_r, &ver_r)
+                        .expect("concurrent reader must never observe missing or partial bundle");
+                }
+            }));
+        }
+
+        for idx in 0..8 {
+            let src = if idx % 2 == 0 { &src_v1 } else { &src_v2 };
+            install_bundle_atomic(src, &install_root, &verifier)
+                .expect("live bundle upgrade must succeed");
+        }
+        done.store(true, Ordering::Release);
+        for handle in readers {
+            handle.join().expect("reader thread panicked");
+        }
     }
 }

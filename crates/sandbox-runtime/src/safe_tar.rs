@@ -4,6 +4,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use sandbox_core::SandboxError;
@@ -11,6 +12,8 @@ use sandbox_core::SandboxError;
 use crate::{is_symlink_or_reparse, map_fs_error};
 
 const COPY_IO_BUFFER_BYTES: usize = 64 * 1024;
+
+static NEXT_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(
     target_os = "linux",
@@ -267,7 +270,8 @@ pub fn extract_tar_safely(
         let file_path = parent_dir.join(&file_name[0]);
         let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
 
-        let mut out_file = open_extract_file_no_follow(&file_path)?;
+        validate_extract_destination_before_replace(&file_path)?;
+        let mut staged = StagedExtractFile::create(&parent_dir)?;
         let mut copied: u64 = 0;
         let mut limited = (&mut entry).take(remaining.saturating_add(1));
 
@@ -276,7 +280,6 @@ pub fn extract_tar_safely(
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(err) => {
-                    let _ = fs::remove_file(&file_path);
                     return Err(SandboxError::InvalidSpec(format!(
                         "failed reading tar payload for '{}': {err}",
                         segments.join("/")
@@ -287,29 +290,23 @@ pub fn extract_tar_safely(
                 .checked_add(n as u64)
                 .ok_or_else(|| SandboxError::BudgetExceeded("extracted byte count overflow".to_owned()))?;
             if copied > remaining {
-                drop(out_file);
-                let _ = fs::remove_file(&file_path);
                 return Err(SandboxError::BudgetExceeded(format!(
                     "tar extraction exceeded max_bytes ({max_bytes})"
                 )));
             }
-            if let Err(err) = out_file.write_all(&copy_buf[..n]) {
-                drop(out_file);
-                let _ = fs::remove_file(&file_path);
-                return Err(map_fs_error(&file_path, "write extracted file", err));
+            if let Err(err) = staged.write_all(&copy_buf[..n]) {
+                return Err(map_fs_error(&file_path, "write staged extracted file", err));
             }
         }
 
         if copied != declared_size {
-            drop(out_file);
-            let _ = fs::remove_file(&file_path);
             return Err(SandboxError::InvalidSpec(format!(
                 "truncated tar entry '{}': expected {declared_size} bytes, got {copied}",
                 segments.join("/")
             )));
         }
 
-        apply_safe_file_mode(&out_file, mode)?;
+        staged.commit(&file_path, mode)?;
         total_extracted = total_extracted
             .checked_add(copied)
             .ok_or_else(|| SandboxError::BudgetExceeded("extracted byte count overflow".to_owned()))?;
@@ -912,8 +909,85 @@ fn open_source_regular_no_follow(
         .map_err(|err| map_fs_error(path, "open source file", err))
 }
 
-fn open_extract_file_no_follow(path: &Path) -> Result<File, SandboxError> {
-    let pre_meta = match fs::symlink_metadata(path) {
+struct StagedExtractFile {
+    tmp_path: PathBuf,
+    file: Option<File>,
+    armed: bool,
+}
+
+impl StagedExtractFile {
+    fn create(parent_dir: &Path) -> Result<Self, SandboxError> {
+        for _ in 0..16 {
+            let seq = NEXT_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = parent_dir.join(format!(
+                ".minipod-extract-{}-{seq}.tmp",
+                std::process::id()
+            ));
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+                if let Some(flag) = UNIX_O_NOFOLLOW {
+                    opts.custom_flags(flag);
+                }
+            }
+            match opts.open(&tmp_path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        tmp_path,
+                        file: Some(file),
+                        armed: true,
+                    });
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(map_fs_error(&tmp_path, "create staged extraction file", err));
+                }
+            }
+        }
+        Err(SandboxError::Internal(format!(
+            "exhausted temporary extraction filenames in '{}'",
+            parent_dir.display()
+        )))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self.file.as_mut() {
+            Some(f) => f.write_all(bytes),
+            None => Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "staged extraction file already closed",
+            )),
+        }
+    }
+
+    fn commit(mut self, dst_path: &Path, mode: u32) -> Result<(), SandboxError> {
+        if let Some(file) = self.file.take() {
+            apply_safe_file_mode(&file, mode)?;
+            file.sync_data()
+                .map_err(|err| map_fs_error(&self.tmp_path, "sync staged extraction file", err))?;
+        }
+        validate_extract_destination_before_replace(dst_path)?;
+        fs::rename(&self.tmp_path, dst_path)
+            .map_err(|err| map_fs_error(dst_path, "commit extracted file", err))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for StagedExtractFile {
+    fn drop(&mut self) {
+        self.file.take();
+        if self.armed {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+fn validate_extract_destination_before_replace(path: &Path) -> Result<(), SandboxError> {
+    match fs::symlink_metadata(path) {
         Ok(meta) => {
             reject_symlink_or_reparse(path, &meta)?;
             if meta.file_type().is_dir() {
@@ -939,37 +1013,11 @@ fn open_extract_file_no_follow(path: &Path) -> Result<File, SandboxError> {
                     )));
                 }
             }
-            Some(meta)
+            Ok(())
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => None,
-        Err(err) => return Err(map_fs_error(path, "inspect destination file", err)),
-    };
-
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    if let Some(flag) = UNIX_O_NOFOLLOW {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(flag);
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(map_fs_error(path, "inspect destination file", err)),
     }
-
-    let file = opts
-        .open(path)
-        .map_err(|err| map_fs_error(path, "open destination file", err))?;
-    let open_meta = file
-        .metadata()
-        .map_err(|err| map_fs_error(path, "inspect opened destination file", err))?;
-    reject_symlink_or_reparse(path, &open_meta)?;
-    if !open_meta.file_type().is_file() {
-        return Err(SandboxError::PolicyViolation(format!(
-            "opened destination '{}' is not a regular file",
-            path.display()
-        )));
-    }
-    if let Some(ref before) = pre_meta {
-        verify_opened_regular_matches(path, before, &open_meta)?;
-    }
-    Ok(file)
 }
 
 fn verify_opened_regular_matches(
@@ -1508,5 +1556,46 @@ mod tests {
             validate_tar_bytes(&trunc_tar, 1024, 16),
             Err(SandboxError::InvalidSpec(_))
         ));
+    }
+
+    #[test]
+    fn extract_never_mutates_hardlinked_outside_file_and_preserves_existing_file_on_truncated_tar() {
+        let tmp = TestTempDir::new("rt-hardlink-and-truncated");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"original").unwrap();
+        fs::hard_link(&outside, out.join("linked.txt")).unwrap();
+
+        let overwrite_tar = make_raw_tar(&[(
+            b"linked.txt",
+            tar::EntryType::Regular,
+            b"overwritten",
+            None,
+        )]);
+        let res = extract_tar_safely(&overwrite_tar, &out, 65536, 20);
+        #[cfg(unix)]
+        assert!(matches!(res, Err(SandboxError::PolicyViolation(_))));
+        #[cfg(windows)]
+        {
+            assert_eq!(res.unwrap(), 11);
+            assert_eq!(fs::read(out.join("linked.txt")).unwrap(), b"overwritten");
+        }
+        assert_eq!(fs::read(&outside).unwrap(), b"original");
+
+        let valuable = out.join("valuable.txt");
+        fs::write(&valuable, b"original").unwrap();
+        let mut truncated = make_raw_tar(&[(
+            b"valuable.txt",
+            tar::EntryType::Regular,
+            b"new contents",
+            None,
+        )]);
+        truncated.truncate(515);
+
+        let err = extract_tar_safely(&truncated, &out, 65536, 20);
+        assert!(matches!(err, Err(SandboxError::InvalidSpec(_))));
+        assert_eq!(fs::read(&valuable).unwrap(), b"original");
     }
 }
