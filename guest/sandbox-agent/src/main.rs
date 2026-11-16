@@ -1694,17 +1694,32 @@ mod tests {
         send_message(&mut host_tx, StreamId(30), &guest_exec_start(shell_cmd(script))).unwrap();
 
         // First chunk must be capped at 10 bytes while remaining bytes wait for credit.
+        // Stderr EOF may arrive concurrently before stdout is flushed.
+        let mut pre_stderr_eof = false;
         let first = loop {
             let f = read_frame(&mut host_rx).unwrap();
-            if let Message::StreamData {
-                channel: StreamChannel::Stdout,
-                eof,
-                data,
-            } = f.decode_message().unwrap()
-            {
-                assert!(!eof);
-                assert_eq!(data.len(), 10);
-                break data;
+            assert_eq!(f.header.stream_id, StreamId(30));
+            match f.decode_message().unwrap() {
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    eof,
+                    data,
+                } => {
+                    assert!(!eof);
+                    assert_eq!(data.len(), 10);
+                    break data;
+                }
+                Message::StreamData {
+                    channel: StreamChannel::Stderr,
+                    eof,
+                    data,
+                } => {
+                    assert!(data.is_empty(), "unexpected stderr output: {data:?}");
+                    if eof {
+                        pre_stderr_eof = true;
+                    }
+                }
+                other => panic!("unexpected frame while waiting for capped stdout: {other:?}"),
             }
         };
 
@@ -1719,9 +1734,10 @@ mod tests {
         )
         .unwrap();
 
-        let (rest_stdout, _, stdout_eof, stderr_eof, exit_msg) =
+        let (rest_stdout, stderr_rest, stdout_eof, stderr_eof, exit_msg) =
             collect_exec_response(&mut host_rx, StreamId(30));
-        assert!(stdout_eof && stderr_eof);
+        assert!(stderr_rest.is_empty(), "unexpected stderr: {stderr_rest:?}");
+        assert!(stdout_eof && (pre_stderr_eof || stderr_eof));
         assert!(matches!(exit_msg, Message::ExecExit { code: Some(0), .. }));
 
         let mut all = first;

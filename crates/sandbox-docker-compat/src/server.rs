@@ -1095,10 +1095,8 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
                     return DockerRoute::ExecOrAttachHijack;
                 }
             }
-            ["containers", raw_id, "attach"] => {
-                if decode_safe_container_id(raw_id).is_some() {
-                    return DockerRoute::ExecOrAttachHijack;
-                }
+            ["containers", raw_id, "attach"] if decode_safe_container_id(raw_id).is_some() => {
+                return DockerRoute::ExecOrAttachHijack;
             }
             _ => {}
         }
@@ -1734,9 +1732,9 @@ mod tests {
                 let n = reader.read(&mut buf).await.unwrap_or(0);
                 if n > 0 {
                     let reply = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nguest:{}",
                         n + 6,
-                        format!("guest:{}", String::from_utf8_lossy(&buf[..n]))
+                        String::from_utf8_lossy(&buf[..n])
                     );
                     let _ = writer.write_all(reply.as_bytes()).await;
                     let _ = writer.flush().await;

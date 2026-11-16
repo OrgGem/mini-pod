@@ -621,12 +621,25 @@ impl VmSessionPort for QemuVmSession {
                 "exec deadline must be greater than zero".to_owned(),
             ));
         }
-        self.ensure_transport_ready()?;
 
         let wire_target = match req.target {
             ExecTarget::Guest => ExecTargetWire::Guest,
-            ExecTarget::Container { id_or_name } => ExecTargetWire::Container { id_or_name },
+            ExecTarget::Container { id_or_name } => {
+                if id_or_name.is_empty()
+                    || id_or_name.len() > 128
+                    || id_or_name.starts_with('-')
+                    || !id_or_name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+                {
+                    return Err(SandboxError::InvalidSpec(
+                        "container exec target id_or_name must be 1..=128 ASCII [a-zA-Z0-9_.-] and cannot start with '-'".to_owned(),
+                    ));
+                }
+                ExecTargetWire::Container { id_or_name }
+            }
         };
+        self.ensure_transport_ready()?;
         let deadline_ms = u64::try_from(req.deadline.as_millis())
             .unwrap_or(u64::MAX)
             .max(1);

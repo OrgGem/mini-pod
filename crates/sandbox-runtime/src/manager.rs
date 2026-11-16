@@ -871,9 +871,15 @@ fn validate_exec_request(req: &ExecRequest) -> Result<(), SandboxError> {
         ));
     }
     if let ExecTarget::Container { ref id_or_name } = req.target {
-        if id_or_name.is_empty() || id_or_name.contains('\0') {
+        if id_or_name.is_empty()
+            || id_or_name.len() > 128
+            || id_or_name.starts_with('-')
+            || !id_or_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        {
             return Err(SandboxError::InvalidSpec(
-                "container exec target id_or_name cannot be empty or contain NUL".to_owned(),
+                "container exec target id_or_name must be 1..=128 ASCII [a-zA-Z0-9_.-] and cannot start with '-'".to_owned(),
             ));
         }
     }
@@ -1680,6 +1686,27 @@ mod tests {
                 .await,
             Err(SandboxError::InvalidSpec(_))
         ));
+        for bad_target in ["", "--privileged", "foo/bar", "a\0b", &"x".repeat(129)] {
+            assert!(matches!(
+                mgr.exec_stream(
+                    &lease.id,
+                    ExecRequest {
+                        target: ExecTarget::Container {
+                            id_or_name: bad_target.to_owned(),
+                        },
+                        argv: vec!["/bin/true".to_owned()],
+                        env: BTreeMap::new(),
+                        cwd: None,
+                        user: None,
+                        deadline: Duration::from_secs(5),
+                        stdout_budget_bytes: 1024,
+                        stderr_budget_bytes: 1024,
+                    },
+                )
+                .await,
+                Err(SandboxError::InvalidSpec(_))
+            ));
+        }
 
         let m1 = Arc::clone(&mgr);
         let m2 = Arc::clone(&mgr);

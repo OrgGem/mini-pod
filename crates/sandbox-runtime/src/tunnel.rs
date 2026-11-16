@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(resp, b"pong");
 
         drop(stream);
-        assert_eq!(handle.drop_rx.await.unwrap(), true);
+        assert!(handle.drop_rx.await.unwrap());
     }
 
     #[tokio::test]
@@ -151,6 +151,6 @@ mod tests {
         let (mut stream, handle) = TunnelStream::channel(StreamId(8));
         stream.write_all(b"partial").await.unwrap();
         drop(stream);
-        assert_eq!(handle.drop_rx.await.unwrap(), false);
+        assert!(!handle.drop_rx.await.unwrap());
     }
 }

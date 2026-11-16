@@ -272,6 +272,12 @@ fn connect_target(
             let stream = TcpStream::connect_timeout(&addr, TCP_CONNECT_TIMEOUT).map_err(|err| {
                 format!("failed to connect guest loopback 127.0.0.1:{port}: {err}")
             })?;
+            // On Windows, `connect_timeout` completes non-blocking `connect()` via `select()`,
+            // leaving `mswsock` user-mode state unsynced until queried; sync via `peer_addr()`
+            // before `try_clone()` (`WSADuplicateSocketW`) so cloned writers don't fail
+            // `shutdown(Shutdown::Write)` with `WSAENOTCONN`.
+            #[cfg(windows)]
+            let _ = stream.peer_addr();
             let _ = stream.set_nodelay(true);
             Ok(TunnelSocket::Tcp(stream))
         }

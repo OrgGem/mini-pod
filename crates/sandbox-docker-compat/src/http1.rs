@@ -583,7 +583,9 @@ where
         BodyMode::ContentLength(total) => {
             let mut remaining = total;
             while remaining > 0 {
-                let to_read = (remaining as usize).min(buf.len());
+                let to_read = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(buf.len());
                 let n = reader.read(&mut buf[..to_read]).await?;
                 if n == 0 {
                     return Err(HttpError::UnexpectedEof);
@@ -630,7 +632,9 @@ where
 
                 let mut remaining = chunk_len;
                 while remaining > 0 {
-                    let to_read = (remaining as usize).min(buf.len());
+                    let to_read = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(buf.len());
                     let n = reader.read(&mut buf[..to_read]).await?;
                     if n == 0 {
                         return Err(HttpError::UnexpectedEof);
@@ -938,7 +942,7 @@ fn parse_chunk_size_line(line: &str) -> Result<u64, HttpError> {
                     "invalid control character in chunk extension".to_owned(),
                 ));
             }
-            size_raw.trim_end_matches(|c| c == ' ' || c == '\t')
+            size_raw.trim_end_matches([' ', '\t'])
         }
         None => line,
     };
