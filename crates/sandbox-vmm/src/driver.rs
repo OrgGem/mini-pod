@@ -1179,7 +1179,10 @@ async fn pump_tunnel_outbound(
             }, if drop_rx.is_some() => {
                 drop_rx = None;
                 let graceful_write = matches!(res, Ok(true));
-                if !(graceful_write && remote_eof) {
+                // Only abort with `StreamClose` on ungraceful drop without write `shutdown()`.
+                // When the host called `shutdown()` before dropping (e.g., HTTP proxy response
+                // before client TCP FIN), keep draining `read_half` until `stdin_eof`.
+                if !graceful_write {
                     if let Ok(frame) = Frame::from_message(stream_id, &Message::StreamClose) {
                         let _ = outbound.enqueue(frame);
                     }
@@ -2324,6 +2327,122 @@ mod tests {
             .expect("guest receives response")
             .expect("guest channel alive");
         assert_eq!(guest_resp, b"HTTP/1.1 200 OK\r\n\r\n");
+
+        assert!(session
+            .graceful_shutdown(Duration::from_millis(500))
+            .await
+            .unwrap());
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn egress_graceful_shutdown_drop_drains_response_before_remote_eof() {
+        use sandbox_protocol::GUEST_STREAM_ID_BIT;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-egress-http").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let (guest_done_tx, guest_done_rx) = oneshot::channel();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            let guest_sid = StreamId(GUEST_STREAM_ID_BIT | 2);
+
+            write_frame(
+                &mut client,
+                &Frame::from_message(guest_sid, &Message::EgressOpen).unwrap(),
+            )
+            .unwrap();
+            let ack = read_frame(&mut client).unwrap();
+            assert_eq!(ack.decode_message().unwrap(), Message::ConnectAck);
+
+            // Send HTTP request WITHOUT closing write side (eof: false), like real `wget`.
+            write_frame(
+                &mut client,
+                &Frame::from_message(
+                    guest_sid,
+                    &Message::StreamData {
+                        channel: StreamChannel::Stdout,
+                        eof: false,
+                        data: b"GET http://allowed.test/ok HTTP/1.1\r\n\r\n".to_vec(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Must receive full HTTP response + Stdin eof:true without premature StreamClose.
+            let mut resp = Vec::new();
+            loop {
+                let f = read_frame(&mut client).unwrap();
+                assert_eq!(f.header.stream_id, guest_sid);
+                match f.decode_message().unwrap() {
+                    Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        eof,
+                        data,
+                    } => {
+                        resp.extend_from_slice(&data);
+                        if eof {
+                            break;
+                        }
+                    }
+                    other => panic!("expected Stdin StreamData, got {other:?}"),
+                }
+            }
+
+            // Now guest closes its TCP socket (Stdout eof: true).
+            write_frame(
+                &mut client,
+                &Frame::from_message(
+                    guest_sid,
+                    &Message::StreamData {
+                        channel: StreamChannel::Stdout,
+                        eof: true,
+                        data: Vec::new(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let _ = guest_done_tx.send(resp);
+
+            while let Ok(frame) = read_frame(&mut client) {
+                if matches!(frame.decode_message(), Ok(Message::Shutdown)) {
+                    let _ = write_frame(
+                        &mut client,
+                        &Frame::from_message(StreamId(0), &Message::Shutdown).unwrap(),
+                    );
+                    break;
+                }
+            }
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let (session, mut egress_rx) =
+            QemuVmSession::from_test_stream_with_egress(host_stream, Duration::from_secs(2))
+                .unwrap();
+
+        let mut egress_stream = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut req_buf = [0u8; 128];
+        let n = egress_stream.read(&mut req_buf).await.unwrap();
+        assert_eq!(&req_buf[..n], b"GET http://allowed.test/ok HTTP/1.1\r\n\r\n");
+
+        // Write response, call shutdown(), and drop immediately BEFORE guest sends Stdout EOF.
+        egress_stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        egress_stream.shutdown().await.unwrap();
+        drop(egress_stream);
+
+        let guest_resp = tokio::time::timeout(Duration::from_secs(2), guest_done_rx)
+            .await
+            .expect("guest receives full HTTP response")
+            .unwrap();
+        assert_eq!(guest_resp, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 
         assert!(session
             .graceful_shutdown(Duration::from_millis(500))

@@ -312,6 +312,15 @@ impl LocalRuntimeManager {
         self.admission.usage()
     }
 
+    /// Samples the live host resident set size (`RSS` / working set) in bytes for an active sandbox.
+    pub fn sandbox_current_rss_bytes(&self, id: &SandboxId) -> Option<u64> {
+        let session = {
+            let active = lock_unpoisoned(&self.active);
+            active.get(id).map(|entry| Arc::clone(&entry.session))
+        }?;
+        session.current_rss_bytes()
+    }
+
     /// Starts the background lease sweeper; aborted automatically when [`LocalRuntimeManager`] drops.
     pub fn spawn_lease_sweeper(self: &Arc<Self>) -> JoinHandle<()> {
         let weak = Arc::downgrade(self);
@@ -2386,6 +2395,14 @@ mod tests {
         rss_spec.budget.guest_ram_mb = 128;
         rss_spec.budget.host_rss_budget_mb = Some(256);
         let lease_rss = mgr.spawn(rss_spec).await.unwrap();
+        assert_eq!(
+            mgr.sandbox_current_rss_bytes(&lease_rss.id),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            mgr.sandbox_current_rss_bytes(&SandboxId::new("missing-id")),
+            None
+        );
         {
             let st = lock_unpoisoned(&vm.state);
             let idx = st.sessions.len() - 1;
@@ -2393,7 +2410,12 @@ mod tests {
                 .rss_bytes
                 .store(300 * 1024 * 1024, Ordering::Release);
         }
+        assert_eq!(
+            mgr.sandbox_current_rss_bytes(&lease_rss.id),
+            Some(300 * 1024 * 1024)
+        );
         assert_eq!(mgr.enforce_resource_budgets().await, 1);
+        assert_eq!(mgr.sandbox_current_rss_bytes(&lease_rss.id), None);
         assert!(matches!(
             mgr.renew_lease(&lease_rss.id, Duration::from_secs(10)).await,
             Err(SandboxError::NotFound(_))
