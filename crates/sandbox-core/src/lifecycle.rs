@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use crate::error::SandboxError;
 use crate::policy::{
-    AccelerationPolicy, EnforcementLevel, IsolationMode, NetworkPolicy, ResourceBudget,
+    normalize_egress_domain, AccelerationPolicy, EnforcementLevel, IsolationMode, NetworkPolicy,
+    ResourceBudget,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -89,6 +90,16 @@ impl SandboxSpec {
             return Err(SandboxError::InvalidSpec(
                 "lease_ttl must be greater than zero".to_string(),
             ));
+        }
+        if let NetworkPolicy::DomainAllowList { rules } = &self.network {
+            for rule in rules {
+                if rule.port == 0 {
+                    return Err(SandboxError::InvalidSpec(
+                        "egress rule port must be greater than zero".to_string(),
+                    ));
+                }
+                normalize_egress_domain(&rule.domain)?;
+            }
         }
         Ok(())
     }

@@ -2,6 +2,7 @@
 //! Layer 2 runtime manager contract: lifecycle orchestration, lease management,
 //! execution streaming, driven adapter ports, safe workspace tar copy I/O, and crash journaling.
 
+pub mod egress;
 pub mod exec_stream;
 pub mod journal;
 pub mod manager;
@@ -15,6 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sandbox_core::{DestroyStatus, ExecRequest, SandboxError, SandboxId, SandboxLease, SandboxSpec};
+
+pub use egress::{
+    is_forbidden_ip, is_forbidden_ipv4, is_forbidden_ipv6, AsyncStream, BoxedUpstreamStream,
+    HostDnsResolver, HostEgressProxy, SystemDnsResolver, TcpUpstreamDialer, UpstreamDialer,
+};
 
 pub use exec_stream::{
     CollectedExecOutput, ExecOutputChunk, ExecStream, ExecStreamHandle, OutputStreamKind,
