@@ -29,7 +29,7 @@ use sandbox_image::{
     install_bundle_atomic, BundleOverlayStore, BundleVerifier, InstalledBundle,
 };
 use sandbox_runtime::{
-    LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig, SandboxTunnelPort,
+    AdmissionLimits, LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig, SandboxTunnelPort,
 };
 use sandbox_vmm::{
     discover_qemu_binary_for_arch, discover_qemu_img_binary, QemuDriverConfig, QemuVmDriver,
@@ -234,6 +234,7 @@ fn build_phase4_runtime(fixtures: &Phase4Fixtures, prefix: &str) -> Phase4Harnes
         max_copy_entries: 4096,
         cleanup_max_attempts: 8,
         cleanup_initial_delay: Duration::from_millis(50),
+        admission: AdmissionLimits::default(),
     };
 
     let manager = Arc::new(

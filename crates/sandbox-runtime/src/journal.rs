@@ -253,6 +253,28 @@ impl JournalStore {
         Ok(record)
     }
 
+    /// Returns the total physical byte footprint of `<id>.journal` (and any `.tmp`) on disk.
+    pub fn record_disk_bytes(&self, id: &SandboxId) -> Result<u64, SandboxError> {
+        validate_sandbox_id_filename(id)?;
+        let stem = id.as_str();
+        let mut total: u64 = 0;
+        for path in [
+            self.root_dir.join(format!("{stem}{JOURNAL_EXT}")),
+            self.root_dir.join(format!("{stem}{JOURNAL_EXT}.tmp")),
+        ] {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    if !is_symlink_or_reparse(&meta) && meta.file_type().is_file() {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(map_fs_error(&path, "inspect journal file size", err)),
+            }
+        }
+        Ok(total)
+    }
+
     /// Idempotently removes a sandbox's committed journal (and any leftover `.tmp` file).
     pub fn remove_record(&self, id: &SandboxId) -> Result<(), SandboxError> {
         validate_sandbox_id_filename(id)?;
@@ -706,7 +728,9 @@ mod tests {
         assert_eq!(loaded2, vec![rec1_updated, rec2.clone()]);
 
         // Idempotent removal.
+        assert!(store.record_disk_bytes(&rec1.sandbox_id).unwrap() > 0);
         store.remove_record(&rec1.sandbox_id).unwrap();
+        assert_eq!(store.record_disk_bytes(&rec1.sandbox_id).unwrap(), 0);
         store.remove_record(&rec1.sandbox_id).unwrap();
         assert_eq!(store.load_records().unwrap(), vec![rec2]);
     }

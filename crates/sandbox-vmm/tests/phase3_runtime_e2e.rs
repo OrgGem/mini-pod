@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_core::{
-    AccelerationPolicy, DestroyStatus, EnforcementLevel, ExecRequest, ExecTarget, GuestArch,
-    IsolationMode, NetworkPolicy, ResourceBudget, SandboxError, SandboxId, SandboxSpec,
+    AccelerationPolicy, DestroyStatus, EgressRule, EnforcementLevel, ExecRequest, ExecTarget,
+    GuestArch, IsolationMode, NetworkPolicy, ResourceBudget, SandboxError, SandboxId, SandboxSpec,
 };
 use sandbox_image::{
     decode_hex_exact, install_bundle_atomic, BundleOverlayStore, BundleVerifier, InstalledBundle,
 };
 use sandbox_runtime::{
-    CollectedExecOutput, JournalLifecycleState, JournalRecord, JournalStore, LocalRuntimeManager,
-    RuntimeManager, RuntimeManagerConfig,
+    AdmissionLimits, CollectedExecOutput, JournalLifecycleState, JournalRecord, JournalStore,
+    LocalRuntimeManager, RuntimeManager, RuntimeManagerConfig,
 };
 use sandbox_vmm::{
     discover_qemu_binary_for_arch, discover_qemu_img_binary, kill_verified_orphan_process,
@@ -157,6 +157,7 @@ fn build_manager_for_installed_bundle(
         max_copy_entries: 4096,
         cleanup_max_attempts: 8,
         cleanup_initial_delay: Duration::from_millis(50),
+        admission: AdmissionLimits::default(),
     };
 
     Arc::new(
@@ -263,7 +264,7 @@ async fn e2e_safe_copy_in_exec_copy_out_and_reject_guest_symlink() {
     let harness = build_test_runtime(&fixtures, "mp-p3-copy");
     let mgr = &harness.manager;
 
-    // Reject SharedKernelAllowed and non-Isolated egress policies upfront in Phase 3.
+    // Reject SharedKernelAllowed and malformed DomainAllowList policies upfront.
     let mut bad_isolation = default_spec(Duration::from_secs(30));
     bad_isolation.isolation = IsolationMode::SharedKernelAllowed;
     let err_isolation = mgr
@@ -279,17 +280,19 @@ async fn e2e_safe_copy_in_exec_copy_out_and_reject_guest_symlink() {
     );
 
     let mut bad_net = default_spec(Duration::from_secs(30));
-    bad_net.network = NetworkPolicy::InternetOnly;
+    bad_net.network = NetworkPolicy::DomainAllowList {
+        rules: vec![EgressRule {
+            domain: "example.com".to_owned(),
+            port: 0,
+        }],
+    };
     let err_net = mgr
         .spawn(bad_net)
         .await
-        .expect_err("InternetOnly must be rejected before Phase 5 proxy");
+        .expect_err("malformed DomainAllowList with port 0 must fail validation");
     assert!(
-        matches!(
-            err_net,
-            SandboxError::PolicyViolation(_) | SandboxError::InvalidSpec(_)
-        ),
-        "unexpected error for InternetOnly: {err_net:?}"
+        matches!(err_net, SandboxError::InvalidSpec(_)),
+        "expected InvalidSpec for malformed DomainAllowList, got: {err_net:?}"
     );
 
     // Boot isolated VM and verify enforced isolation capability.

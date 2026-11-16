@@ -644,6 +644,73 @@ pub(crate) fn ensure_safe_dir_path(path: &Path, create_missing: bool) -> Result<
     Ok(())
 }
 
+/// Sums regular file byte lengths inside `path` using `symlink_metadata`, never following
+/// symlinks or Windows reparse points/junctions.
+pub fn measure_dir_bytes(path: &Path) -> Result<u64, SandboxError> {
+    validate_host_path_components(path)?;
+    let root_meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(map_fs_error(path, "inspect directory size root", err)),
+    };
+    if is_symlink_or_reparse(&root_meta) {
+        return Err(SandboxError::PolicyViolation(format!(
+            "refusing symlink or Windows reparse point at '{}'",
+            path.display()
+        )));
+    }
+    if root_meta.file_type().is_file() {
+        return Ok(root_meta.len());
+    }
+    if !root_meta.file_type().is_dir() {
+        return Ok(0);
+    }
+
+    let mut total_bytes: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(map_fs_error(
+                    &dir,
+                    "read directory for size measurement",
+                    err,
+                ))
+            }
+        };
+        for entry_res in entries {
+            let entry = match entry_res {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(map_fs_error(
+                        &dir,
+                        "iterate directory for size measurement",
+                        err,
+                    ))
+                }
+            };
+            let child = entry.path();
+            let meta = match fs::symlink_metadata(&child) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(map_fs_error(&child, "inspect entry metadata", err)),
+            };
+            if is_symlink_or_reparse(&meta) {
+                continue;
+            }
+            if meta.file_type().is_dir() {
+                stack.push(child);
+            } else if meta.file_type().is_file() {
+                total_bytes = total_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total_bytes)
+}
+
 fn validate_host_path_components(path: &Path) -> Result<(), SandboxError> {
     if path.as_os_str().is_empty() {
         return Err(SandboxError::InvalidSpec(
@@ -1245,5 +1312,54 @@ mod tests {
             Err(SandboxError::PolicyViolation(_))
         ));
         assert!(!outside.join("nested").exists());
+    }
+
+    #[test]
+    fn measure_dir_bytes_sums_nested_files_and_ignores_symlinks_or_reparse_points() {
+        let tmp = TestTempDir::new("measure-dir-bytes");
+        assert_eq!(measure_dir_bytes(&tmp.path().join("missing")).unwrap(), 0);
+
+        let root = tmp.path().join("work");
+        let sub = root.join("nested");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("a.bin"), vec![1u8; 120]).unwrap();
+        fs::write(sub.join("b.bin"), vec![2u8; 345]).unwrap();
+
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big.bin"), vec![3u8; 99_999]).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&outside, root.join("link_out")).unwrap();
+            assert!(matches!(
+                measure_dir_bytes(&root.join("link_out")),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+            let junc = root.join("junc_out");
+            let status = Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &junc.to_string_lossy(),
+                    &outside.to_string_lossy(),
+                ])
+                .status()
+                .expect("invoke mklink /J");
+            assert!(status.success(), "mklink /J must succeed");
+            assert!(matches!(
+                measure_dir_bytes(&junc),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        assert_eq!(measure_dir_bytes(&root).unwrap(), 120 + 345);
     }
 }

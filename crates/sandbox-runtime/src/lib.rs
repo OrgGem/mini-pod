@@ -2,6 +2,7 @@
 //! Layer 2 runtime manager contract: lifecycle orchestration, lease management,
 //! execution streaming, driven adapter ports, safe workspace tar copy I/O, and crash journaling.
 
+pub mod admission;
 pub mod egress;
 pub mod exec_stream;
 pub mod journal;
@@ -17,6 +18,7 @@ use std::time::Duration;
 
 use sandbox_core::{DestroyStatus, ExecRequest, SandboxError, SandboxId, SandboxLease, SandboxSpec};
 
+pub use admission::{AdmissionLimits, AdmissionUsage};
 pub use egress::{
     is_forbidden_ip, is_forbidden_ipv4, is_forbidden_ipv6, AsyncStream, BoxedUpstreamStream,
     HostDnsResolver, HostEgressProxy, SystemDnsResolver, TcpUpstreamDialer, UpstreamDialer,
@@ -35,7 +37,7 @@ pub use ports::{
     DiskOverlayPort, PreparedOverlay, SandboxTunnelPort, VmBootConfig, VmBootOutcome, VmRuntimePort,
     VmSessionPort,
 };
-pub use safe_tar::{extract_tar_safely, pack_host_path_to_tar};
+pub use safe_tar::{extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar};
 pub use tunnel::{TunnelStream, TunnelStreamHandle};
 
 #[async_trait::async_trait]

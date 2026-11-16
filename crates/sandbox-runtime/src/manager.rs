@@ -15,18 +15,26 @@ use sandbox_protocol::StreamTargetWire;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::admission::{AdmissionController, AdmissionLimits, AdmissionPermit, AdmissionUsage};
+use crate::egress::{
+    HostDnsResolver, HostEgressProxy, SystemDnsResolver, TcpUpstreamDialer, UpstreamDialer,
+};
 use crate::exec_stream::ExecStream;
 use crate::journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
 };
 use crate::ports::{
-    DiskOverlayPort, SandboxTunnelPort, VmBootConfig, VmRuntimePort, VmSessionPort,
+    DiskOverlayPort, PreparedOverlay, SandboxTunnelPort, VmBootConfig, VmRuntimePort,
+    VmSessionPort,
 };
-use crate::safe_tar::{ensure_safe_dir_path, extract_tar_safely, pack_host_path_to_tar};
+use crate::safe_tar::{
+    ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar,
+};
 use crate::tunnel::TunnelStream;
 use crate::RuntimeManager;
 
 const MAX_GUEST_PATH_BYTES: usize = 4096;
+const QCOW2_STORAGE_HEADROOM_MB: u64 = 16;
 
 /// Configuration for [`LocalRuntimeManager`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +46,22 @@ pub struct RuntimeManagerConfig {
     pub max_copy_entries: usize,
     pub cleanup_max_attempts: usize,
     pub cleanup_initial_delay: Duration,
+    pub admission: AdmissionLimits,
+}
+
+impl Default for RuntimeManagerConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: PathBuf::from("minipod-state"),
+            sweep_interval: Duration::from_secs(5),
+            graceful_shutdown_timeout: Duration::from_secs(5),
+            max_copy_bytes: 64 * 1024 * 1024,
+            max_copy_entries: 16_384,
+            cleanup_max_attempts: 8,
+            cleanup_initial_delay: Duration::from_millis(50),
+            admission: AdmissionLimits::default(),
+        }
+    }
 }
 
 impl RuntimeManagerConfig {
@@ -78,6 +102,7 @@ impl RuntimeManagerConfig {
                 "cleanup_initial_delay must be greater than zero".to_owned(),
             ));
         }
+        self.admission.validate()?;
         Ok(())
     }
 }
@@ -91,11 +116,80 @@ pub struct ReconciliationReport {
     pub remaining: usize,
 }
 
+struct EgressProxyHandle {
+    shutdown_tx: watch::Sender<bool>,
+    acceptor: Option<JoinHandle<()>>,
+}
+
+impl EgressProxyHandle {
+    async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.acceptor.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for EgressProxyHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.acceptor.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn spawn_egress_acceptor(
+    proxy: Arc<HostEgressProxy>,
+    mut rx: tokio::sync::mpsc::Receiver<TunnelStream>,
+) -> EgressProxyHandle {
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let acceptor = tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                maybe_stream = rx.recv() => {
+                    match maybe_stream {
+                        Some(stream) => {
+                            let proxy = Arc::clone(&proxy);
+                            tasks.spawn(async move {
+                                proxy.handle_stream(stream).await;
+                            });
+                        }
+                        None => break,
+                    }
+                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    });
+
+    EgressProxyHandle {
+        shutdown_tx,
+        acceptor: Some(acceptor),
+    }
+}
+
 struct ActiveSandbox {
     session: Arc<dyn VmSessionPort>,
+    work_dir: PathBuf,
     overlay_path: PathBuf,
     artifact_paths: Vec<PathBuf>,
     expires_at: Instant,
+    reserved_rss_mb: u64,
+    host_rss_budget_mb: Option<u32>,
+    host_storage_budget_mb: u32,
+    egress_proxy: Option<EgressProxyHandle>,
+    // Drop `permit` last so session/proxy tasks tear down before admission capacity re-opens.
+    permit: AdmissionPermit,
 }
 
 struct DestroySlotGuard<'a> {
@@ -121,7 +215,10 @@ pub struct LocalRuntimeManager {
     sandboxes_dir: PathBuf,
     overlay: Arc<dyn DiskOverlayPort>,
     vm_runtime: Arc<dyn VmRuntimePort>,
-    active: Mutex<HashMap<SandboxId, ActiveSandbox>>,
+    dns_resolver: Arc<dyn HostDnsResolver>,
+    dialer: Arc<dyn UpstreamDialer>,
+    admission: AdmissionController,
+    active: Arc<Mutex<HashMap<SandboxId, ActiveSandbox>>>,
     in_flight_destroys: Mutex<HashMap<SandboxId, watch::Sender<bool>>>,
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
     next_seq: AtomicU64,
@@ -137,11 +234,29 @@ impl Drop for LocalRuntimeManager {
 }
 
 impl LocalRuntimeManager {
-    /// Initializes durable state directories (`journals/`, `sandboxes/`) and constructs a manager.
+    /// Initializes durable state directories (`journals/`, `sandboxes/`) and constructs a manager
+    /// with default [`SystemDnsResolver`] and [`TcpUpstreamDialer`] egress hooks.
     pub fn new(
         config: RuntimeManagerConfig,
         overlay: Arc<dyn DiskOverlayPort>,
         vm_runtime: Arc<dyn VmRuntimePort>,
+    ) -> Result<Self, SandboxError> {
+        Self::with_egress_hooks(
+            config,
+            overlay,
+            vm_runtime,
+            Arc::new(SystemDnsResolver),
+            Arc::new(TcpUpstreamDialer),
+        )
+    }
+
+    /// Initializes durable state directories (`journals/`, `sandboxes/`) with explicit egress hooks.
+    pub fn with_egress_hooks(
+        config: RuntimeManagerConfig,
+        overlay: Arc<dyn DiskOverlayPort>,
+        vm_runtime: Arc<dyn VmRuntimePort>,
+        dns_resolver: Arc<dyn HostDnsResolver>,
+        dialer: Arc<dyn UpstreamDialer>,
     ) -> Result<Self, SandboxError> {
         config.validate()?;
         ensure_safe_dir_path(&config.state_dir, true)?;
@@ -149,13 +264,39 @@ impl LocalRuntimeManager {
         let sandboxes_dir = config.state_dir.join("sandboxes");
         ensure_safe_dir_path(&sandboxes_dir, true)?;
 
+        let active = Arc::new(Mutex::new(HashMap::<SandboxId, ActiveSandbox>::new()));
+        let active_for_rss = Arc::clone(&active);
+        let observed_rss_fn = Arc::new(move || -> u64 {
+            let entries: Vec<(Arc<dyn VmSessionPort>, u64)> = {
+                let guard = lock_unpoisoned(&active_for_rss);
+                guard
+                    .values()
+                    .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb))
+                    .collect()
+            };
+            entries
+                .into_iter()
+                .map(|(session, reserved_mb)| {
+                    let live_mb = session
+                        .current_rss_bytes()
+                        .map(bytes_to_mib_ceil)
+                        .unwrap_or(0);
+                    reserved_mb.max(live_mb)
+                })
+                .sum()
+        });
+        let admission = AdmissionController::new(config.admission.clone(), observed_rss_fn);
+
         Ok(Self {
             config,
             journal,
             sandboxes_dir,
             overlay,
             vm_runtime,
-            active: Mutex::new(HashMap::new()),
+            dns_resolver,
+            dialer,
+            admission,
+            active,
             in_flight_destroys: Mutex::new(HashMap::new()),
             sweeper_abort: Mutex::new(None),
             next_seq: AtomicU64::new(1),
@@ -164,6 +305,11 @@ impl LocalRuntimeManager {
 
     pub fn config(&self) -> &RuntimeManagerConfig {
         &self.config
+    }
+
+    /// Returns a snapshot of current host admission reservations and effective live RSS.
+    pub fn current_admission_usage(&self) -> AdmissionUsage {
+        self.admission.usage()
     }
 
     /// Starts the background lease sweeper; aborted automatically when [`LocalRuntimeManager`] drops.
@@ -180,6 +326,7 @@ impl LocalRuntimeManager {
                     break;
                 };
                 let _ = mgr.sweep_expired_leases().await;
+                let _ = mgr.enforce_resource_budgets().await;
             }
         });
 
@@ -282,6 +429,99 @@ impl LocalRuntimeManager {
         swept
     }
 
+    /// Reaps active sandboxes whose physical host storage or live RSS exceeds their configured
+    /// [`sandbox_core::ResourceBudget`] ceilings, returning the number destroyed.
+    pub async fn enforce_resource_budgets(&self) -> usize {
+        struct BudgetCandidate {
+            id: SandboxId,
+            work_dir: PathBuf,
+            session: Arc<dyn VmSessionPort>,
+            host_storage_budget_mb: u32,
+            host_rss_budget_mb: Option<u32>,
+        }
+
+        let snapshot: Vec<BudgetCandidate> = {
+            let active = lock_unpoisoned(&self.active);
+            active
+                .iter()
+                .map(|(id, entry)| BudgetCandidate {
+                    id: id.clone(),
+                    work_dir: entry.work_dir.clone(),
+                    session: Arc::clone(&entry.session),
+                    host_storage_budget_mb: entry.host_storage_budget_mb,
+                    host_rss_budget_mb: entry.host_rss_budget_mb,
+                })
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return 0;
+        }
+
+        let mut breached_ids = Vec::new();
+        let mut storage_checks = Vec::new();
+        for item in snapshot {
+            let rss_breached = match (item.host_rss_budget_mb, item.session.current_rss_bytes()) {
+                (Some(limit_mb), Some(rss_bytes)) => {
+                    rss_bytes > u64::from(limit_mb).saturating_mul(1024 * 1024)
+                }
+                _ => false,
+            };
+            if rss_breached {
+                breached_ids.push(item.id);
+            } else {
+                storage_checks.push((
+                    item.id,
+                    item.work_dir,
+                    u64::from(item.host_storage_budget_mb).saturating_mul(1024 * 1024),
+                ));
+            }
+        }
+
+        if !storage_checks.is_empty() {
+            let journal = self.journal.clone();
+            if let Ok(over_storage) = tokio::task::spawn_blocking(move || {
+                let mut exceeded = Vec::new();
+                for (id, work_dir, storage_limit_bytes) in storage_checks {
+                    let work_bytes = measure_dir_bytes(&work_dir).unwrap_or(0);
+                    let journal_bytes = journal.record_disk_bytes(&id).unwrap_or(0);
+                    if work_bytes.saturating_add(journal_bytes) > storage_limit_bytes {
+                        exceeded.push(id);
+                    }
+                }
+                exceeded
+            })
+            .await
+            {
+                breached_ids.extend(over_storage);
+            }
+        }
+
+        let mut reaped = 0usize;
+        for id in breached_ids {
+            if self.destroy(&id).await.is_ok() {
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    async fn measure_sandbox_storage_bytes(
+        &self,
+        id: &SandboxId,
+        work_dir: &Path,
+    ) -> Result<u64, SandboxError> {
+        let journal = self.journal.clone();
+        let id = id.clone();
+        let work_dir = work_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let work_bytes = measure_dir_bytes(&work_dir)?;
+            let journal_bytes = journal.record_disk_bytes(&id)?;
+            Ok(work_bytes.saturating_add(journal_bytes))
+        })
+        .await
+        .map_err(|err| SandboxError::Internal(format!("storage measurement task failed: {err}")))?
+    }
+
     async fn acquire_destroy_slot(&self, id: &SandboxId) -> DestroySlotGuard<'_> {
         loop {
             let existing_rx = {
@@ -305,10 +545,10 @@ impl LocalRuntimeManager {
         }
     }
 
-    fn get_active_session_for_op(
+    fn get_active_op_target(
         &self,
         id: &SandboxId,
-    ) -> Result<Arc<dyn VmSessionPort>, SandboxError> {
+    ) -> Result<(Arc<dyn VmSessionPort>, PathBuf, u32), SandboxError> {
         let now = Instant::now();
         {
             let active = lock_unpoisoned(&self.active);
@@ -323,7 +563,11 @@ impl LocalRuntimeManager {
                         "sandbox '{id}' VM process is no longer alive"
                     )));
                 }
-                return Ok(Arc::clone(&entry.session));
+                return Ok((
+                    Arc::clone(&entry.session),
+                    entry.work_dir.clone(),
+                    entry.host_storage_budget_mb,
+                ));
             }
         }
 
@@ -340,6 +584,13 @@ impl LocalRuntimeManager {
         Err(SandboxError::NotFound(format!(
             "sandbox '{id}' does not exist"
         )))
+    }
+
+    fn get_active_session_for_op(
+        &self,
+        id: &SandboxId,
+    ) -> Result<Arc<dyn VmSessionPort>, SandboxError> {
+        self.get_active_op_target(id).map(|(session, _, _)| session)
     }
 
     async fn rollback_spawn(
@@ -428,12 +679,15 @@ impl RuntimeManager for LocalRuntimeManager {
                     .to_owned(),
             ));
         }
-        if spec.network != NetworkPolicy::Isolated {
-            return Err(SandboxError::PolicyViolation(
-                "only NetworkPolicy::Isolated is supported prior to Host Egress Proxy".to_owned(),
-            ));
-        }
         spec.validate_for_host_os(std::env::consts::OS)?;
+        if spec.budget.virtual_disk_mb > spec.budget.host_storage_budget_mb {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "requested virtual_disk_mb ({} MiB) exceeds host_storage_budget_mb ({} MiB)",
+                spec.budget.virtual_disk_mb, spec.budget.host_storage_budget_mb
+            )));
+        }
+
+        let permit = self.admission.acquire(&spec).await?;
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
@@ -480,7 +734,11 @@ impl RuntimeManager for LocalRuntimeManager {
             }
         };
 
-        let spawn_artifacts = merge_artifact_paths(&[], std::slice::from_ref(&prepared.overlay_path), &work_dir);
+        let spawn_artifacts = merge_artifact_paths(
+            &[],
+            std::slice::from_ref(&prepared.overlay_path),
+            &work_dir,
+        );
         if let Err(err) = self
             .write_journal_async(JournalRecord {
                 sandbox_id: sandbox_id.clone(),
@@ -542,6 +800,7 @@ impl RuntimeManager for LocalRuntimeManager {
             })
             .await
         {
+            drop(boot.egress_rx);
             let graceful = session
                 .graceful_shutdown(self.config.graceful_shutdown_timeout)
                 .await
@@ -560,19 +819,35 @@ impl RuntimeManager for LocalRuntimeManager {
             return Err(err);
         }
 
-        let capabilities = build_lease_capabilities(&spec, boot.capabilities);
-        {
+        let egress_proxy = boot.egress_rx.map(|rx| {
+            let proxy = Arc::new(HostEgressProxy::new(
+                spec.network.clone(),
+                Arc::clone(&self.dns_resolver),
+                Arc::clone(&self.dialer),
+            ));
+            spawn_egress_acceptor(proxy, rx)
+        });
+        let capabilities = build_lease_capabilities(&spec, &prepared, boot.capabilities);
+        let reserved_rss_mb = permit.demand().rss_mb;
+        let replaced = {
             let mut active = lock_unpoisoned(&self.active);
             active.insert(
                 sandbox_id.clone(),
                 ActiveSandbox {
                     session,
+                    work_dir,
                     overlay_path: prepared.overlay_path,
                     artifact_paths: all_artifacts,
                     expires_at,
+                    reserved_rss_mb,
+                    host_rss_budget_mb: spec.budget.host_rss_budget_mb,
+                    host_storage_budget_mb: spec.budget.host_storage_budget_mb,
+                    egress_proxy,
+                    permit,
                 },
-            );
-        }
+            )
+        };
+        drop(replaced);
 
         Ok(SandboxLease {
             id: sandbox_id,
@@ -659,17 +934,45 @@ impl RuntimeManager for LocalRuntimeManager {
         dst_guest: String,
     ) -> Result<(), SandboxError> {
         validate_guest_path(&dst_guest, "dst_guest")?;
-        let session = self.get_active_session_for_op(id)?;
-        let max_bytes = self.config.max_copy_bytes;
+        let (session, work_dir, host_storage_budget_mb) = self.get_active_op_target(id)?;
+        let storage_budget_bytes = u64::from(host_storage_budget_mb).saturating_mul(1024 * 1024);
+
+        let pre_bytes = self.measure_sandbox_storage_bytes(id, &work_dir).await?;
+        if pre_bytes > storage_budget_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "sandbox '{id}' physical storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)"
+            )));
+        }
+
+        let max_copy_bytes = self.config.max_copy_bytes;
+        let remaining_storage_bytes = storage_budget_bytes.saturating_sub(pre_bytes);
+        let pack_budget = max_copy_bytes.min(remaining_storage_bytes);
 
         let tar_bytes =
-            tokio::task::spawn_blocking(move || pack_host_path_to_tar(&src_host, max_bytes))
+            tokio::task::spawn_blocking(move || pack_host_path_to_tar(&src_host, pack_budget))
                 .await
                 .map_err(|err| {
                     SandboxError::Internal(format!("copy_in tar packing failed: {err}"))
                 })??;
 
-        let _ = session.copy_in_tar(&dst_guest, tar_bytes, max_bytes).await?;
+        if pre_bytes.saturating_add(tar_bytes.len() as u64) > storage_budget_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "copy_in archive ({} bytes) plus existing storage ({pre_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)",
+                tar_bytes.len()
+            )));
+        }
+
+        let _ = session
+            .copy_in_tar(&dst_guest, tar_bytes, max_copy_bytes)
+            .await?;
+
+        let post_bytes = self.measure_sandbox_storage_bytes(id, &work_dir).await?;
+        if post_bytes > storage_budget_bytes {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "sandbox '{id}' physical storage after copy_in ({post_bytes} bytes) exceeds host_storage_budget ({storage_budget_bytes} bytes)"
+            )));
+        }
+
         Ok(())
     }
 
@@ -714,40 +1017,55 @@ impl RuntimeManager for LocalRuntimeManager {
             .map(|rec| rec.expires_at_unix_ms)
             .unwrap_or_else(unix_now_ms);
 
-        let (overlay_path_opt, artifacts) = if let Some(entry) = removed_active {
+        let (overlay_path_opt, artifacts, _permit_guard) = if let Some(entry) = removed_active {
+            let ActiveSandbox {
+                session,
+                work_dir: _,
+                overlay_path,
+                artifact_paths: entry_artifacts,
+                expires_at: _,
+                reserved_rss_mb: _,
+                host_rss_budget_mb: _,
+                host_storage_budget_mb: _,
+                egress_proxy,
+                permit,
+            } = entry;
+
             let journal_paths = journal_rec
                 .as_ref()
                 .map(|rec| rec.artifact_paths.as_slice())
                 .unwrap_or(&[]);
             let mut merged = merge_artifact_paths(
-                &entry.artifact_paths,
+                &entry_artifacts,
                 journal_paths,
                 &self.sandboxes_dir.join(id.as_str()),
             );
-            push_unique_path(&mut merged, &entry.overlay_path);
+            push_unique_path(&mut merged, &overlay_path);
 
             self.write_journal_async(JournalRecord {
                 sandbox_id: id.clone(),
                 state: JournalLifecycleState::Destroying,
-                pid: Some(entry.session.pid()),
-                start_token: Some(entry.session.start_token()),
+                pid: Some(session.pid()),
+                start_token: Some(session.start_token()),
                 artifact_paths: merged.clone(),
                 expires_at_unix_ms,
             })
             .await?;
 
-            let graceful_ok = entry
-                .session
+            let graceful_ok = session
                 .graceful_shutdown(self.config.graceful_shutdown_timeout)
                 .await
                 .unwrap_or(false);
-            if !graceful_ok && entry.session.is_alive() {
-                entry.session.force_kill().await?;
+            if !graceful_ok && session.is_alive() {
+                session.force_kill().await?;
             }
-            let overlay_path = entry.overlay_path.clone();
-            // Drop session ownership before removing overlays/sockets so Windows releases all handles.
-            drop(entry);
-            (Some(overlay_path), merged)
+            // Drop session ownership before removing overlays/sockets so Windows releases all handles,
+            // and shut down all proxy tasks before cleanup completes.
+            drop(session);
+            if let Some(proxy) = egress_proxy {
+                proxy.shutdown().await;
+            }
+            (Some(overlay_path), merged, Some(permit))
         } else if let Some(rec) = journal_rec {
             if let (Some(pid), Some(start_token)) = (rec.pid, rec.start_token) {
                 match self.vm_runtime.kill_orphan_process(pid, start_token).await {
@@ -755,7 +1073,7 @@ impl RuntimeManager for LocalRuntimeManager {
                     Err(err) => return Err(err),
                 }
             }
-            (None, rec.artifact_paths)
+            (None, rec.artifact_paths, None)
         } else {
             return Ok(DestroyStatus::AllResourcesCleaned);
         };
@@ -765,7 +1083,7 @@ impl RuntimeManager for LocalRuntimeManager {
         }
         self.remove_overlay_artifacts(&artifacts).await;
 
-        match cleanup_artifacts_with_backoff(
+        let result = match cleanup_artifacts_with_backoff(
             &artifacts,
             self.config.cleanup_max_attempts,
             self.config.cleanup_initial_delay,
@@ -792,7 +1110,9 @@ impl RuntimeManager for LocalRuntimeManager {
                     remaining_artifacts,
                 })
             }
-        }
+        };
+        drop(_permit_guard);
+        result
     }
 }
 
@@ -886,21 +1206,37 @@ fn validate_exec_request(req: &ExecRequest) -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn build_lease_capabilities(spec: &SandboxSpec, boot_caps: CapabilityReport) -> CapabilityReport {
+fn bytes_to_mib_ceil(bytes: u64) -> u64 {
+    bytes.div_ceil(1024 * 1024)
+}
+
+fn build_lease_capabilities(
+    spec: &SandboxSpec,
+    prepared: &PreparedOverlay,
+    boot_caps: CapabilityReport,
+) -> CapabilityReport {
+    let host_budget_bytes =
+        u64::from(spec.budget.host_storage_budget_mb).saturating_mul(1024 * 1024);
+    let virtual_disk_mb = u64::from(prepared.virtual_disk_mb.max(spec.budget.virtual_disk_mb));
+    let host_storage = if virtual_disk_mb.saturating_add(QCOW2_STORAGE_HEADROOM_MB)
+        <= u64::from(spec.budget.host_storage_budget_mb)
+        && prepared.provisioned_host_bytes <= host_budget_bytes
+    {
+        EnforcementLevel::HardLimit
+    } else {
+        EnforcementLevel::BestEffort
+    };
+    let egress_filter = match &spec.network {
+        NetworkPolicy::Isolated
+        | NetworkPolicy::InternetOnly
+        | NetworkPolicy::DomainAllowList { .. } => EnforcementLevel::HardLimit,
+        NetworkPolicy::Unrestricted => EnforcementLevel::Unsupported,
+    };
     CapabilityReport {
         cpu_quota: boot_caps.cpu_quota,
         host_rss: boot_caps.host_rss,
-        host_storage: match boot_caps.host_storage {
-            EnforcementLevel::HardLimit => EnforcementLevel::HardLimit,
-            EnforcementLevel::BestEffort | EnforcementLevel::Unsupported => {
-                EnforcementLevel::BestEffort
-            }
-        },
-        egress_filter: if spec.network == NetworkPolicy::Isolated {
-            EnforcementLevel::HardLimit
-        } else {
-            boot_caps.egress_filter
-        },
+        host_storage,
+        egress_filter,
     }
 }
 
@@ -970,6 +1306,7 @@ mod tests {
             max_copy_entries: 128,
             cleanup_max_attempts: 4,
             cleanup_initial_delay: Duration::from_millis(2),
+            admission: AdmissionLimits::default(),
         }
     }
 
@@ -1032,6 +1369,7 @@ mod tests {
 
     struct MockSessionState {
         alive: AtomicBool,
+        rss_bytes: AtomicU64,
         graceful_succeeds: bool,
         graceful_calls: Mutex<usize>,
         force_kill_calls: Mutex<usize>,
@@ -1065,7 +1403,8 @@ mod tests {
         }
 
         fn current_rss_bytes(&self) -> Option<u64> {
-            self.is_alive().then_some(64 * 1024 * 1024)
+            self.is_alive()
+                .then(|| self.state.rss_bytes.load(Ordering::Acquire))
         }
 
         async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -1161,8 +1500,10 @@ mod tests {
     struct MockVmRuntimeState {
         fail_boot: bool,
         graceful_succeeds: bool,
+        enable_egress_channel: bool,
         next_pid: u32,
         sessions: Vec<Arc<MockSessionState>>,
+        egress_senders: Vec<tokio::sync::mpsc::Sender<TunnelStream>>,
         orphan_kill_calls: Vec<(u32, u64)>,
         live_orphans: HashSet<(u32, u64)>,
         error_on_orphan: Option<(u32, u64)>,
@@ -1188,7 +1529,7 @@ mod tests {
     #[async_trait::async_trait]
     impl VmRuntimePort for MockVmRuntime {
         async fn boot_vm(&self, config: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
-            let (pid, token, graceful, fail) = {
+            let (pid, token, graceful, fail, enable_egress) = {
                 let mut st = lock_unpoisoned(&self.state);
                 st.next_pid += 1;
                 (
@@ -1196,6 +1537,7 @@ mod tests {
                     u64::from(st.next_pid) * 17,
                     st.graceful_succeeds,
                     st.fail_boot,
+                    st.enable_egress_channel && config.spec.network != NetworkPolicy::Isolated,
                 )
             };
             if fail {
@@ -1207,15 +1549,26 @@ mod tests {
             fs::write(&sock_path, b"sock").unwrap();
             let sess_state = Arc::new(MockSessionState {
                 alive: AtomicBool::new(true),
+                rss_bytes: AtomicU64::new(64 * 1024 * 1024),
                 graceful_succeeds: graceful,
                 graceful_calls: Mutex::new(0),
                 force_kill_calls: Mutex::new(0),
                 copied_in: Mutex::new(Vec::new()),
                 copy_out_archive: Mutex::new(Vec::new()),
             });
-            lock_unpoisoned(&self.state)
-                .sessions
-                .push(Arc::clone(&sess_state));
+            let (egress_tx, egress_rx) = if enable_egress {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            {
+                let mut st = lock_unpoisoned(&self.state);
+                st.sessions.push(Arc::clone(&sess_state));
+                if let Some(tx) = egress_tx {
+                    st.egress_senders.push(tx);
+                }
+            }
 
             Ok(VmBootOutcome {
                 session: Box::new(MockVmSession {
@@ -1234,7 +1587,7 @@ mod tests {
                     host_storage: EnforcementLevel::Unsupported,
                     egress_filter: EnforcementLevel::HardLimit,
                 },
-                egress_rx: None,
+                egress_rx,
             })
         }
 
@@ -1284,6 +1637,13 @@ mod tests {
         cfg = base_config(tmp.path().to_path_buf());
         cfg.cleanup_max_attempts = 0;
         assert!(matches!(
+            LocalRuntimeManager::new(cfg, overlay.clone(), vm.clone()),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        cfg = base_config(tmp.path().to_path_buf());
+        cfg.admission.max_concurrent_sandboxes = Some(0);
+        assert!(matches!(
             LocalRuntimeManager::new(cfg, overlay, vm),
             Err(SandboxError::InvalidSpec(_))
         ));
@@ -1304,7 +1664,7 @@ mod tests {
 
         let lease = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
         assert_eq!(lease.capabilities.egress_filter, EnforcementLevel::HardLimit);
-        assert_eq!(lease.capabilities.host_storage, EnforcementLevel::BestEffort);
+        assert_eq!(lease.capabilities.host_storage, EnforcementLevel::HardLimit);
         assert_eq!(lease.capabilities.cpu_quota, EnforcementLevel::Unsupported);
 
         // Journal must persist Active state with PID & start_token.
@@ -1387,7 +1747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_shared_kernel_and_non_isolated_network_policy() {
+    async fn rejects_shared_kernel_and_malformed_domain_allow_list_and_reports_capabilities() {
         let tmp = TestTempDir::new("mgr-policy");
         let overlay = Arc::new(MockOverlayStore::default());
         let vm = Arc::new(MockVmRuntime::new(true));
@@ -1405,26 +1765,60 @@ mod tests {
             Err(SandboxError::UnsupportedIsolationMode(_))
         ));
 
-        for net in [
-            NetworkPolicy::InternetOnly,
+        for bad_net in [
             NetworkPolicy::DomainAllowList {
                 rules: vec![EgressRule {
                     domain: "example.com".into(),
+                    port: 0,
+                }],
+            },
+            NetworkPolicy::DomainAllowList {
+                rules: vec![EgressRule {
+                    domain: "127.0.0.1".into(),
                     port: 443,
                 }],
             },
-            NetworkPolicy::Unrestricted,
         ] {
             let mut spec = valid_spec(Duration::from_secs(10));
-            spec.network = net;
+            spec.network = bad_net;
             assert!(matches!(
                 mgr.spawn(spec).await,
-                Err(SandboxError::PolicyViolation(_))
+                Err(SandboxError::InvalidSpec(_))
             ));
         }
 
         // Neither failure may leave sandbox artifacts or journals behind.
         assert!(mgr.journal.load_records().unwrap().is_empty());
+
+        // Tight storage headroom (<= virtual_disk_mb + 16 MiB) reports BestEffort; >= 16 MiB reports HardLimit.
+        let mut tight = valid_spec(Duration::from_secs(30));
+        tight.budget.virtual_disk_mb = 512;
+        tight.budget.host_storage_budget_mb = 520;
+        let tight_lease = mgr.spawn(tight).await.unwrap();
+        assert_eq!(tight_lease.capabilities.host_storage, EnforcementLevel::BestEffort);
+        assert_eq!(tight_lease.capabilities.egress_filter, EnforcementLevel::HardLimit);
+        mgr.destroy(&tight_lease.id).await.unwrap();
+
+        for (net, expected_egress) in [
+            (NetworkPolicy::InternetOnly, EnforcementLevel::HardLimit),
+            (
+                NetworkPolicy::DomainAllowList {
+                    rules: vec![EgressRule {
+                        domain: "api.example.com".into(),
+                        port: 443,
+                    }],
+                },
+                EnforcementLevel::HardLimit,
+            ),
+            (NetworkPolicy::Unrestricted, EnforcementLevel::Unsupported),
+        ] {
+            let mut spec = valid_spec(Duration::from_secs(30));
+            spec.network = net;
+            let lease = mgr.spawn(spec).await.unwrap();
+            assert_eq!(lease.capabilities.egress_filter, expected_egress);
+            assert_eq!(lease.capabilities.host_storage, EnforcementLevel::HardLimit);
+            mgr.destroy(&lease.id).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1790,5 +2184,434 @@ mod tests {
             mgr.open_podman_unix_stream(&active_lease.id).await,
             Err(SandboxError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn admission_control_enforces_limits_fifo_queue_cancellation_and_live_rss() {
+        // 1. Immediate rejection across count, RSS, storage, CPU when queue timeout is ZERO,
+        // plus permit release on mid-spawn rollback.
+        let tmp = TestTempDir::new("mgr-adm-limits");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().to_path_buf());
+        cfg.admission = AdmissionLimits {
+            max_concurrent_sandboxes: Some(2),
+            max_total_host_rss_mb: Some(768),
+            max_total_host_storage_mb: Some(1536),
+            max_total_host_cpu_millicores: Some(2000),
+            admission_queue_timeout: Duration::ZERO,
+            max_admission_queue_depth: 8,
+        };
+        let mgr = LocalRuntimeManager::new(cfg, overlay.clone(), vm.clone()).unwrap();
+
+        // Rollback during failed spawn must NOT leak the AdmissionPermit.
+        overlay.set_fail_prepare(true);
+        assert!(mgr.spawn(valid_spec(Duration::from_secs(30))).await.is_err());
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+        overlay.set_fail_prepare(false);
+
+        let lease1 = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        assert_eq!(mgr.current_admission_usage().active_sandboxes, 1);
+
+        // Exceeds RSS (512 + 300 > 768)
+        let mut over_rss = valid_spec(Duration::from_secs(30));
+        over_rss.budget.host_rss_budget_mb = Some(300);
+        over_rss.budget.host_storage_budget_mb = 256;
+        over_rss.budget.virtual_disk_mb = 128;
+        assert!(matches!(
+            mgr.spawn(over_rss).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        // Exceeds storage (1024 + 600 > 1536)
+        let mut over_storage = valid_spec(Duration::from_secs(30));
+        over_storage.budget.host_rss_budget_mb = Some(256);
+        over_storage.budget.host_storage_budget_mb = 600;
+        assert!(matches!(
+            mgr.spawn(over_storage).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        // Exceeds CPU (1000 + 1500 > 2000)
+        let mut over_cpu = valid_spec(Duration::from_secs(30));
+        over_cpu.budget.host_rss_budget_mb = Some(256);
+        over_cpu.budget.host_storage_budget_mb = 256;
+        over_cpu.budget.virtual_disk_mb = 128;
+        over_cpu.budget.host_cpu_quota_Millicores = Some(1500);
+        assert!(matches!(
+            mgr.spawn(over_cpu).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        // Live observed RSS spike on lease1 (600 MiB > 512 MiB reserved) blocks a 200 MiB spawn (600 + 200 > 768).
+        {
+            let st = lock_unpoisoned(&vm.state);
+            st.sessions[0]
+                .rss_bytes
+                .store(600 * 1024 * 1024, Ordering::Release);
+        }
+        let mut small_rss = valid_spec(Duration::from_secs(30));
+        small_rss.budget.guest_ram_mb = 128;
+        small_rss.budget.host_rss_budget_mb = Some(200);
+        small_rss.budget.host_storage_budget_mb = 256;
+        small_rss.budget.virtual_disk_mb = 128;
+        assert!(matches!(
+            mgr.spawn(small_rss.clone()).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        // Restore live RSS <= reserved -> small_rss fits, then 3rd fails max_concurrent_sandboxes (2).
+        {
+            let st = lock_unpoisoned(&vm.state);
+            st.sessions[0]
+                .rss_bytes
+                .store(64 * 1024 * 1024, Ordering::Release);
+        }
+        let lease2 = mgr.spawn(small_rss.clone()).await.unwrap();
+        let mut tiny = small_rss;
+        tiny.budget.host_rss_budget_mb = Some(16);
+        tiny.budget.guest_ram_mb = 16;
+        tiny.budget.host_storage_budget_mb = 64;
+        tiny.budget.virtual_disk_mb = 32;
+        tiny.budget.host_cpu_quota_Millicores = Some(100);
+        assert!(matches!(
+            mgr.spawn(tiny).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+        mgr.destroy(&lease1.id).await.unwrap();
+        mgr.destroy(&lease2.id).await.unwrap();
+        assert_eq!(mgr.current_admission_usage(), AdmissionUsage::default());
+
+        // 2. FIFO queue waits, wakes upon destroy(), rejects queue overflow/timeout, and handles cancelled waiter.
+        let tmp_q = TestTempDir::new("mgr-adm-queue");
+        let overlay_q = Arc::new(MockOverlayStore::default());
+        let vm_q = Arc::new(MockVmRuntime::new(true));
+        let mut cfg_q = base_config(tmp_q.path().to_path_buf());
+        cfg_q.admission = AdmissionLimits {
+            max_concurrent_sandboxes: Some(1),
+            admission_queue_timeout: Duration::from_secs(2),
+            max_admission_queue_depth: 2,
+            ..Default::default()
+        };
+        let mgr_q = Arc::new(LocalRuntimeManager::new(cfg_q, overlay_q, vm_q).unwrap());
+
+        let hold = mgr_q.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+
+        let mgr_cancel = Arc::clone(&mgr_q);
+        let cancelled_waiter = tokio::spawn(async move {
+            mgr_cancel.spawn(valid_spec(Duration::from_secs(30))).await
+        });
+        tokio::task::yield_now().await;
+
+        let mgr_next = Arc::clone(&mgr_q);
+        let next_waiter = tokio::spawn(async move {
+            mgr_next.spawn(valid_spec(Duration::from_secs(30))).await
+        });
+        tokio::task::yield_now().await;
+
+        // Queue depth is 2 -> 3rd queued caller must reject immediately.
+        assert!(matches!(
+            mgr_q.spawn(valid_spec(Duration::from_secs(30))).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        // Abort cancelled_waiter before destroying `hold`; next_waiter must still succeed promptly!
+        cancelled_waiter.abort();
+        let _ = cancelled_waiter.await;
+
+        mgr_q.destroy(&hold.id).await.unwrap();
+        let admitted = next_waiter.await.unwrap().unwrap();
+        mgr_q.destroy(&admitted.id).await.unwrap();
+        assert_eq!(mgr_q.current_admission_usage(), AdmissionUsage::default());
+
+        // Timeout rejects cleanly.
+        let tmp_t = TestTempDir::new("mgr-adm-timeout");
+        let mut cfg_t = base_config(tmp_t.path().to_path_buf());
+        cfg_t.admission = AdmissionLimits {
+            max_concurrent_sandboxes: Some(1),
+            admission_queue_timeout: Duration::from_millis(30),
+            max_admission_queue_depth: 4,
+            ..Default::default()
+        };
+        let mgr_t = LocalRuntimeManager::new(
+            cfg_t,
+            Arc::new(MockOverlayStore::default()),
+            Arc::new(MockVmRuntime::new(true)),
+        )
+        .unwrap();
+        let hold_t = mgr_t.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        assert!(matches!(
+            mgr_t.spawn(valid_spec(Duration::from_secs(30))).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+        mgr_t.destroy(&hold_t.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_in_and_watchdog_enforce_physical_storage_and_live_rss_budgets() {
+        let tmp = TestTempDir::new("mgr-watchdog");
+        let state_dir = tmp.path().join("state");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(state_dir.clone());
+        cfg.max_copy_bytes = 8 * 1024 * 1024;
+        let mgr = LocalRuntimeManager::new(cfg, overlay, vm.clone()).unwrap();
+
+        let mut tight_storage = valid_spec(Duration::from_secs(60));
+        tight_storage.budget.virtual_disk_mb = 1;
+        tight_storage.budget.host_storage_budget_mb = 1;
+        let lease_storage = mgr.spawn(tight_storage).await.unwrap();
+
+        // Attempting copy_in larger than remaining 1 MiB host_storage_budget_mb must return BudgetExceeded.
+        let big_src = tmp.path().join("big_upload.bin");
+        fs::write(&big_src, vec![0xABu8; 1_200_000]).unwrap();
+        assert!(matches!(
+            mgr.copy_in(&lease_storage.id, big_src, "/workspace".to_owned())
+                .await,
+            Err(SandboxError::BudgetExceeded(_))
+        ));
+
+        // Pre-existing work_dir growth beyond 1 MiB is reaped by enforce_resource_budgets.
+        let work_dir = state_dir.join("sandboxes").join(lease_storage.id.as_str());
+        fs::write(work_dir.join("bloated_overlay.bin"), vec![0xCDu8; 1_100_000]).unwrap();
+        assert_eq!(mgr.enforce_resource_budgets().await, 1);
+        assert!(!work_dir.exists());
+        assert!(matches!(
+            mgr.renew_lease(&lease_storage.id, Duration::from_secs(10)).await,
+            Err(SandboxError::NotFound(_))
+        ));
+
+        // Live RSS breach beyond host_rss_budget_mb is also reaped by enforce_resource_budgets.
+        let mut rss_spec = valid_spec(Duration::from_secs(60));
+        rss_spec.budget.guest_ram_mb = 128;
+        rss_spec.budget.host_rss_budget_mb = Some(256);
+        let lease_rss = mgr.spawn(rss_spec).await.unwrap();
+        {
+            let st = lock_unpoisoned(&vm.state);
+            let idx = st.sessions.len() - 1;
+            st.sessions[idx]
+                .rss_bytes
+                .store(300 * 1024 * 1024, Ordering::Release);
+        }
+        assert_eq!(mgr.enforce_resource_budgets().await, 1);
+        assert!(matches!(
+            mgr.renew_lease(&lease_rss.id, Duration::from_secs(10)).await,
+            Err(SandboxError::NotFound(_))
+        ));
+
+        // Background sweeper also runs enforce_resource_budgets automatically alongside TTL sweeping.
+        let tmp_sw = TestTempDir::new("mgr-watchdog-sweeper");
+        let overlay_sw = Arc::new(MockOverlayStore::default());
+        let vm_sw = Arc::new(MockVmRuntime::new(true));
+        let mut cfg_sw = base_config(tmp_sw.path().to_path_buf());
+        cfg_sw.sweep_interval = Duration::from_millis(15);
+        let mgr_sw = Arc::new(LocalRuntimeManager::new(cfg_sw, overlay_sw, vm_sw.clone()).unwrap());
+        let _sweeper = mgr_sw.spawn_lease_sweeper();
+
+        let mut sw_spec = valid_spec(Duration::from_secs(60));
+        sw_spec.budget.guest_ram_mb = 128;
+        sw_spec.budget.host_rss_budget_mb = Some(256);
+        let sw_lease = mgr_sw.spawn(sw_spec).await.unwrap();
+        {
+            let st = lock_unpoisoned(&vm_sw.state);
+            st.sessions[0]
+                .rss_bytes
+                .store(300 * 1024 * 1024, Ordering::Release);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(matches!(
+            mgr_sw.renew_lease(&sw_lease.id, Duration::from_secs(10)).await,
+            Err(SandboxError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_integration_filters_bogon_and_rebound_ips_and_aborts_on_destroy() {
+        use std::collections::VecDeque;
+        use std::io;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::egress::BoxedUpstreamStream;
+
+        struct TestDns {
+            responses: Mutex<VecDeque<io::Result<Vec<SocketAddr>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl HostDnsResolver for TestDns {
+            async fn resolve(&self, _host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+                let mut q = lock_unpoisoned(&self.responses);
+                q.pop_front().unwrap_or_else(|| {
+                    Ok(vec![SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                        port,
+                    )])
+                })
+            }
+        }
+
+        struct TestDialer {
+            dialed: Mutex<Vec<SocketAddr>>,
+            hold_forever: AtomicBool,
+            active_hold_started: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl UpstreamDialer for TestDialer {
+            async fn connect(&self, addr: SocketAddr) -> io::Result<BoxedUpstreamStream> {
+                lock_unpoisoned(&self.dialed).push(addr);
+                if self.hold_forever.load(Ordering::Acquire) {
+                    self.active_hold_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                let (proxy_side, mut server_side) = tokio::io::duplex(4096);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    if let Ok(n) = server_side.read(&mut buf).await {
+                        if n > 0 {
+                            let _ = server_side.write_all(b"echo:").await;
+                            let _ = server_side.write_all(&buf[..n]).await;
+                        }
+                    }
+                    let _ = server_side.shutdown().await;
+                });
+                Ok(Box::pin(proxy_side))
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-egress");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        lock_unpoisoned(&vm.state).enable_egress_channel = true;
+
+        let dns = Arc::new(TestDns {
+            responses: Mutex::new(VecDeque::from([
+                // 1. Allowed public IP for api.example.com:443
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                    443,
+                )]),
+                // 2. DNS rebinding to loopback 127.0.0.1 for api.example.com:443
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    443,
+                )]),
+                // 3. Allowed public IP for stalled tunnel test
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                    443,
+                )]),
+            ])),
+        });
+        let dialer = Arc::new(TestDialer {
+            dialed: Mutex::new(Vec::new()),
+            hold_forever: AtomicBool::new(false),
+            active_hold_started: tokio::sync::Notify::new(),
+        });
+
+        let mgr = LocalRuntimeManager::with_egress_hooks(
+            base_config(tmp.path().to_path_buf()),
+            overlay,
+            vm.clone(),
+            dns,
+            dialer.clone(),
+        )
+        .unwrap();
+
+        let mut spec = valid_spec(Duration::from_secs(60));
+        spec.network = NetworkPolicy::DomainAllowList {
+            rules: vec![EgressRule {
+                domain: "api.example.com".to_owned(),
+                port: 443,
+            }],
+        };
+        let lease = mgr.spawn(spec).await.unwrap();
+        let egress_tx = {
+            let st = lock_unpoisoned(&vm.state);
+            st.egress_senders[0].clone()
+        };
+
+        // 1. Allowed HTTP CONNECT succeeds via HostEgressProxy.
+        let (stream_ok, mut handle_ok) = TunnelStream::channel(StreamId(10));
+        egress_tx.send(stream_ok).await.unwrap();
+        handle_ok
+            .write_half
+            .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut ok_head = [0u8; 64];
+        let n = handle_ok.read_half.read(&mut ok_head).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&ok_head[..n]).starts_with("HTTP/1.1 200 Connection Established")
+        );
+        handle_ok.write_half.write_all(b"ping").await.unwrap();
+        handle_ok.write_half.shutdown().await.unwrap();
+        let mut tunnel_resp = Vec::new();
+        handle_ok.read_half.read_to_end(&mut tunnel_resp).await.unwrap();
+        assert_eq!(tunnel_resp, b"echo:ping");
+
+        // 2. DNS rebinding to 127.0.0.1 is blocked with 403 Forbidden and NEVER dialed.
+        let (stream_rebind, mut handle_rebind) = TunnelStream::channel(StreamId(11));
+        egress_tx.send(stream_rebind).await.unwrap();
+        handle_rebind
+            .write_half
+            .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        handle_rebind.write_half.shutdown().await.unwrap();
+        let mut rebind_resp = Vec::new();
+        handle_rebind
+            .read_half
+            .read_to_end(&mut rebind_resp)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&rebind_resp).starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 3. Raw private IP literal is blocked with 403 Forbidden.
+        let (stream_ip, mut handle_ip) = TunnelStream::channel(StreamId(12));
+        egress_tx.send(stream_ip).await.unwrap();
+        handle_ip
+            .write_half
+            .write_all(b"CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+        handle_ip.write_half.shutdown().await.unwrap();
+        let mut ip_resp = Vec::new();
+        handle_ip.read_half.read_to_end(&mut ip_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&ip_resp).starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(
+            *lock_unpoisoned(&dialer.dialed),
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                443
+            )]
+        );
+
+        // 4. An active stalled proxied connection task is aborted immediately when destroy() runs.
+        dialer.hold_forever.store(true, Ordering::Release);
+        let (stream_stalled, mut handle_stalled) = TunnelStream::channel(StreamId(13));
+        egress_tx.send(stream_stalled).await.unwrap();
+        handle_stalled
+            .write_half
+            .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        dialer.active_hold_started.notified().await;
+
+        assert_eq!(
+            mgr.destroy(&lease.id).await.unwrap(),
+            DestroyStatus::AllResourcesCleaned
+        );
+        // Once proxy task aborts on destroy(), TunnelStream drops and driver handle reads EOF promptly.
+        let mut after_destroy = Vec::new();
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            handle_stalled.read_half.read_to_end(&mut after_destroy),
+        )
+        .await
+        .expect("stalled proxy task must abort promptly on destroy")
+        .unwrap();
+        assert!(after_destroy.is_empty());
     }
 }
