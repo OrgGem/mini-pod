@@ -1323,6 +1323,34 @@ fn canonicalize_docker_path(raw_path: &str) -> Result<String, &'static str> {
         segments.push(norm);
     }
 
+    if segments
+        .first()
+        .is_some_and(|first| is_api_version_segment(first))
+    {
+        segments[0].make_ascii_lowercase();
+    }
+
+    let tail_start = usize::from(
+        segments
+            .first()
+            .is_some_and(|first| is_api_version_segment(first)),
+    );
+    let tail = &segments[tail_start..];
+    for (idx, seg) in tail.iter().enumerate() {
+        if seg.contains("%2F") {
+            let is_image_ref = idx == 1 && tail[0].eq_ignore_ascii_case("images");
+            if !is_image_ref {
+                return Err("encoded slash '%2F' is forbidden in this Docker API route");
+            }
+            if !seg
+                .split("%2F")
+                .all(|sub| !sub.is_empty() && sub != "." && sub != "..")
+            {
+                return Err("invalid subsegment in encoded Docker image name");
+            }
+        }
+    }
+
     if segments.is_empty() {
         Ok("/".to_owned())
     } else {
@@ -1454,7 +1482,7 @@ fn strip_api_version(path: &str) -> (Option<&str>, &str) {
 }
 
 fn is_api_version_segment(seg: &str) -> bool {
-    let Some(ver) = seg.strip_prefix('v') else {
+    let Some(ver) = seg.strip_prefix('v').or_else(|| seg.strip_prefix('V')) else {
         return false;
     };
     let bytes = ver.as_bytes();
@@ -2488,5 +2516,37 @@ mod tests {
             ),
             DockerRoute::ForbiddenLibpod
         ));
+
+        // Uppercase API version prefixes normalize to lowercase before route matching.
+        let upper_create = canonicalize_docker_path("/V1.45/containers/create").unwrap();
+        assert_eq!(upper_create, "/v1.45/containers/create");
+        assert!(matches!(
+            parse_docker_route("POST", &upper_create),
+            DockerRoute::ContainerCreate
+        ));
+        let upper_libpod = canonicalize_docker_path("/V5.0.0/libpod/containers/create").unwrap();
+        assert_eq!(upper_libpod, "/v5.0.0/libpod/containers/create");
+        assert!(matches!(
+            parse_docker_route("POST", &upper_libpod),
+            DockerRoute::ForbiddenLibpod
+        ));
+        assert_eq!(
+            canonicalize_docker_path("/V1.45/images/minipod-e2e%2fecho-http:1.0/json").unwrap(),
+            "/v1.45/images/minipod-e2e%2Fecho-http:1.0/json"
+        );
+
+        // Encoded slashes `%2F` outside valid `/images/<ref>` segments are rejected cleanly.
+        for bad_encoded_slash in [
+            "/v1.45/containers%2Fcreate",
+            "/v5.0.0/libpod%2Fcontainers%2Fcreate",
+            "/libpod%2fcontainers/create",
+            "/v1.45/containers/abc%2Fstart",
+            "/v1.45/images/..%2Flibpod/json",
+        ] {
+            assert!(
+                canonicalize_docker_path(bad_encoded_slash).is_err(),
+                "must reject encoded slash route '{bad_encoded_slash}'"
+            );
+        }
     }
 }

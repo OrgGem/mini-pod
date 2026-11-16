@@ -2,20 +2,28 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use sandbox_core::{SandboxError, SandboxId};
 use sandbox_runtime::SandboxTunnelPort;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::policy::{parse_port_key, RequestedPortBinding};
 
 const HOST_LOOPBACK_IP: &str = "127.0.0.1";
 const MIN_SHORT_ID_PREFIX_LEN: usize = 12;
+pub const MAX_CONCURRENT_PORT_FORWARD_CONNS: usize = 64;
+const PORT_FORWARD_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const PORT_FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Public snapshot of an active Host loopback -> Guest loopback port forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,14 +458,82 @@ fn parse_bound_guest_port(entry: &Value, container_key: &str) -> Result<u16, San
     Ok(port)
 }
 
+struct IdleTrackedIo<'a, S: Unpin> {
+    inner: &'a mut S,
+    activity: &'a AtomicU64,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTrackedIo<'_, S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            if buf.filled().len() > before {
+                self.activity.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTrackedIo<'_, S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                self.activity.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut *self.inner).poll_shutdown(cx);
+        if let Poll::Ready(Ok(())) = &poll {
+            self.activity.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        poll
+    }
+}
+
+async fn wait_for_idle(activity: &AtomicU64, idle_timeout: Duration) {
+    let mut last = activity.load(AtomicOrdering::Relaxed);
+    loop {
+        tokio::time::sleep(idle_timeout).await;
+        let current = activity.load(AtomicOrdering::Relaxed);
+        if current == last {
+            return;
+        }
+        last = current;
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     tunnel_port: Arc<dyn SandboxTunnelPort>,
     sandbox_id: SandboxId,
     guest_port: u16,
 ) {
+    let mut connections: JoinSet<()> = JoinSet::new();
     loop {
-        let (mut client_stream, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+            res = listener.accept() => res,
+        };
+        let (mut client_stream, _) = match accepted {
             Ok(conn) => conn,
             Err(err) => {
                 if matches!(
@@ -471,15 +547,42 @@ async fn accept_loop(
                 break;
             }
         };
+
+        while connections.try_join_next().is_some() {}
+        if connections.len() >= MAX_CONCURRENT_PORT_FORWARD_CONNS {
+            let _ = client_stream.shutdown().await;
+            drop(client_stream);
+            continue;
+        }
+
         let _ = client_stream.set_nodelay(true);
         let tunnel = Arc::clone(&tunnel_port);
         let sbx = sandbox_id.clone();
-        tokio::spawn(async move {
-            let Ok(mut guest_stream) = tunnel.open_guest_tcp_stream(&sbx, guest_port).await else {
+        connections.spawn(async move {
+            let Ok(Ok(mut guest_stream)) = tokio::time::timeout(
+                PORT_FORWARD_OPEN_TIMEOUT,
+                tunnel.open_guest_tcp_stream(&sbx, guest_port),
+            )
+            .await
+            else {
                 let _ = client_stream.shutdown().await;
                 return;
             };
-            let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut guest_stream).await;
+
+            let activity = AtomicU64::new(0);
+            let mut tracked_client = IdleTrackedIo {
+                inner: &mut client_stream,
+                activity: &activity,
+            };
+            let mut tracked_guest = IdleTrackedIo {
+                inner: &mut guest_stream,
+                activity: &activity,
+            };
+            tokio::select! {
+                biased;
+                _ = wait_for_idle(&activity, PORT_FORWARD_IDLE_TIMEOUT) => {}
+                _ = tokio::io::copy_bidirectional(&mut tracked_client, &mut tracked_guest) => {}
+            }
         });
     }
 }
@@ -810,5 +913,74 @@ mod tests {
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn release_closes_active_idle_forwarded_connections_and_caps_concurrency() {
+        use tokio::io::AsyncReadExt;
+
+        let cid = "222233334444555566667777888899990000aaaabbbbccccddddeeeeffff1111";
+        let reg = PortForwardRegistry::new();
+        let sbx_id = SandboxId::new("sbx-port-bounds");
+        let inspect = json!({
+            "Id": cid,
+            "NetworkSettings": {
+                "Ports": {
+                    "80/tcp": [{ "HostIp": "127.0.0.1", "HostPort": "45080" }]
+                }
+            }
+        });
+        let tunnel: Arc<dyn SandboxTunnelPort> = Arc::new(MockTcpTunnelPort {
+            expected_guest_port: 45080,
+            half_close_mode: false,
+        });
+        let fwds = reg
+            .activate_container_forwards(tunnel, &sbx_id, cid, &inspect)
+            .await
+            .expect("activate bounded forwards");
+        let host_port = fwds[0].host_port;
+
+        // Open `MAX_CONCURRENT_PORT_FORWARD_CONNS` active connections and verify they echo.
+        let mut open_clients = Vec::with_capacity(MAX_CONCURRENT_PORT_FORWARD_CONNS);
+        for _ in 0..MAX_CONCURRENT_PORT_FORWARD_CONNS {
+            let mut client = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+            client.write_all(b"ok").await.unwrap();
+            let mut pong = [0u8; 2];
+            client.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong, b"ok");
+            open_clients.push(client);
+        }
+
+        // Excess (65th) concurrent connection must be closed promptly instead of spawning unboundedly.
+        let mut excess = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+        let mut probe = [0u8; 16];
+        let excess_res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            excess.read(&mut probe),
+        )
+        .await
+        .expect("excess connection must be closed promptly");
+        assert!(
+            matches!(excess_res, Ok(0) | Err(_)),
+            "expected excess connection EOF/reset, got {excess_res:?}"
+        );
+
+        // Existing idle connections must still function, then close immediately on release.
+        open_clients[0].write_all(b"hi").await.unwrap();
+        let mut echo = [0u8; 2];
+        open_clients[0].read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hi");
+
+        reg.release_container_forwards_async(cid, true).await;
+        let close_res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            open_clients[0].read(&mut probe),
+        )
+        .await
+        .expect("active forwarded connection must close on container release");
+        assert!(
+            matches!(close_res, Ok(0) | Err(_)),
+            "expected EOF/reset after release, got {close_res:?}"
+        );
     }
 }
