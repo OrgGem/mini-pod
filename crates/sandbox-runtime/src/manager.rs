@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_core::{
-    CapabilityReport, DestroyStatus, EnforcementLevel, ExecRequest, ExecTarget, IsolationMode,
-    NetworkPolicy, SandboxError, SandboxId, SandboxLease, SandboxSpec,
+    CapabilityReport, DestroyStatus, EnforcementLevel, ExecRequest, ExecTarget, NetworkPolicy,
+    SandboxError, SandboxId, SandboxLease, SandboxSpec,
 };
 use sandbox_protocol::StreamTargetWire;
 use tokio::sync::watch;
@@ -32,8 +32,8 @@ use crate::safe_tar::{
 };
 use crate::tunnel::TunnelStream;
 use crate::warm_pool::{
-    CheckoutPop, ReplenisherHandle, WarmEntry, WarmPoolConfig, WarmPoolKey, WarmPoolStats,
-    WarmPoolStore,
+    validate_vm_spec, CheckoutPop, ReplenisherHandle, WarmEntry, WarmPoolConfig, WarmPoolKey,
+    WarmPoolStats, WarmPoolStore,
 };
 use crate::RuntimeManager;
 
@@ -441,8 +441,8 @@ impl LocalRuntimeManager {
             };
 
             if self.warm_pool.is_draining() || self.admission.has_waiters() {
-                drop(guard);
                 self.dispose_warm_entry(entry).await;
+                drop(guard);
                 break;
             }
             if let Some(rejected) = self
@@ -876,7 +876,7 @@ struct TransitioningCheckoutGuard<'a> {
 impl Drop for TransitioningCheckoutGuard<'_> {
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            self.warm_pool.abort_checkout(&entry.sandbox_id, true);
+            self.warm_pool.abort_checkout(&entry.sandbox_id);
             // Drop `entry` outside warm_pool lock so session tears down before permit releases.
             drop(entry);
         }
@@ -1166,6 +1166,14 @@ impl LocalRuntimeManager {
         entry: WarmEntry,
         abort_transitioning_dirty: bool,
     ) -> Result<(), SandboxError> {
+        struct AbortTransitionGuard<'a>(&'a WarmPoolStore, SandboxId);
+
+        impl Drop for AbortTransitionGuard<'_> {
+            fn drop(&mut self) {
+                self.0.abort_checkout(&self.1);
+            }
+        }
+
         let WarmEntry {
             sandbox_id,
             key: _,
@@ -1179,12 +1187,17 @@ impl LocalRuntimeManager {
             permit,
         } = entry;
 
-        let mut merged = merge_artifact_paths(
+        // Drop order on cancellation: `session` -> `abort_guard` -> `_permit`, ensuring QEMU exits
+        // and transitioning RSS/dirty accounting clears before admission capacity re-opens.
+        let _permit = permit;
+        let abort_guard = abort_transitioning_dirty
+            .then(|| AbortTransitionGuard(&self.warm_pool, sandbox_id.clone()));
+
+        let merged = merge_artifact_paths(
             &artifact_paths,
             std::slice::from_ref(&prepared.overlay_path),
             &work_dir,
         );
-        push_unique_path(&mut merged, &prepared.overlay_path);
         let expires_ms = unix_now_ms();
 
         let _ = self
@@ -1220,10 +1233,8 @@ impl LocalRuntimeManager {
             .await;
         }
 
-        if abort_transitioning_dirty {
-            self.warm_pool.abort_checkout(&sandbox_id, true);
-        }
-        drop(permit);
+        drop(abort_guard);
+        drop(_permit);
         kill_res
     }
 
@@ -1307,19 +1318,7 @@ impl LocalRuntimeManager {
 #[async_trait::async_trait]
 impl RuntimeManager for LocalRuntimeManager {
     async fn spawn(&self, spec: SandboxSpec) -> Result<SandboxLease, SandboxError> {
-        if spec.isolation == IsolationMode::SharedKernelAllowed {
-            return Err(SandboxError::UnsupportedIsolationMode(
-                "SharedKernelAllowed is not permitted when VmRequired runtime enforcement is active"
-                    .to_owned(),
-            ));
-        }
-        spec.validate_for_host_os(std::env::consts::OS)?;
-        if spec.budget.virtual_disk_mb > spec.budget.host_storage_budget_mb {
-            return Err(SandboxError::BudgetExceeded(format!(
-                "requested virtual_disk_mb ({} MiB) exceeds host_storage_budget_mb ({} MiB)",
-                spec.budget.virtual_disk_mb, spec.budget.host_storage_budget_mb
-            )));
-        }
+        validate_vm_spec(&spec, "requested")?;
 
         // Fast path: check out a compatible warm VM when no foreground waiters are queued.
         if !self.admission.has_waiters() {
@@ -1826,7 +1825,9 @@ mod tests {
     use std::fs;
     use std::sync::atomic::AtomicBool;
 
-    use sandbox_core::{AccelerationPolicy, EgressRule, ExecExitStatus, ResourceBudget};
+    use sandbox_core::{
+        AccelerationPolicy, EgressRule, ExecExitStatus, IsolationMode, ResourceBudget,
+    };
     use sandbox_protocol::StreamId;
 
     use crate::exec_stream::{ExecOutputChunk, OutputStreamKind};

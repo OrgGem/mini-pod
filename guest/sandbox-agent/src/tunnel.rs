@@ -157,6 +157,17 @@ impl TunnelSocket {
             Self::Unix(stream) => stream.shutdown(how),
         }
     }
+
+    fn enable_windows_abort_poll(&self) {
+        // WinSock2 `shutdown(SD_BOTH)` does not wake an already-blocked `recv()` on Windows;
+        // polling with a short read timeout lets host `cargo test` observe `handle.is_closed()`.
+        #[cfg(windows)]
+        match self {
+            Self::Tcp(stream) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+            }
+        }
+    }
 }
 
 impl Read for TunnelSocket {
@@ -295,6 +306,7 @@ pub(crate) fn relay_tunnel_socket(
     stdin_rx: mpsc::Receiver<TunnelInput>,
     outbound: &OutboundQueue,
 ) -> Result<(), ProtocolError> {
+    reader_sock.enable_windows_abort_poll();
     thread::scope(|scope| {
         let writer_handle = Arc::clone(handle);
         let writer_thread = scope.spawn(move || {
@@ -395,7 +407,20 @@ fn pump_tunnel_reader(
                 }
                 outbound.send_stream_data(stream_id, StreamChannel::Stdout, &buf[..n])?;
             }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err)
+                if err.kind() == io::ErrorKind::Interrupted
+                    || (cfg!(windows)
+                        && matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )) =>
+            {
+                if handle.is_closed() {
+                    outbound.clear_stream(stream_id);
+                    return Ok(());
+                }
+                continue;
+            }
             Err(_) => {
                 if handle.is_closed() {
                     outbound.clear_stream(stream_id);
@@ -581,6 +606,8 @@ mod tests {
                 break;
             }
         }
+        // Let pump_tunnel_reader enter blocking read() before aborting the socket.
+        thread::sleep(Duration::from_millis(15));
 
         handle.close(&outbound);
         worker.join().unwrap();

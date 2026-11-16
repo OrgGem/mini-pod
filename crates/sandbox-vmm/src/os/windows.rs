@@ -1227,6 +1227,15 @@ mod tests {
         drop(rebound);
         let _ = fs::remove_file(&sock_path);
 
+        // Pre-existing directory or junction at socket path must still be rejected.
+        let dir_as_sock = dir_path.join("dir.sock");
+        fs::create_dir(&dir_as_sock).expect("create directory at socket path");
+        assert!(matches!(
+            IpcListener::bind(&dir_as_sock),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        let _ = fs::remove_dir(&dir_as_sock);
+
         // Pre-existing permissive directory (inheriting %TEMP%'s SYSTEM/Admin/Users ACEs) must be rejected.
         let insecure_dir = CleanupDir::unique_path("weak");
         let _weak_cleanup = CleanupDir(insecure_dir.clone());

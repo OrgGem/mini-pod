@@ -492,6 +492,8 @@ enum StreamHandler {
     },
 }
 
+type NetworkAckSlot = Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>;
+
 /// Active multiplexed QEMU `virtio-serial` session implementing [`VmSessionPort`].
 pub struct QemuVmSession {
     pid: u32,
@@ -506,7 +508,7 @@ pub struct QemuVmSession {
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
     egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
-    pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>>,
+    pending_network_ack: Arc<NetworkAckSlot>,
     network_cfg_lock: AsyncMutex<()>,
     transport_closed: Arc<AtomicBool>,
     alive: AtomicBool,
@@ -549,8 +551,7 @@ impl QemuVmSession {
         let ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let egress_tx = Arc::new(Mutex::new(egress_tx));
-        let pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>> =
-            Arc::new(Mutex::new(None));
+        let pending_network_ack: Arc<NetworkAckSlot> = Arc::new(Mutex::new(None));
         let transport_closed = Arc::new(AtomicBool::new(false));
         let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
@@ -1167,7 +1168,7 @@ impl Drop for TunnelConnectGuard<'_> {
 
 struct NetworkConfigureGuard<'a> {
     egress_tx: &'a Mutex<Option<mpsc::Sender<TunnelStream>>>,
-    pending_network_ack: &'a Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>,
+    pending_network_ack: &'a NetworkAckSlot,
     armed: bool,
 }
 
@@ -1409,7 +1410,7 @@ fn run_writer_loop(
     mut write_half: IpcWriteHalf,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
-    pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>>,
+    pending_network_ack: Arc<NetworkAckSlot>,
     transport_closed: Arc<AtomicBool>,
 ) {
     while let Some(frame) = outbound.pop_blocking() {
@@ -1428,7 +1429,7 @@ fn run_reader_loop(
     mut read_half: IpcReadHalf,
     outbound: Arc<OutboundQueue>,
     ops: Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
-    pending_network_ack: Arc<Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>>,
+    pending_network_ack: Arc<NetworkAckSlot>,
     transport_closed: Arc<AtomicBool>,
     egress_tx: Arc<Mutex<Option<mpsc::Sender<TunnelStream>>>>,
     tokio_handle: Option<tokio::runtime::Handle>,
@@ -1740,7 +1741,7 @@ fn handle_egress_open(
 
 fn fail_all_pending_ops(
     ops: &Mutex<HashMap<StreamId, StreamHandler>>,
-    pending_network_ack: &Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>,
+    pending_network_ack: &NetworkAckSlot,
     reason: &str,
 ) {
     let ack_tx = lock_unpoisoned(pending_network_ack).take();

@@ -54,22 +54,27 @@ impl WarmPoolConfig {
                     "warm_pool.template_spec must be Some when target_size > 0".to_owned(),
                 ));
             };
-            if spec.isolation == IsolationMode::SharedKernelAllowed {
-                return Err(SandboxError::UnsupportedIsolationMode(
-                    "SharedKernelAllowed is not permitted in warm_pool.template_spec when VmRequired runtime enforcement is active"
-                        .to_owned(),
-                ));
-            }
-            spec.validate_for_host_os(std::env::consts::OS)?;
-            if spec.budget.virtual_disk_mb > spec.budget.host_storage_budget_mb {
-                return Err(SandboxError::BudgetExceeded(format!(
-                    "warm_pool.template_spec virtual_disk_mb ({} MiB) exceeds host_storage_budget_mb ({} MiB)",
-                    spec.budget.virtual_disk_mb, spec.budget.host_storage_budget_mb
-                )));
-            }
+            validate_vm_spec(spec, "warm_pool.template_spec")?;
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_vm_spec(spec: &SandboxSpec, label: &str) -> Result<(), SandboxError> {
+    if spec.isolation == IsolationMode::SharedKernelAllowed {
+        return Err(SandboxError::UnsupportedIsolationMode(
+            "SharedKernelAllowed is not permitted when VmRequired runtime enforcement is active"
+                .to_owned(),
+        ));
+    }
+    spec.validate_for_host_os(std::env::consts::OS)?;
+    if spec.budget.virtual_disk_mb > spec.budget.host_storage_budget_mb {
+        return Err(SandboxError::BudgetExceeded(format!(
+            "{label} virtual_disk_mb ({} MiB) exceeds host_storage_budget_mb ({} MiB)",
+            spec.budget.virtual_disk_mb, spec.budget.host_storage_budget_mb
+        )));
+    }
+    Ok(())
 }
 
 /// Compatibility key matching `(isolation, acceleration, budget)` independent of `network` and `lease_ttl`.
@@ -323,12 +328,10 @@ impl WarmPoolStore {
         state.total_checkouts = state.total_checkouts.saturating_add(1);
     }
 
-    pub(crate) fn abort_checkout(&self, sandbox_id: &SandboxId, count_dirty: bool) {
+    pub(crate) fn abort_checkout(&self, sandbox_id: &SandboxId) {
         let mut state = lock_unpoisoned(&self.inner);
         state.transitioning.remove(sandbox_id);
-        if count_dirty {
-            state.total_disposed_dirty = state.total_disposed_dirty.saturating_add(1);
-        }
+        state.total_disposed_dirty = state.total_disposed_dirty.saturating_add(1);
     }
 
     pub(crate) fn pop_one_for_eviction(&self) -> Option<WarmEntry> {
