@@ -463,7 +463,7 @@ RUN rustc --edition 2021 -O -C opt-level=z -C panic=abort -C strip=symbols -C ta
     mkdir -p /out-echo/bin /out-echo/etc /out-echo/tmp /out-echo/work && \
     cp /echo-http /out-echo/echo-http && chmod 0755 /out-echo/echo-http && \
     cp /bin/busybox.static /out-echo/bin/busybox && chmod 0755 /out-echo/bin/busybox && \
-    for cmd in sh cat echo ls mkdir rm sleep chmod touch tar; do ln -s busybox "/out-echo/bin/`$cmd"; done && \
+    for cmd in sh cat echo printf ls mkdir rm sleep setsid chmod touch tar; do ln -s busybox "/out-echo/bin/`$cmd"; done && \
     printf 'root:x:0:0:root:/root:/bin/sh\n' > /out-echo/etc/passwd && \
     printf 'root:x:0:\n' > /out-echo/etc/group && \
     chmod 0644 /out-echo/etc/passwd /out-echo/etc/group && \

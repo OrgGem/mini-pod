@@ -407,7 +407,10 @@ fn run_exec_inner(
     }
 
     #[cfg(unix)]
-    let exec_scope = Arc::new(supervisor_unix::ExecScope::prepare(stream_id));
+    let exec_scope = Arc::new(supervisor_unix::ExecScope::prepare(
+        stream_id,
+        matches!(spec.target, ExecTargetWire::Container { .. }),
+    ));
 
     let (program_label, mut cmd) = match prepared {
         PreparedCommand::Guest {

@@ -31,6 +31,8 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const KILL_DRAIN_POLL: Duration = Duration::from_millis(5);
+#[cfg(target_os = "linux")]
+const CONMON_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "linux")]
 static NEXT_EXEC_SCOPE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -46,18 +48,21 @@ pub(crate) struct UnixUser {
 pub(crate) struct ExecScope {
     cgroup_dir: Option<PathBuf>,
     spawn_procs_file: Mutex<Option<File>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    is_container_exec: bool,
 }
 
 impl ExecScope {
     /// Creates a fresh per-exec cgroup v2 scope on Linux if `/sys/fs/cgroup` is writable,
     /// falling back gracefully to process-group + `/proc` tree tracking in unprivileged host tests.
-    pub(crate) fn prepare(stream_id: StreamId) -> Self {
+    pub(crate) fn prepare(stream_id: StreamId, is_container_exec: bool) -> Self {
         #[cfg(target_os = "linux")]
         {
             if let Some((dir, procs_file)) = try_create_linux_exec_cgroup(stream_id) {
                 return Self {
                     cgroup_dir: Some(dir),
                     spawn_procs_file: Mutex::new(Some(procs_file)),
+                    is_container_exec,
                 };
             }
         }
@@ -67,6 +72,7 @@ impl ExecScope {
         Self {
             cgroup_dir: None,
             spawn_procs_file: Mutex::new(None),
+            is_container_exec,
         }
     }
 
@@ -105,11 +111,15 @@ impl ExecScope {
         self.close_spawn_fd();
         #[cfg(target_os = "linux")]
         if let Some(ref dir) = self.cgroup_dir {
-            kill_linux_exec_tree(Some(dir.as_path()), pgid);
+            let leader_alive = process_group_has_live_members(pgid);
+            // Skip costly `/proc` snapshots when a guest exec exited cleanly with empty pgid and leaf cgroup.
+            if self.is_container_exec || leader_alive || !read_cgroup_pids(dir).is_empty() {
+                kill_linux_exec_tree(Some(dir.as_path()), pgid);
+            }
             remove_cgroup_dir_with_retry(dir);
             return;
         }
-        let _ = (&self.cgroup_dir, pgid);
+        self.kill_all(pgid);
     }
 }
 
@@ -269,7 +279,10 @@ fn discover_conmon_exec_pids(seed_pids: &HashSet<i32>) -> Vec<i32> {
         }
 
         if let Some(path) = pidfile_path.filter(|p| {
-            p.starts_with("/run/") || p.starts_with("/var/run/") || p.starts_with("/tmp/")
+            p.starts_with("/run/")
+                || p.starts_with("/var/run/")
+                || p.starts_with("/var/lib/containers/")
+                || p.starts_with("/tmp/")
         }) {
             if let Ok(raw_pid) = fs::read_to_string(path) {
                 if let Ok(exec_pid) = raw_pid.trim().parse::<i32>() {
@@ -320,6 +333,23 @@ fn kill_pid_and_group(pid: i32) {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn process_group_has_live_members(pgid: u32) -> bool {
+    let Ok(pgid_i32) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    if pgid_i32 <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 probes process-group existence without delivering a signal.
+    let rc = unsafe { libc::kill(-pgid_i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
 fn is_pid_alive_non_zombie(pid: i32) -> bool {
     let Ok(stat_raw) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -330,44 +360,90 @@ fn is_pid_alive_non_zombie(pid: i32) -> bool {
 #[cfg(target_os = "linux")]
 fn kill_linux_exec_tree(cgroup_dir: Option<&Path>, pgid: u32) {
     let self_pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
-    let mut tracked_pids = HashSet::new();
-    if let Ok(root_pid) = i32::try_from(pgid) {
-        if root_pid > 1 && root_pid != self_pid {
-            tracked_pids.insert(root_pid);
-        }
-    }
+    let mut host_cgroup_pids = HashSet::new();
     if let Some(dir) = cgroup_dir {
         for pid in read_cgroup_pids(dir) {
             if pid != self_pid {
-                tracked_pids.insert(pid);
+                host_cgroup_pids.insert(pid);
             }
+        }
+    }
+
+    let mut all_pids = host_cgroup_pids.clone();
+    if let Ok(root_pid) = i32::try_from(pgid) {
+        if root_pid > 1 && root_pid != self_pid {
+            all_pids.insert(root_pid);
         }
     }
 
     // Snapshot `/proc` closure BEFORE killing parent leaders so `setsid()` children and
     // `conmon --pidfile` container exec processes are captured prior to PID 1 reparenting.
-    expand_proc_closure(&mut tracked_pids, self_pid);
-    for container_exec_pid in discover_conmon_exec_pids(&tracked_pids) {
+    expand_proc_closure(&mut all_pids, self_pid);
+    for container_exec_pid in discover_conmon_exec_pids(&all_pids) {
         if container_exec_pid != self_pid {
-            tracked_pids.insert(container_exec_pid);
+            all_pids.insert(container_exec_pid);
         }
     }
-    expand_proc_closure(&mut tracked_pids, self_pid);
+    expand_proc_closure(&mut all_pids, self_pid);
 
+    // Phase A: Kill container-side workload processes (outside `cgroup_dir`, e.g. in `libpod-<cid>`)
+    // immediately while allowing `conmon -e` and `podman exec` inside `cgroup_dir` to reap the child
+    // and write Podman's `.../exit/<cid>` file before Phase B's hard sweep.
+    if let Some(dir) = cgroup_dir {
+        if all_pids.iter().any(|pid| !host_cgroup_pids.contains(pid)) {
+            for &pid in &all_pids {
+                if !host_cgroup_pids.contains(&pid) {
+                    kill_pid_and_group(pid);
+                }
+            }
+
+            let grace_deadline = Instant::now() + CONMON_EXIT_GRACE;
+            while Instant::now() < grace_deadline {
+                let cur_host: HashSet<i32> = read_cgroup_pids(dir)
+                    .into_iter()
+                    .filter(|&pid| pid != self_pid)
+                    .collect();
+
+                expand_proc_closure(&mut all_pids, self_pid);
+                for container_exec_pid in discover_conmon_exec_pids(&all_pids) {
+                    if container_exec_pid != self_pid {
+                        all_pids.insert(container_exec_pid);
+                    }
+                }
+                expand_proc_closure(&mut all_pids, self_pid);
+
+                for &pid in &all_pids {
+                    if !cur_host.contains(&pid) {
+                        kill_pid_and_group(pid);
+                    }
+                }
+
+                let container_alive = all_pids
+                    .iter()
+                    .any(|&p| !cur_host.contains(&p) && is_pid_alive_non_zombie(p));
+                if cur_host.is_empty() && !process_group_has_live_members(pgid) && !container_alive {
+                    return;
+                }
+                thread::sleep(KILL_DRAIN_POLL);
+            }
+        }
+    }
+
+    // Phase B: Unconditional hard sweep across leaf cgroup, process group, and all closures.
     // 1. Trigger atomic kernel `cgroup.kill` if available (Linux >= 5.14).
     if let Some(dir) = cgroup_dir {
         let _ = fs::write(dir.join("cgroup.kill"), b"1");
     }
 
-    // 2. Kill initial process group and every discovered descendant / container exec process.
+    // 2. Kill initial process group and every surviving descendant / container exec process.
     kill_process_group(pgid);
-    for &pid in &tracked_pids {
+    for &pid in &all_pids {
         kill_pid_and_group(pid);
     }
     if let Some(dir) = cgroup_dir {
         for pid in read_cgroup_pids(dir) {
             if pid != self_pid {
-                tracked_pids.insert(pid);
+                all_pids.insert(pid);
                 kill_pid_and_group(pid);
             }
         }
@@ -381,7 +457,7 @@ fn kill_linux_exec_tree(cgroup_dir: Option<&Path>, pgid: u32) {
             let remaining = read_cgroup_pids(dir);
             for &pid in &remaining {
                 if pid != self_pid {
-                    tracked_pids.insert(pid);
+                    all_pids.insert(pid);
                     kill_pid_and_group(pid);
                 }
             }
@@ -391,9 +467,9 @@ fn kill_linux_exec_tree(cgroup_dir: Option<&Path>, pgid: u32) {
             }
         }
 
-        expand_proc_closure(&mut tracked_pids, self_pid);
+        expand_proc_closure(&mut all_pids, self_pid);
         let mut any_alive = false;
-        for &pid in &tracked_pids {
+        for &pid in &all_pids {
             if is_pid_alive_non_zombie(pid) {
                 any_alive = true;
                 kill_pid_and_group(pid);
@@ -573,5 +649,62 @@ mod tests {
         let pid = child.id();
         kill_process_group(pid);
         let _ = child.wait();
+    }
+
+    #[test]
+    fn fallback_exec_scope_without_cgroup_kills_surviving_process_group_on_cleanup() {
+        #[cfg_attr(not(target_os = "linux"), allow(unsafe_code))]
+        fn pid_is_alive(pid: i32) -> bool {
+            #[cfg(target_os = "linux")]
+            {
+                is_pid_alive_non_zombie(pid)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+            }
+        }
+
+        let scope = ExecScope {
+            cgroup_dir: None,
+            spawn_procs_file: Mutex::new(None),
+            is_container_exec: false,
+        };
+
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "sleep 30 >/dev/null 2>&1 </dev/null & echo $!; exit 0",
+        ]);
+        cmd.stdout(Stdio::piped());
+        configure_process_group(&mut cmd);
+
+        let child = cmd.spawn().expect("spawn sh with background child");
+        let pgid = child.id();
+        let output = child.wait_with_output().expect("reap leader shell");
+        assert!(output.status.success(), "leader shell failed: {:?}", output);
+        let bg_pid: i32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("parse background sleep pid");
+        assert!(
+            pid_is_alive(bg_pid),
+            "background survivor {bg_pid} should still be running right after leader exits"
+        );
+
+        scope.cleanup_after_reap(pgid);
+
+        let mut dead = false;
+        for _ in 0..50 {
+            if !pid_is_alive(bg_pid) {
+                dead = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dead,
+            "cleanup_after_reap without cgroup must kill surviving process group member {bg_pid}"
+        );
     }
 }

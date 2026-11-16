@@ -783,7 +783,13 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
     .expect("timeout waiting for READY_ON_8080 log line");
     assert!(logs_seen.contains("READY_ON_8080"));
 
-    // 8. Interactive exec hijack (101 UPGRADED) with stdin half-close (EOF).
+    // 8. Interactive exec hijack (101 UPGRADED) with stdin half-close (EOF) on Unix,
+    // or newline-delimited stdin round-trip on Windows (byte-mode Named Pipes lack OS SHUT_WR).
+    #[cfg(unix)]
+    let hijack_cmd = vec!["/bin/sh", "-c", "cat"];
+    #[cfg(windows)]
+    let hijack_cmd = vec!["/bin/sh", "-c", "IFS= read -r line && printf '%s\\n' \"$line\""];
+
     let exec_created = docker
         .create_exec(
             &cid,
@@ -791,7 +797,7 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
                 attach_stdin: Some(true),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
-                cmd: Some(vec!["/bin/sh", "-c", "cat"]),
+                cmd: Some(hijack_cmd),
                 ..Default::default()
             },
         )
@@ -938,7 +944,7 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
                 argv: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "rm -f /tmp/ctr-escaped && setsid sh -c 'sleep 1; echo survived > /tmp/ctr-escaped' </dev/null >/dev/null 2>&1 & wait".to_owned(),
+                    "rm -f /tmp/ctr-started /tmp/ctr-escaped && /bin/busybox setsid /bin/sh -c 'touch /tmp/ctr-started; sleep 1; echo survived > /tmp/ctr-escaped' </dev/null >/dev/null 2>&1 & /bin/sleep 5".to_owned(),
                 ],
                 env: BTreeMap::new(),
                 cwd: None,
@@ -972,7 +978,7 @@ async fn e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy() {
                 argv: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "if [ -e /tmp/ctr-escaped ]; then echo ESCAPED; else echo CONTAINED; fi"
+                    "if [ ! -e /tmp/ctr-started ]; then echo NEVER_STARTED; elif [ -e /tmp/ctr-escaped ]; then echo ESCAPED; else echo CONTAINED; fi"
                         .to_owned(),
                 ],
                 env: BTreeMap::new(),

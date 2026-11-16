@@ -109,6 +109,7 @@ fn early_initramfs_setup() -> io::Result<()> {
     for &(src, target, fstype) in EARLY_MOUNTS {
         mount_raw(Some(src), target, Some(fstype), 0, None, true)?;
     }
+    ensure_standard_fds_open();
 
     if Path::new("/sbin/modprobe").exists() {
         for module in REQUIRED_MODULES {
@@ -120,6 +121,27 @@ fn early_initramfs_setup() -> io::Result<()> {
 
     populate_virtio_ports(Path::new("/sys"), Path::new("/dev"))?;
     Ok(())
+}
+
+fn ensure_standard_fds_open() {
+    // SAFETY: Probes fd table via fcntl(F_GETFD) and binds any missing 0..=2 to /dev/null via dup2.
+    unsafe {
+        if !(0..=2).any(|fd| libc::fcntl(fd, libc::F_GETFD) < 0) {
+            return;
+        }
+        let null_fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if null_fd < 0 {
+            return;
+        }
+        for fd in 0..=2 {
+            if libc::fcntl(fd, libc::F_GETFD) < 0 {
+                let _ = libc::dup2(null_fd, fd);
+            }
+        }
+        if null_fd > 2 {
+            let _ = libc::close(null_fd);
+        }
+    }
 }
 
 fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
@@ -842,12 +864,7 @@ mod tests {
             if set_process_name(b"tiny-init\0").is_err() {
                 unsafe { libc::_exit(2) };
             }
-            let fd = unsafe {
-                libc::open(
-                    b"/proc/self/comm\0".as_ptr().cast::<libc::c_char>(),
-                    libc::O_RDONLY,
-                )
-            };
+            let fd = unsafe { libc::open(c"/proc/self/comm".as_ptr(), libc::O_RDONLY) };
             if fd < 0 {
                 unsafe { libc::_exit(3) };
             }
@@ -861,5 +878,41 @@ mod tests {
         }
 
         assert_forked_child_exits_zero(pid, "set_process_name test");
+    }
+
+    #[test]
+    fn ensure_standard_fds_open_rebinds_closed_stdio_in_forked_child() {
+        if !Path::new("/dev/null").exists() {
+            return;
+        }
+        // SAFETY: Forks an isolated child process to test stdio fd recovery without mutating parent fds.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for ensure_standard_fds_open test failed");
+        if pid == 0 {
+            // SAFETY: Standard close/fcntl/open/dup2 sequence inside forked child.
+            unsafe {
+                let _ = libc::close(1);
+                let _ = libc::close(2);
+            }
+            ensure_standard_fds_open();
+            for fd in 0..=2 {
+                // SAFETY: Valid descriptor probe in forked child.
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                    unsafe { libc::_exit(2) };
+                }
+            }
+            // SAFETY: Opening /dev/null must yield fd >= 3 if 0..=2 are all occupied.
+            let probe = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            if probe < 3 {
+                unsafe { libc::_exit(3) };
+            }
+            // SAFETY: Close probe descriptor and exit cleanly.
+            unsafe {
+                let _ = libc::close(probe);
+                libc::_exit(0);
+            }
+        }
+
+        assert_forked_child_exits_zero(pid, "ensure_standard_fds_open test");
     }
 }

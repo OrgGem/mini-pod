@@ -71,7 +71,9 @@ impl QemuLaunchConfig {
             serial_arg.push(serial_log.as_os_str());
             args.push(serial_arg);
         } else {
-            args.push("none".into());
+            // Keep ttyS0/ttyAMA0 console UART wired to QEMU's zero-disk null sink so guest PID 1
+            // always opens /dev/console with valid standard descriptors 0..=2.
+            args.push("null".into());
         }
 
         match self.arch {
@@ -228,7 +230,7 @@ mod tests {
         assert!(args.contains(&"-nodefaults".to_owned()));
         assert!(args.windows(2).any(|w| w == ["-display", "none"]));
         assert!(args.windows(2).any(|w| w == ["-monitor", "none"]));
-        assert!(args.windows(2).any(|w| w == ["-serial", "none"]));
+        assert!(args.windows(2).any(|w| w == ["-serial", "null"]));
         assert!(args.windows(2).any(|w| w == ["-machine", "q35"]));
         assert!(!args.contains(&"-cpu".to_owned()));
         assert!(!args.contains(&"-drive".to_owned()));
