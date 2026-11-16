@@ -222,8 +222,10 @@ fn boot_single_attempt(
 
     let serial_log_path = boot_cfg.work_dir.join("serial.log");
     let stderr_log_path = boot_cfg.work_dir.join("qemu-stderr.log");
-    artifact_paths.push(serial_log_path.clone());
     artifact_paths.push(stderr_log_path.clone());
+
+    // Persist any external IPC artifact paths in the crash journal before spawning QEMU.
+    boot_cfg.record_boot_progress(None, &artifact_paths)?;
 
     let launch_cfg = QemuLaunchConfig {
         qemu_bin: qemu_bin.to_path_buf(),
@@ -236,7 +238,7 @@ fn boot_single_attempt(
         vcpus: boot_cfg.spec.budget.guest_vcpus,
         ram_mb: boot_cfg.spec.budget.guest_ram_mb,
         agent_socket_path: socket_path,
-        serial_log_path: Some(serial_log_path.clone()),
+        serial_log_path: None,
         network: boot_cfg.spec.network.clone(),
     };
     let args = launch_cfg.build_args()?;
@@ -257,6 +259,14 @@ fn boot_single_attempt(
         .host_rss_budget_mb
         .map(|mb| u64::from(mb) * 1024 * 1024);
     let mut process = ConfinedProcess::spawn(launch_spec)?;
+    let identity = process.start_identity();
+    if let Err(err) = boot_cfg.record_boot_progress(
+        Some((identity.pid, identity.start_token)),
+        &artifact_paths,
+    ) {
+        let _ = process.kill_and_wait();
+        return Err(err);
+    }
 
     let boot_deadline = Instant::now() + driver_cfg.boot_timeout;
     let mut stream = loop {
@@ -337,7 +347,6 @@ fn boot_single_attempt(
         (None, None)
     };
 
-    let identity = process.start_identity();
     let proc_caps = process.resource_capabilities();
     let session = QemuVmSession::start(
         Some(process),

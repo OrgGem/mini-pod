@@ -2,6 +2,8 @@
 //! durable crash journaling, TTL lease enforcement, and safe workspace copy I/O.
 
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,8 +26,8 @@ use crate::journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
 };
 use crate::ports::{
-    DiskOverlayPort, PreparedOverlay, SandboxTunnelPort, VmBootConfig, VmRuntimePort,
-    VmSessionPort,
+    DiskOverlayPort, PreBootJournalHook, PreparedOverlay, SandboxTunnelPort, VmBootConfig,
+    VmRuntimePort, VmSessionPort,
 };
 use crate::safe_tar::{
     ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar,
@@ -36,10 +38,9 @@ use crate::warm_pool::{
     validate_vm_spec, CheckoutPop, ReplenisherHandle, WarmEntry, WarmPoolConfig, WarmPoolKey,
     WarmPoolStats, WarmPoolStore,
 };
-use crate::RuntimeManager;
+use crate::{is_symlink_or_reparse, map_fs_error, RuntimeManager};
 
 const MAX_GUEST_PATH_BYTES: usize = 4096;
-const QCOW2_STORAGE_HEADROOM_MB: u64 = 16;
 const EGRESS_PROXY_PORT: u16 = 3128;
 
 /// Configuration for [`LocalRuntimeManager`].
@@ -221,6 +222,7 @@ impl Drop for DestroySlotGuard<'_> {
 /// Layer 2 `RuntimeManager` orchestrating VMs, disk overlays, leases, and crash recovery.
 pub struct LocalRuntimeManager {
     config: RuntimeManagerConfig,
+    _state_lock: File,
     journal: JournalStore,
     sandboxes_dir: PathBuf,
     overlay: Arc<dyn DiskOverlayPort>,
@@ -232,6 +234,7 @@ pub struct LocalRuntimeManager {
     warm_pool: WarmPoolStore,
     in_flight_destroys: Mutex<HashMap<SandboxId, watch::Sender<bool>>>,
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    destroy_listeners: Mutex<Vec<Arc<dyn Fn(&SandboxId) + Send + Sync>>>,
     next_seq: AtomicU64,
 }
 
@@ -244,9 +247,15 @@ impl Drop for LocalRuntimeManager {
             }
         }
         self.warm_pool.abort_replenisher();
-        let drained = self.warm_pool.clear_ready_for_drop();
-        // Drop entries outside warm_pool lock so AdmissionPermit::drop preserves strict lock ordering.
-        drop(drained);
+        let drained_active: Vec<ActiveSandbox> = {
+            let mut guard = lock_unpoisoned(&self.active);
+            guard.drain().map(|(_, entry)| entry).collect()
+        };
+        let drained_warm = self.warm_pool.clear_ready_for_drop();
+        // Drop entries outside `active` and `warm_pool` locks so `AdmissionPermit::drop`
+        // and `VmSessionPort::drop` preserve strict lock ordering.
+        drop(drained_active);
+        drop(drained_warm);
     }
 }
 
@@ -277,25 +286,27 @@ impl LocalRuntimeManager {
     ) -> Result<Self, SandboxError> {
         config.validate()?;
         ensure_safe_dir_path(&config.state_dir, true)?;
+        let state_lock = acquire_exclusive_state_lock(&config.state_dir)?;
         let journal = JournalStore::new(config.state_dir.join("journals"))?;
         let sandboxes_dir = config.state_dir.join("sandboxes");
         ensure_safe_dir_path(&sandboxes_dir, true)?;
 
         let active = Arc::new(Mutex::new(HashMap::<SandboxId, ActiveSandbox>::new()));
         let warm_pool = WarmPoolStore::new();
-        let active_for_rss = Arc::clone(&active);
-        let warm_pool_for_rss = warm_pool.clone();
+        let active_for_rss = Arc::downgrade(&active);
+        let warm_pool_for_rss = warm_pool.downgrade();
         let observed_rss_fn = Arc::new(move || -> u64 {
-            let entries: Vec<(Arc<dyn VmSessionPort>, u64)> = {
-                let guard = lock_unpoisoned(&active_for_rss);
-                let mut collected: Vec<(Arc<dyn VmSessionPort>, u64)> = guard
-                    .values()
-                    .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb))
-                    .collect();
-                warm_pool_for_rss.collect_rss_samples(&mut collected);
-                collected
-            };
-            entries
+            let mut collected: Vec<(Arc<dyn VmSessionPort>, u64)> = Vec::new();
+            if let Some(active_arc) = active_for_rss.upgrade() {
+                let guard = lock_unpoisoned(&active_arc);
+                collected.extend(
+                    guard
+                        .values()
+                        .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb)),
+                );
+            }
+            warm_pool_for_rss.collect_rss_samples(&mut collected);
+            collected
                 .into_iter()
                 .map(|(session, reserved_mb)| {
                     let live_mb = session
@@ -310,6 +321,7 @@ impl LocalRuntimeManager {
 
         Ok(Self {
             config,
+            _state_lock: state_lock,
             journal,
             sandboxes_dir,
             overlay,
@@ -321,8 +333,26 @@ impl LocalRuntimeManager {
             warm_pool,
             in_flight_destroys: Mutex::new(HashMap::new()),
             sweeper_abort: Mutex::new(None),
+            destroy_listeners: Mutex::new(Vec::new()),
             next_seq: AtomicU64::new(1),
         })
+    }
+
+    /// Registers a synchronous listener invoked whenever a sandbox is destroyed (including TTL
+    /// lease sweeps and resource-budget enforcement).
+    pub fn register_destroy_listener<F>(&self, listener: F)
+    where
+        F: Fn(&SandboxId) + Send + Sync + 'static,
+    {
+        lock_unpoisoned(&self.destroy_listeners).push(Arc::new(listener));
+    }
+
+    fn notify_destroy_listeners(&self, id: &SandboxId) {
+        let listeners: Vec<Arc<dyn Fn(&SandboxId) + Send + Sync>> =
+            lock_unpoisoned(&self.destroy_listeners).clone();
+        for listener in listeners {
+            listener(id);
+        }
     }
 
     pub fn config(&self) -> &RuntimeManagerConfig {
@@ -1090,19 +1120,53 @@ impl LocalRuntimeManager {
             return Err(err);
         }
 
+        let journal_for_hook = self.journal.clone();
+        let id_for_hook = sandbox_id.clone();
+        let overlay_for_hook = prepared.overlay_path.clone();
+        let work_dir_for_hook = work_dir.clone();
+        let on_boot_progress: PreBootJournalHook = Arc::new(move |identity, boot_artifacts| {
+            let merged = merge_artifact_paths(
+                boot_artifacts,
+                std::slice::from_ref(&overlay_for_hook),
+                &work_dir_for_hook,
+            );
+            let (pid, start_token) = match identity {
+                Some((p, t)) => (Some(p), Some(t)),
+                None => (None, None),
+            };
+            journal_for_hook.write_record(&JournalRecord {
+                sandbox_id: id_for_hook.clone(),
+                state: JournalLifecycleState::Spawning,
+                pid,
+                start_token,
+                artifact_paths: merged,
+                expires_at_unix_ms: initial_expires_ms,
+            })
+        });
+
         let boot_cfg = VmBootConfig {
             sandbox_id: sandbox_id.clone(),
             spec: spec.clone(),
             overlay: prepared.clone(),
             work_dir: work_dir.clone(),
+            on_boot_progress: Some(on_boot_progress),
         };
         let boot = match self.vm_runtime.boot_vm(boot_cfg).await {
             Ok(outcome) => outcome,
             Err(err) => {
+                let recorded = self.load_record_async(sandbox_id.clone()).await.ok().flatten();
+                let rollback_artifacts = match recorded {
+                    Some(rec) => merge_artifact_paths(
+                        &rec.artifact_paths,
+                        &spawn_artifacts,
+                        &work_dir,
+                    ),
+                    None => spawn_artifacts,
+                };
                 self.rollback_spawn(
                     &sandbox_id,
                     Some(&prepared.overlay_path),
-                    spawn_artifacts,
+                    rollback_artifacts,
                     initial_expires_ms,
                 )
                 .await;
@@ -1661,6 +1725,7 @@ impl RuntimeManager for LocalRuntimeManager {
         }
 
         let _slot = self.acquire_destroy_slot(id).await;
+        self.notify_destroy_listeners(id);
 
         let removed_active = {
             let mut active = lock_unpoisoned(&self.active);
@@ -1877,25 +1942,77 @@ fn validate_exec_request(req: &ExecRequest) -> Result<(), SandboxError> {
     Ok(())
 }
 
+fn acquire_exclusive_state_lock(state_dir: &Path) -> Result<File, SandboxError> {
+    let lock_path = state_dir.join("state.lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(meta) => {
+            if is_symlink_or_reparse(&meta) {
+                return Err(SandboxError::PolicyViolation(format!(
+                    "refusing symlink or reparse state lock file '{}'",
+                    lock_path.display()
+                )));
+            }
+            if !meta.file_type().is_file() {
+                return Err(SandboxError::PolicyViolation(format!(
+                    "state lock path '{}' is not a regular file",
+                    lock_path.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(map_fs_error(&lock_path, "inspect state lock file", err)),
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(&lock_path)
+        .map_err(|err| map_fs_error(&lock_path, "open state lock file", err))?;
+
+    let open_meta = file
+        .metadata()
+        .map_err(|err| map_fs_error(&lock_path, "inspect opened state lock file", err))?;
+    if is_symlink_or_reparse(&open_meta) || !open_meta.file_type().is_file() {
+        return Err(SandboxError::PolicyViolation(format!(
+            "opened state lock '{}' is not a safe regular file",
+            lock_path.display()
+        )));
+    }
+
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(SandboxError::PolicyViolation(format!(
+            "state directory '{}' is already locked by another active runtime instance",
+            state_dir.display()
+        ))),
+        Err(TryLockError::Error(err)) => {
+            Err(map_fs_error(&lock_path, "acquire exclusive state lock", err))
+        }
+    }
+}
+
 fn bytes_to_mib_ceil(bytes: u64) -> u64 {
     bytes.div_ceil(1024 * 1024)
 }
 
 fn build_lease_capabilities(
     spec: &SandboxSpec,
-    prepared: &PreparedOverlay,
+    _prepared: &PreparedOverlay,
     boot_caps: CapabilityReport,
 ) -> CapabilityReport {
-    let host_budget_bytes =
-        u64::from(spec.budget.host_storage_budget_mb).saturating_mul(1024 * 1024);
-    let virtual_disk_mb = u64::from(prepared.virtual_disk_mb.max(spec.budget.virtual_disk_mb));
-    let host_storage = if virtual_disk_mb.saturating_add(QCOW2_STORAGE_HEADROOM_MB)
-        <= u64::from(spec.budget.host_storage_budget_mb)
-        && prepared.provisioned_host_bytes <= host_budget_bytes
-    {
-        EnforcementLevel::HardLimit
-    } else {
-        EnforcementLevel::BestEffort
+    // Host storage is enforced via qcow2 virtual disk sizing, admission reservations, pre-copy
+    // checks, and periodic physical directory sweeps rather than a kernel filesystem quota, so it
+    // is honestly reported as BestEffort unless the underlying VMM driver provides a HardLimit.
+    let host_storage = match boot_caps.host_storage {
+        EnforcementLevel::HardLimit => EnforcementLevel::HardLimit,
+        EnforcementLevel::BestEffort | EnforcementLevel::Unsupported => {
+            EnforcementLevel::BestEffort
+        }
     };
     let egress_filter = match &spec.network {
         NetworkPolicy::Isolated
@@ -2043,6 +2160,7 @@ mod tests {
 
     struct MockSessionState {
         alive: AtomicBool,
+        dropped_count: AtomicU64,
         rss_bytes: AtomicU64,
         fail_enable_egress: AtomicBool,
         graceful_succeeds: bool,
@@ -2059,6 +2177,13 @@ mod tests {
         start_token: u64,
         artifacts: Vec<PathBuf>,
         state: Arc<MockSessionState>,
+    }
+
+    impl Drop for MockVmSession {
+        fn drop(&mut self) {
+            self.state.alive.store(false, Ordering::Release);
+            self.state.dropped_count.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     #[async_trait::async_trait]
@@ -2210,6 +2335,10 @@ mod tests {
     struct MockVmRuntimeState {
         fail_boot: bool,
         boot_delay: Option<Duration>,
+        pre_handshake_stall: Option<(
+            PathBuf,
+            tokio::sync::oneshot::Sender<(u32, u64)>,
+        )>,
         graceful_succeeds: bool,
         enable_egress_channel: bool,
         next_pid: u32,
@@ -2240,7 +2369,7 @@ mod tests {
     #[async_trait::async_trait]
     impl VmRuntimePort for MockVmRuntime {
         async fn boot_vm(&self, config: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
-            let (pid, token, graceful, fail, boot_delay, enable_egress) = {
+            let (pid, token, graceful, fail, boot_delay, enable_egress, stall) = {
                 let mut st = lock_unpoisoned(&self.state);
                 st.next_pid += 1;
                 (
@@ -2250,8 +2379,17 @@ mod tests {
                     st.fail_boot,
                     st.boot_delay,
                     st.enable_egress_channel && config.spec.network != NetworkPolicy::Isolated,
+                    st.pre_handshake_stall.take(),
                 )
             };
+            if let Some((ext_ipc_path, notify_tx)) = stall {
+                fs::write(&ext_ipc_path, b"ipc").unwrap();
+                let artifacts = vec![ext_ipc_path];
+                config.record_boot_progress(None, &artifacts)?;
+                config.record_boot_progress(Some((pid, token)), &artifacts)?;
+                let _ = notify_tx.send((pid, token));
+                std::future::pending::<()>().await;
+            }
             if let Some(delay) = boot_delay {
                 tokio::time::sleep(delay).await;
             }
@@ -2262,6 +2400,9 @@ mod tests {
             }
             let sock_path = config.work_dir.join("a.sock");
             fs::write(&sock_path, b"sock").unwrap();
+            let artifacts = vec![sock_path.clone()];
+            config.record_boot_progress(None, &artifacts)?;
+            config.record_boot_progress(Some((pid, token)), &artifacts)?;
             let (egress_tx, egress_rx) = if enable_egress {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 (Some(tx), Some(rx))
@@ -2270,6 +2411,7 @@ mod tests {
             };
             let sess_state = Arc::new(MockSessionState {
                 alive: AtomicBool::new(true),
+                dropped_count: AtomicU64::new(0),
                 rss_bytes: AtomicU64::new(64 * 1024 * 1024),
                 fail_enable_egress: AtomicBool::new(false),
                 graceful_succeeds: graceful,
@@ -2382,7 +2524,7 @@ mod tests {
 
         let lease = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
         assert_eq!(lease.capabilities.egress_filter, EnforcementLevel::HardLimit);
-        assert_eq!(lease.capabilities.host_storage, EnforcementLevel::HardLimit);
+        assert_eq!(lease.capabilities.host_storage, EnforcementLevel::BestEffort);
         assert_eq!(lease.capabilities.cpu_quota, EnforcementLevel::Unsupported);
 
         // Journal must persist Active state with PID & start_token.
@@ -2508,7 +2650,7 @@ mod tests {
         // Neither failure may leave sandbox artifacts or journals behind.
         assert!(mgr.journal.load_records().unwrap().is_empty());
 
-        // Tight storage headroom (<= virtual_disk_mb + 16 MiB) reports BestEffort; >= 16 MiB reports HardLimit.
+        // Without an OS filesystem quota, host_storage honestly reports BestEffort across headroom levels.
         let mut tight = valid_spec(Duration::from_secs(30));
         tight.budget.virtual_disk_mb = 512;
         tight.budget.host_storage_budget_mb = 520;
@@ -2534,7 +2676,7 @@ mod tests {
             spec.network = net;
             let lease = mgr.spawn(spec).await.unwrap();
             assert_eq!(lease.capabilities.egress_filter, expected_egress);
-            assert_eq!(lease.capabilities.host_storage, EnforcementLevel::HardLimit);
+            assert_eq!(lease.capabilities.host_storage, EnforcementLevel::BestEffort);
             mgr.destroy(&lease.id).await.unwrap();
         }
     }
@@ -4045,5 +4187,157 @@ mod tests {
             .await
             .expect("lease must not be pre-expired by VM boot latency");
         mgr.destroy(&lease.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_runtime_on_same_state_dir_is_rejected_before_reconciliation() {
+        let tmp = TestTempDir::new("mgr-state-lock");
+        let state_dir = tmp.path().join("state");
+        let overlay1 = Arc::new(MockOverlayStore::default());
+        let vm1 = Arc::new(MockVmRuntime::new(true));
+        let mgr1 = LocalRuntimeManager::new(
+            base_config(state_dir.clone()),
+            overlay1,
+            vm1.clone(),
+        )
+        .expect("first runtime acquires state.lock");
+
+        let lease = mgr1
+            .spawn(valid_spec(Duration::from_secs(60)))
+            .await
+            .expect("spawn sandbox on first runtime");
+
+        let overlay2 = Arc::new(MockOverlayStore::default());
+        let vm2 = Arc::new(MockVmRuntime::new(true));
+        let second_err = match LocalRuntimeManager::new(
+            base_config(state_dir.clone()),
+            overlay2.clone(),
+            vm2.clone(),
+        ) {
+            Ok(_) => panic!("second runtime sharing state_dir must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(second_err, SandboxError::PolicyViolation(_)),
+            "expected PolicyViolation on locked state_dir, got {second_err:?}"
+        );
+
+        // First runtime's VM and journal must remain untouched and fully executable.
+        let out = mgr1
+            .exec_stream(
+                &lease.id,
+                ExecRequest {
+                    target: ExecTarget::Guest,
+                    argv: vec!["echo".into(), "alive".into()],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    user: None,
+                    deadline: Duration::from_secs(5),
+                    stdout_budget_bytes: 1024,
+                    stderr_budget_bytes: 1024,
+                },
+            )
+            .await
+            .expect("first runtime sandbox still active")
+            .collect()
+            .await
+            .expect("collect exec output");
+        assert_eq!(out.stdout, b"ran:echo alive");
+
+        mgr1.destroy(&lease.id).await.unwrap();
+        drop(mgr1);
+
+        // Once the first runtime drops, state.lock is released and a new runtime can initialize.
+        let mgr2 = LocalRuntimeManager::new(base_config(state_dir), overlay2, vm2)
+            .expect("new runtime succeeds after previous owner drops");
+        assert_eq!(mgr2.reconcile_startup().await.unwrap().records_seen, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_manager_with_live_active_and_warm_leases_drops_all_sessions() {
+        let tmp = TestTempDir::new("mgr-arc-drop");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().join("state"));
+        cfg.warm_pool.target_size = 1;
+        cfg.warm_pool.template_spec = Some(valid_spec(Duration::from_secs(60)));
+
+        let mgr = LocalRuntimeManager::new(cfg, overlay, vm.clone()).unwrap();
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+
+        let mut custom = valid_spec(Duration::from_secs(60));
+        custom.budget.guest_vcpus = 2; // Force cold spawn alongside the warm VM.
+        let _active_lease = mgr.spawn(custom).await.unwrap();
+
+        let sessions: Vec<Arc<MockSessionState>> = lock_unpoisoned(&vm.state).sessions.clone();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|s| s.dropped_count.load(Ordering::Acquire) == 0));
+
+        // Dropping the manager without calling destroy() must break all Admission/RSS Arc references
+        // and immediately run Drop on both the active and warm sessions.
+        drop(mgr);
+
+        for (idx, sess) in sessions.iter().enumerate() {
+            assert_eq!(
+                sess.dropped_count.load(Ordering::Acquire),
+                1,
+                "session {idx} leaked across LocalRuntimeManager::drop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_handshake_boot_crash_persists_pid_and_external_artifacts_for_reconciler() {
+        let tmp = TestTempDir::new("mgr-pre-handshake-crash");
+        let state_dir = tmp.path().join("state");
+        let ext_ipc_dir = tmp.path().join("ext-ipc");
+        fs::create_dir_all(&ext_ipc_dir).unwrap();
+        let ext_ipc_sock = ext_ipc_dir.join("a.sock");
+
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+        let overlay1 = Arc::new(MockOverlayStore::default());
+        let vm1 = Arc::new(MockVmRuntime::new(true));
+        lock_unpoisoned(&vm1.state).pre_handshake_stall = Some((ext_ipc_sock.clone(), spawned_tx));
+
+        let mgr1 = Arc::new(
+            LocalRuntimeManager::new(base_config(state_dir.clone()), overlay1, vm1).unwrap(),
+        );
+        let mgr1_spawn = Arc::clone(&mgr1);
+        let spawn_task = tokio::spawn(async move {
+            mgr1_spawn.spawn(valid_spec(Duration::from_secs(60))).await
+        });
+
+        let (orphan_pid, orphan_token) = spawned_rx
+            .await
+            .expect("receive pre-handshake spawned identity");
+
+        // Simulate abrupt daemon death (SIGKILL) mid-boot before handshake completes.
+        spawn_task.abort();
+        let _ = spawn_task.await;
+        drop(mgr1);
+
+        // Journal on disk must already hold the spawned PID, start_token, and external IPC path.
+        let records = JournalStore::new(state_dir.join("journals"))
+            .unwrap()
+            .load_records()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pid, Some(orphan_pid));
+        assert_eq!(records[0].start_token, Some(orphan_token));
+        assert!(records[0].artifact_paths.contains(&ext_ipc_sock));
+
+        // Next daemon startup reconciles the pre-handshake orphan and removes external IPC artifact.
+        let overlay2 = Arc::new(MockOverlayStore::default());
+        let vm2 = Arc::new(MockVmRuntime::new(true));
+        lock_unpoisoned(&vm2.state)
+            .live_orphans
+            .insert((orphan_pid, orphan_token));
+        let mgr2 = LocalRuntimeManager::new(base_config(state_dir), overlay2, vm2.clone()).unwrap();
+        let report = mgr2.reconcile_startup().await.unwrap();
+        assert_eq!(report.records_seen, 1);
+        assert_eq!(report.orphans_killed, 1);
+        assert_eq!(report.cleaned, 1);
+        assert_eq!(report.remaining, 0);
+        assert!(!ext_ipc_sock.exists());
     }
 }

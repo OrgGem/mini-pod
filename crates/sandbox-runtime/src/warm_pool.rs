@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use sandbox_core::{
@@ -182,6 +182,32 @@ pub(crate) struct WarmPoolStore {
     replenish_done_notify: Arc<Notify>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WeakWarmPoolStore {
+    inner: Weak<Mutex<WarmPoolState>>,
+}
+
+impl WeakWarmPoolStore {
+    pub(crate) fn collect_rss_samples(&self, dst: &mut Vec<(Arc<dyn VmSessionPort>, u64)>) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let state = lock_unpoisoned(&inner);
+        dst.extend(
+            state
+                .ready
+                .iter()
+                .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb)),
+        );
+        dst.extend(
+            state
+                .transitioning
+                .values()
+                .map(|vm| (Arc::clone(&vm.session), vm.reserved_rss_mb)),
+        );
+    }
+}
+
 impl WarmPoolStore {
     pub(crate) fn new() -> Self {
         Self {
@@ -189,6 +215,12 @@ impl WarmPoolStore {
             replenisher: Arc::new(Mutex::new(None)),
             replenish_notify: Arc::new(Notify::new()),
             replenish_done_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakWarmPoolStore {
+        WeakWarmPoolStore {
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -214,23 +246,6 @@ impl WarmPoolStore {
 
     pub(crate) fn set_draining(&self, draining: bool) {
         lock_unpoisoned(&self.inner).draining = draining;
-    }
-
-    /// Appends live `(session, reserved_rss_mb)` samples for all ready and transitioning warm VMs.
-    pub(crate) fn collect_rss_samples(&self, dst: &mut Vec<(Arc<dyn VmSessionPort>, u64)>) {
-        let state = lock_unpoisoned(&self.inner);
-        dst.extend(
-            state
-                .ready
-                .iter()
-                .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb)),
-        );
-        dst.extend(
-            state
-                .transitioning
-                .values()
-                .map(|vm| (Arc::clone(&vm.session), vm.reserved_rss_mb)),
-        );
     }
 
     pub(crate) fn contains_live_id(&self, id: &SandboxId) -> bool {

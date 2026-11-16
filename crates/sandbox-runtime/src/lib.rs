@@ -37,8 +37,8 @@ pub use manager::{
     validate_guest_path, LocalRuntimeManager, ReconciliationReport, RuntimeManagerConfig,
 };
 pub use ports::{
-    DiskOverlayPort, PreparedOverlay, SandboxTunnelPort, VmBootConfig, VmBootOutcome, VmRuntimePort,
-    VmSessionPort,
+    DiskOverlayPort, PreBootJournalHook, PreparedOverlay, SandboxTunnelPort, VmBootConfig,
+    VmBootOutcome, VmRuntimePort, VmSessionPort,
 };
 pub use safe_tar::{extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar, validate_tar_bytes};
 pub use tunnel::{TunnelStream, TunnelStreamHandle};

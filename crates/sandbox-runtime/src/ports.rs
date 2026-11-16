@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sandbox_core::{CapabilityReport, ExecRequest, SandboxError, SandboxId, SandboxSpec};
@@ -37,13 +38,46 @@ pub trait DiskOverlayPort: Send + Sync {
     async fn remove_overlay(&self, overlay_path: &Path) -> Result<(), SandboxError>;
 }
 
+/// Synchronous pre-handshake boot progress callback invoked before and immediately after spawning
+/// the VMM process so crash journals persist IPC paths and `(pid, start_token)` prior to handshake.
+pub type PreBootJournalHook =
+    Arc<dyn Fn(Option<(u32, u64)>, &[PathBuf]) -> Result<(), SandboxError> + Send + Sync>;
+
 /// Configuration passed from Layer 2 runtime orchestration to boot a single sandbox VM.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct VmBootConfig {
     pub sandbox_id: SandboxId,
     pub spec: SandboxSpec,
     pub overlay: PreparedOverlay,
     pub work_dir: PathBuf,
+    pub on_boot_progress: Option<PreBootJournalHook>,
+}
+
+impl VmBootConfig {
+    /// Persists pre-boot artifact paths or spawned VMM `(pid, start_token)` via `on_boot_progress`
+    /// when configured by [`crate::LocalRuntimeManager`].
+    pub fn record_boot_progress(
+        &self,
+        identity: Option<(u32, u64)>,
+        artifact_paths: &[PathBuf],
+    ) -> Result<(), SandboxError> {
+        if let Some(hook) = &self.on_boot_progress {
+            hook(identity, artifact_paths)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for VmBootConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VmBootConfig")
+            .field("sandbox_id", &self.sandbox_id)
+            .field("spec", &self.spec)
+            .field("overlay", &self.overlay)
+            .field("work_dir", &self.work_dir)
+            .field("has_on_boot_progress", &self.on_boot_progress.is_some())
+            .finish()
+    }
 }
 
 /// Active VM driver session exposed to Layer 2 runtime orchestration.

@@ -46,7 +46,7 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 
 ## Prerequisites
 
-- **Rust toolchain:** Rust `1.75+` (`rustfmt`, `cargo`)
+- **Rust toolchain:** Rust `1.89+` (`rustfmt`, `cargo`)
 - **QEMU:** `qemu-system-x86_64` (plus `qemu-system-aarch64` for cross-arch bundle test) and `qemu-img` on `PATH` (or in standard Windows `Program Files\qemu` / `%LOCALAPPDATA%\Programs\qemu`)
 - **Docker (optional, for rebuilding reproducible guest bundles & offline OCI test images):** Linux container runtime supporting `linux/amd64` and `linux/arm64`
 

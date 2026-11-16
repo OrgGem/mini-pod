@@ -1101,7 +1101,7 @@ async fn e2e_admission_control_os_resource_caps_and_capability_report() {
         assert_eq!(lease_a.capabilities.host_rss, EnforcementLevel::HardLimit);
         assert_eq!(
             lease_a.capabilities.host_storage,
-            EnforcementLevel::HardLimit
+            EnforcementLevel::BestEffort
         );
         assert_eq!(
             lease_a.capabilities.egress_filter,
@@ -1120,7 +1120,7 @@ async fn e2e_admission_control_os_resource_caps_and_capability_report() {
         ));
         assert_eq!(
             lease_a.capabilities.host_storage,
-            EnforcementLevel::HardLimit
+            EnforcementLevel::BestEffort
         );
         assert_eq!(
             lease_a.capabilities.egress_filter,
@@ -1131,7 +1131,7 @@ async fn e2e_admission_control_os_resource_caps_and_capability_report() {
     {
         assert_eq!(
             lease_a.capabilities.host_storage,
-            EnforcementLevel::HardLimit
+            EnforcementLevel::BestEffort
         );
         assert_eq!(
             lease_a.capabilities.egress_filter,
