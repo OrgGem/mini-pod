@@ -32,7 +32,8 @@ use crate::ipc::{
 };
 use crate::launch::QemuLaunchConfig;
 use crate::process::{
-    kill_verified_orphan_process, ConfinedProcess, ProcessLaunchSpec, ProcessStdio,
+    kill_verified_orphan_process, spawn_bounded_pipe_file_sink, ConfinedProcess, ProcessLaunchSpec,
+    ProcessStdio,
 };
 use crate::spike::{
     build_candidate_attempts, combine_fallback_error, is_retryable_boot_error, perform_handshake,
@@ -249,9 +250,13 @@ fn boot_single_attempt(
             stderr_log_path.display()
         ))
     })?;
+    let (stderr_rx, stderr_tx) = std::io::pipe().map_err(|err| {
+        SandboxError::Transport(format!("failed to create QEMU stderr pipe: {err}"))
+    })?;
+    spawn_bounded_pipe_file_sink(stderr_rx, stderr_file, 512 * 1024);
 
     let mut launch_spec = ProcessLaunchSpec::new(qemu_bin, args);
-    launch_spec.stderr = ProcessStdio::File(stderr_file);
+    launch_spec.stderr = ProcessStdio::PipeWriter(stderr_tx);
     launch_spec.cpu_quota_millicores = boot_cfg.spec.budget.host_cpu_quota_Millicores;
     launch_spec.memory_limit_bytes = boot_cfg
         .spec

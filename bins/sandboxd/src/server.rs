@@ -19,12 +19,13 @@ use sandbox_core::{DestroyStatus, NetworkPolicy, SandboxError, SandboxId};
 use sandbox_docker_compat::{
     DockerCompatPolicy, DockerCompatServer, HttpServerHandle, ReaperSocketPolicy,
 };
-use sandbox_image::{verify_installed_bundle, BundleOverlayStore};
+use sandbox_image::{verify_installed_bundle, BundleOverlayStore, HelperCommandOutput};
 use sandbox_runtime::{
     ExecStream, LocalRuntimeManager, OutputStreamKind, RuntimeManager, SandboxTunnelPort,
 };
 use sandbox_vmm::{
-    discover_qemu_binary_for_arch, discover_qemu_img_binary, QemuDriverConfig, QemuVmDriver,
+    discover_qemu_binary_for_arch, discover_qemu_img_binary, run_confined_command_bounded,
+    QemuDriverConfig, QemuVmDriver,
 };
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -205,7 +206,17 @@ pub async fn build_runtime(cfg: &ServeConfig) -> Result<Arc<LocalRuntimeManager>
     let qemu_img_bin = discover_qemu_img_binary(cfg.qemu_img_bin.as_deref())?;
     let qemu_bin = discover_qemu_binary_for_arch(cfg.arch, cfg.qemu_bin.as_deref())?;
 
-    let overlay = BundleOverlayStore::new(&cfg.bundle_dir, verifier, qemu_img_bin)?;
+    let helper_runner = Arc::new(|prog: &Path, args: &[std::ffi::OsString], timeout: Duration| {
+        let out = run_confined_command_bounded(prog, args, timeout, 1024 * 1024)?;
+        Ok(HelperCommandOutput {
+            success: out.status.success(),
+            status_label: out.status.to_string(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    });
+    let overlay =
+        BundleOverlayStore::with_command_runner(&cfg.bundle_dir, verifier, qemu_img_bin, helper_runner)?;
     let driver = QemuVmDriver::new(QemuDriverConfig {
         arch: cfg.arch,
         qemu_bin: Some(qemu_bin),

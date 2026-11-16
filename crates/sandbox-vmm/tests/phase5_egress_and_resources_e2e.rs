@@ -184,10 +184,19 @@ fn build_phase5_runtime(
         BundleVerifier::with_public_key(fixtures.public_key).expect("verifier from pubkey");
     let installed = install_bundle_atomic(&fixtures.src_bundle_dir, &install_parent, &verifier)
         .expect("install signed bundle atomically");
-    let overlay = BundleOverlayStore::new(
+    let overlay = BundleOverlayStore::with_command_runner(
         installed.root_dir().to_path_buf(),
         verifier,
         &fixtures.qemu_img_bin,
+        Arc::new(|prog, args, timeout| {
+            let out = sandbox_vmm::run_confined_command_bounded(prog, args, timeout, 1024 * 1024)?;
+            Ok(sandbox_image::HelperCommandOutput {
+                success: out.status.success(),
+                status_label: out.status.to_string(),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            })
+        }),
     )
     .expect("build BundleOverlayStore");
 

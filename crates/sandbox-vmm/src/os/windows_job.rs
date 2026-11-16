@@ -770,13 +770,19 @@ fn resolve_stdio_handle(stdio: &ProcessStdio, is_stdin: bool) -> Result<OwnedHan
     match stdio {
         ProcessStdio::Null => open_inheritable_nul(is_stdin),
         ProcessStdio::File(file) => duplicate_inheritable_handle(file),
+        ProcessStdio::PipeWriter(writer) => {
+            duplicate_inheritable_raw_handle(writer.as_raw_handle() as HANDLE)
+        }
     }
 }
 
 fn duplicate_inheritable_handle(file: &File) -> Result<OwnedHandle, SandboxError> {
+    duplicate_inheritable_raw_handle(file.as_raw_handle() as HANDLE)
+}
+
+fn duplicate_inheritable_raw_handle(src: HANDLE) -> Result<OwnedHandle, SandboxError> {
     let mut dup: HANDLE = ptr::null_mut();
-    let src = file.as_raw_handle() as HANDLE;
-    // SAFETY: `GetCurrentProcess()` is a pseudo-handle; `src` is a live open handle borrowed from `file`.
+    // SAFETY: `GetCurrentProcess()` is a pseudo-handle; `src` is a live open handle borrowed from caller.
     let ok = unsafe {
         let cur = GetCurrentProcess();
         DuplicateHandle(cur, src, cur, &mut dup, 0, 1, DUPLICATE_SAME_ACCESS)

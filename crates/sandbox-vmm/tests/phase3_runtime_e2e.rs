@@ -138,8 +138,21 @@ fn build_manager_for_installed_bundle(
     state_dir: &Path,
 ) -> Arc<LocalRuntimeManager> {
     let verifier = BundleVerifier::with_public_key(public_key).expect("verifier from pubkey");
-    let overlay = BundleOverlayStore::new(bundle_root.to_path_buf(), verifier, qemu_img_bin)
-        .expect("build BundleOverlayStore");
+    let overlay = BundleOverlayStore::with_command_runner(
+        bundle_root.to_path_buf(),
+        verifier,
+        qemu_img_bin,
+        Arc::new(|prog, args, timeout| {
+            let out = sandbox_vmm::run_confined_command_bounded(prog, args, timeout, 1024 * 1024)?;
+            Ok(sandbox_image::HelperCommandOutput {
+                success: out.status.success(),
+                status_label: out.status.to_string(),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            })
+        }),
+    )
+    .expect("build BundleOverlayStore");
     let driver = QemuVmDriver::new(QemuDriverConfig {
         arch,
         qemu_bin: Some(qemu_bin.to_path_buf()),

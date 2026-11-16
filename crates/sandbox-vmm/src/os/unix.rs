@@ -818,12 +818,16 @@ pub(crate) fn spawn_confined(spec: ProcessLaunchSpec) -> Result<UnixConfinedProc
 /// Verifies `pid` against `expected_start_token` before killing its process group (`-pid`) and PID.
 ///
 /// On Linux, verifies `/proc/<pid>/stat` is not a zombie and its field 22 `starttime` matches
-/// `expected_start_token`. On Unix platforms without `/proc` (macOS), accepts only the documented
-/// `0` fallback token and verifies the PID is live before sending `SIGKILL`.
+/// `expected_start_token`. On macOS, queries `proc_pidinfo(PROC_PIDTBSDINFO)` to verify non-zombie
+/// status and matching microsecond creation time. Unverified (`0`) tokens are unconditionally
+/// rejected on all Unix platforms to prevent PID-reuse kills.
 pub fn kill_verified_orphan_process(
     pid: u32,
     expected_start_token: u64,
 ) -> Result<bool, SandboxError> {
+    if expected_start_token == 0 {
+        return Ok(false);
+    }
     let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
         return Ok(false);
     };
@@ -833,9 +837,6 @@ pub fn kill_verified_orphan_process(
 
     #[cfg(target_os = "linux")]
     {
-        if expected_start_token == 0 {
-            return Ok(false);
-        }
         let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(s) => s,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -853,48 +854,49 @@ pub fn kill_verified_orphan_process(
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        // shortcut: macOS/non-procfs Unix lacks /proc/<pid>/stat starttime (accepts start_token=0 fallback), add Darwin proc_pidinfo/sysctl verification if non-Linux hosts run persistent daemon reconcilers
-        if expected_start_token != 0 {
+        let Some((is_zombie, actual_start_token)) = query_macos_proc_bsd_start_token(pid)? else {
+            return Ok(false);
+        };
+        if is_zombie || actual_start_token != expected_start_token {
             return Ok(false);
         }
-        // SAFETY: Signal `0` probes process existence for positive `raw_pid`.
-        if unsafe { libc::kill(raw_pid, 0) } != 0 {
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return Ok(false);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut signaled = false;
+        if kill_process_group_raw(pid)? {
+            signaled = true;
+        }
+
+        // SAFETY: `raw_pid > 0` targets the verified orphan process directly.
+        if unsafe { libc::kill(raw_pid, libc::SIGKILL) } == 0 {
+            signaled = true;
+        } else {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(false);
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(SandboxError::Internal(format!(
+                    "failed to kill orphan process {raw_pid}: {err}"
+                )));
             }
-            return Err(SandboxError::Internal(format!(
-                "kill({raw_pid}, 0) failed: {err}"
-            )));
         }
-    }
 
-    let mut signaled = false;
-    if kill_process_group_raw(pid)? {
-        signaled = true;
+        Ok(signaled)
     }
-
-    // SAFETY: `raw_pid > 0` targets the verified orphan process directly.
-    if unsafe { libc::kill(raw_pid, libc::SIGKILL) } == 0 {
-        signaled = true;
-    } else {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            return Err(SandboxError::Internal(format!(
-                "failed to kill orphan process {raw_pid}: {err}"
-            )));
-        }
-    }
-
-    Ok(signaled)
 }
 
 fn stdio_from(stdio: ProcessStdio) -> Stdio {
     match stdio {
         ProcessStdio::Null => Stdio::null(),
         ProcessStdio::File(file) => Stdio::from(file),
+        ProcessStdio::PipeWriter(writer) => Stdio::from(writer),
     }
 }
 
@@ -908,6 +910,7 @@ fn exit_status_from_std(status: ExitStatus) -> ProcessExitStatus {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kill_process_group_raw(pid: u32) -> Result<bool, SandboxError> {
     let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
         return Ok(false);
@@ -938,11 +941,61 @@ fn read_process_start_token(pid: u32) -> u64 {
             .and_then(|s| parse_proc_stat_starttime(&s))
             .unwrap_or(0)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        query_macos_proc_bsd_start_token(pid)
+            .ok()
+            .flatten()
+            .map(|(_, token)| token)
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         0
     }
+}
+
+#[cfg(target_os = "macos")]
+fn query_macos_proc_bsd_start_token(pid: u32) -> Result<Option<(bool, u64)>, SandboxError> {
+    let Ok(raw_pid) = libc::c_int::try_from(pid) else {
+        return Ok(None);
+    };
+    if raw_pid <= 0 {
+        return Ok(None);
+    }
+    let expected_size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `proc_bsdinfo` is a POD C struct written by `proc_pidinfo(PROC_PIDTBSDINFO)`.
+    let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+    // SAFETY: `info` provides `expected_size` writable bytes for `PROC_PIDTBSDINFO`.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+            expected_size,
+        )
+    };
+    if rc <= 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            None | Some(0) | Some(libc::ESRCH) => Ok(None),
+            _ => Err(SandboxError::Internal(format!(
+                "proc_pidinfo({raw_pid}, PROC_PIDTBSDINFO) failed: {err}"
+            ))),
+        };
+    }
+    if rc != expected_size {
+        return Ok(None);
+    }
+    let is_zombie = info.pbi_status == libc::SZOMB;
+    let token = info
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
+        .max(1);
+    Ok(Some((is_zombie, token)))
 }
 
 #[cfg(target_os = "linux")]
@@ -1345,9 +1398,10 @@ mod tests {
             .expect("spawn sleep");
         let pid = child.id();
         let token = read_process_start_token(pid);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_ne!(token, 0);
 
+        assert_eq!(kill_verified_orphan_process(pid, 0), Ok(false));
         assert_eq!(kill_verified_orphan_process(pid, token ^ 1), Ok(false));
         assert_eq!(kill_verified_orphan_process(0, token), Ok(false));
         assert_eq!(

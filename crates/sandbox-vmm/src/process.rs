@@ -3,7 +3,9 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Duration;
 
 use sandbox_core::{EnforcementLevel, SandboxError};
@@ -71,6 +73,16 @@ pub enum ProcessStdio {
     Null,
     /// Redirects the stream to an already-opened host file.
     File(File),
+    /// Redirects the stream to the write end of an anonymous OS pipe.
+    PipeWriter(PipeWriter),
+}
+
+/// Captured exit status and bounded `stdout`/`stderr` buffers from [`run_confined_command_bounded`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfinedCommandOutput {
+    pub status: ProcessExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Host OS enforcement levels actually achieved for a spawned [`ConfinedProcess`].
@@ -176,6 +188,119 @@ impl ConfinedProcess {
     pub fn kill_and_wait(&mut self) -> Result<(), SandboxError> {
         self.inner.kill_and_wait()
     }
+}
+
+/// Spawns `program` with `args` inside a [`ConfinedProcess`] (Windows Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; Unix dedicated
+/// process group), captures up to `max_output_bytes` per stream while draining excess output so
+/// pipes never deadlock, and kills the entire process tree if `timeout` elapses.
+pub fn run_confined_command_bounded(
+    program: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<ConfinedCommandOutput, SandboxError> {
+    if timeout.is_zero() {
+        return Err(SandboxError::InvalidSpec(
+            "confined command timeout must be greater than zero".to_owned(),
+        ));
+    }
+    let (stdout_rx, stdout_tx) = io::pipe().map_err(|err| {
+        SandboxError::Transport(format!("failed to create confined stdout pipe: {err}"))
+    })?;
+    let (stderr_rx, stderr_tx) = io::pipe().map_err(|err| {
+        SandboxError::Transport(format!("failed to create confined stderr pipe: {err}"))
+    })?;
+
+    let mut spec = ProcessLaunchSpec::new(program, args.to_vec());
+    spec.stdout = ProcessStdio::PipeWriter(stdout_tx);
+    spec.stderr = ProcessStdio::PipeWriter(stderr_tx);
+    let mut proc = ConfinedProcess::spawn(spec)?;
+
+    thread::scope(|s| {
+        let out_handle = s.spawn(move || read_pipe_bounded(stdout_rx, max_output_bytes));
+        let err_handle = s.spawn(move || read_pipe_bounded(stderr_rx, max_output_bytes));
+
+        match proc.wait_timeout(timeout) {
+            Ok(Some(status)) => {
+                let stdout = out_handle.join().unwrap_or_default();
+                let stderr = err_handle.join().unwrap_or_default();
+                Ok(ConfinedCommandOutput {
+                    status,
+                    stdout,
+                    stderr,
+                })
+            }
+            Ok(None) => {
+                let _ = proc.kill_and_wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                Err(SandboxError::Transport(format!(
+                    "confined helper command '{}' timed out after {}ms",
+                    program.display(),
+                    timeout.as_millis()
+                )))
+            }
+            Err(err) => {
+                let _ = proc.kill_and_wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                Err(err)
+            }
+        }
+    })
+}
+
+/// Spawns a detached background thread that copies at most `max_bytes` from `reader` into `file`
+/// and discards any subsequent bytes until pipe EOF so the child process never stalls on writes
+/// while host disk usage stays strictly bounded.
+pub(crate) fn spawn_bounded_pipe_file_sink(reader: PipeReader, mut file: File, max_bytes: u64) {
+    let _ = thread::Builder::new()
+        .name("minipod-log-sink".to_owned())
+        .spawn(move || {
+            let mut reader = reader;
+            let mut written: u64 = 0;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let rem = max_bytes.saturating_sub(written);
+                        if rem > 0 {
+                            let to_write = (n as u64).min(rem) as usize;
+                            if file.write_all(&buf[..to_write]).is_ok() {
+                                written += to_write as u64;
+                            } else {
+                                written = max_bytes;
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = file.flush();
+        });
+}
+
+fn read_pipe_bounded(mut reader: PipeReader, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let rem = max_bytes.saturating_sub(out.len());
+                if rem > 0 {
+                    let take = n.min(rem);
+                    out.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// Verifies `pid` against `expected_start_token` before killing an orphaned process tree.
@@ -584,6 +709,43 @@ mod tests {
         assert_eq!(
             parse_proc_statm_rss_bytes(&format!("100 {} 0", u64::MAX), 4096),
             None
+        );
+    }
+
+    #[test]
+    fn run_confined_command_bounded_captures_output_truncates_and_enforces_timeout() {
+        #[cfg(windows)]
+        let (prog, ok_args, slow_args) = (
+            Path::new("cmd.exe"),
+            vec![
+                OsString::from("/C"),
+                OsString::from("echo hello-confined && echo err-line 1>&2"),
+            ],
+            vec![
+                OsString::from("/C"),
+                OsString::from("ping -n 10 127.0.0.1 >NUL"),
+            ],
+        );
+        #[cfg(unix)]
+        let (prog, ok_args, slow_args) = (
+            Path::new("/bin/sh"),
+            vec![
+                OsString::from("-c"),
+                OsString::from("printf 'hello-confined\\n'; printf 'err-line\\n' >&2"),
+            ],
+            vec![OsString::from("-c"), OsString::from("sleep 10")],
+        );
+
+        let out = run_confined_command_bounded(prog, &ok_args, Duration::from_secs(5), 6)
+            .expect("confined command succeeds");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"hello-");
+        assert_eq!(out.stderr, b"err-li");
+
+        let timed_out = run_confined_command_bounded(prog, &slow_args, Duration::from_millis(80), 64);
+        assert!(
+            matches!(timed_out, Err(SandboxError::Transport(_))),
+            "expected Transport timeout error, got {timed_out:?}"
         );
     }
 }

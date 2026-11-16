@@ -1,8 +1,8 @@
 //! QEMU binary discovery, OS launch-error classification, and accelerator policy resolution.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sandbox_core::{AccelerationPolicy, GuestArch, SandboxError};
 
@@ -227,10 +227,13 @@ pub fn probe_available_accelerators_for_arch(
     qemu_bin: &Path,
     guest_arch: GuestArch,
 ) -> Result<Vec<Accelerator>, SandboxError> {
-    let output = Command::new(qemu_bin)
-        .args(["-accel", "help"])
-        .output()
-        .map_err(|err| classify_launch_error(qemu_bin, &err))?;
+    let args = [OsString::from("-accel"), OsString::from("help")];
+    let output = crate::process::run_confined_command_bounded(
+        qemu_bin,
+        &args,
+         std::time::Duration::from_secs(15),
+        256 * 1024,
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

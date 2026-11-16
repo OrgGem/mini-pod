@@ -1,6 +1,7 @@
 //! Layer 3 adapter implementing [`DiskOverlayPort`] atop signed Portable Runtime Bundles
 //! and atomic QCOW2 Copy-on-Write overlays.
 
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -10,15 +11,27 @@ use sandbox_runtime::{DiskOverlayPort, PreparedOverlay};
 
 use crate::crypto::BundleVerifier;
 use crate::installer::{check_regular_file_path, map_fs_error, verify_installed_bundle};
-use crate::qcow2::create_qcow2_overlay_atomic;
+use crate::qcow2::{create_qcow2_overlay_atomic_with_runner, HelperCommandRunner};
 
 /// [`DiskOverlayPort`] implementation backed by an Ed25519-verified Portable Runtime Bundle
 /// and `qemu-img` Copy-on-Write QCOW2 overlays.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BundleOverlayStore {
     bundle_dir: PathBuf,
     verifier: BundleVerifier,
     qemu_img_bin: PathBuf,
+    command_runner: Option<HelperCommandRunner>,
+}
+
+impl fmt::Debug for BundleOverlayStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BundleOverlayStore")
+            .field("bundle_dir", &self.bundle_dir)
+            .field("verifier", &self.verifier)
+            .field("qemu_img_bin", &self.qemu_img_bin)
+            .field("has_command_runner", &self.command_runner.is_some())
+            .finish()
+    }
 }
 
 impl BundleOverlayStore {
@@ -28,8 +41,31 @@ impl BundleOverlayStore {
         verifier: BundleVerifier,
         qemu_img_bin: impl Into<PathBuf>,
     ) -> Result<Self, SandboxError> {
-        let bundle_dir = bundle_dir.into();
-        let qemu_img_bin = qemu_img_bin.into();
+        Self::new_inner(bundle_dir.into(), verifier, qemu_img_bin.into(), None)
+    }
+
+    /// Creates an overlay store executing `qemu-img` via a confined [`HelperCommandRunner`]
+    /// (such as a Win32 Job Object + handle whitelist runner injected from `sandbox-vmm`).
+    pub fn with_command_runner(
+        bundle_dir: impl Into<PathBuf>,
+        verifier: BundleVerifier,
+        qemu_img_bin: impl Into<PathBuf>,
+        command_runner: HelperCommandRunner,
+    ) -> Result<Self, SandboxError> {
+        Self::new_inner(
+            bundle_dir.into(),
+            verifier,
+            qemu_img_bin.into(),
+            Some(command_runner),
+        )
+    }
+
+    fn new_inner(
+        bundle_dir: PathBuf,
+        verifier: BundleVerifier,
+        qemu_img_bin: PathBuf,
+        command_runner: Option<HelperCommandRunner>,
+    ) -> Result<Self, SandboxError> {
         if bundle_dir.as_os_str().is_empty() {
             return Err(SandboxError::InvalidSpec(
                 "bundle_dir cannot be empty".to_owned(),
@@ -44,6 +80,7 @@ impl BundleOverlayStore {
             bundle_dir,
             verifier,
             qemu_img_bin,
+            command_runner,
         })
     }
 
@@ -79,6 +116,7 @@ impl DiskOverlayPort for BundleOverlayStore {
         let bundle_dir = self.bundle_dir.clone();
         let verifier = self.verifier.clone();
         let qemu_img_bin = self.qemu_img_bin.clone();
+        let command_runner = self.command_runner.clone();
         let overlay_path = work_dir.join("overlay.qcow2");
         let virtual_disk_mb = spec.budget.virtual_disk_mb;
         let host_budget_bytes = u64::from(spec.budget.host_storage_budget_mb) * 1024 * 1024;
@@ -87,11 +125,12 @@ impl DiskOverlayPort for BundleOverlayStore {
             let installed = verify_installed_bundle(&bundle_dir, &verifier)?;
             let base_rootfs = installed.base_rootfs_qcow2_path();
 
-            create_qcow2_overlay_atomic(
+            create_qcow2_overlay_atomic_with_runner(
                 &qemu_img_bin,
                 &base_rootfs,
                 &overlay_path,
                 Some(virtual_disk_mb),
+                command_runner.as_ref(),
             )?;
 
             let meta = fs::symlink_metadata(&overlay_path).map_err(|err| {
@@ -304,5 +343,78 @@ mod tests {
             store.remove_overlay(&dir).await,
             Err(SandboxError::PolicyViolation(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn prepare_overlay_invokes_injected_confined_command_runner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use crate::qcow2::HelperCommandOutput;
+
+        let tmp = TempDir::new("custom-runner");
+        let bundle_dir = tmp.path().join("bundle");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let secret = [0x55u8; 32];
+        write_signed_test_bundle(&bundle_dir, &secret);
+        let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let store = BundleOverlayStore::with_command_runner(
+            &bundle_dir,
+            verifier,
+            "confined-qemu-img",
+            Arc::new(move |prog, args, _timeout| {
+                calls_ref.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(prog, Path::new("confined-qemu-img"));
+                assert!(args.iter().any(|a| a == "create"));
+                Ok(HelperCommandOutput {
+                    success: false,
+                    status_label: "simulated-failure".to_owned(),
+                    stdout: Vec::new(),
+                    stderr: b"confined runner invoked".to_vec(),
+                })
+            }),
+        )
+        .unwrap();
+
+        let mut fake_qcow2 = vec![0u8; 72];
+        fake_qcow2[0..4].copy_from_slice(&0x5146_49fb_u32.to_be_bytes());
+        fake_qcow2[4..8].copy_from_slice(&3u32.to_be_bytes());
+        fake_qcow2[24..32].copy_from_slice(&(64u64 * 1024 * 1024).to_be_bytes());
+        let rootfs_path = bundle_dir.join("rootfs").join("base.qcow2");
+        fs::write(&rootfs_path, &fake_qcow2).unwrap();
+
+        let manifest_path = bundle_dir.join(MANIFEST_FILENAME);
+        let old_manifest =
+            BundleManifest::parse_untrusted(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let (sha256, size_bytes) = sha256_reader(&mut Cursor::new(&fake_qcow2)).unwrap();
+        let mut updated_entries = old_manifest.entries;
+        for entry in &mut updated_entries {
+            if entry.rel_path == "rootfs/base.qcow2" {
+                entry.sha256 = sha256;
+                entry.size_bytes = size_bytes;
+            }
+        }
+        let new_manifest = BundleManifest {
+            entries: updated_entries,
+            ..old_manifest
+        };
+        let encoded = new_manifest.encode_canonical().unwrap();
+        fs::write(&manifest_path, &encoded).unwrap();
+        fs::write(
+            bundle_dir.join(SIGNATURE_FILENAME),
+            sign_manifest_hex(&secret, encoded.as_bytes()),
+        )
+        .unwrap();
+
+        let err = store
+            .prepare_overlay(&SandboxId::new("sb-run"), &test_spec(128, 256), &work_dir)
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(err.to_string().contains("confined runner invoked"), "unexpected err: {err}");
     }
 }

@@ -19,5 +19,6 @@ pub use manifest::{
     MAX_MANIFEST_BYTES, SIGNATURE_FILENAME,
 };
 pub use qcow2::{
-    clean_qemu_host_path, create_qcow2_overlay_atomic, inspect_qcow2_header, Qcow2HeaderInfo,
+    clean_qemu_host_path, create_qcow2_overlay_atomic, create_qcow2_overlay_atomic_with_runner,
+    inspect_qcow2_header, HelperCommandOutput, HelperCommandRunner, Qcow2HeaderInfo,
 };

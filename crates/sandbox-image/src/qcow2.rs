@@ -1,9 +1,12 @@
 //! QCOW2 header inspection, QEMU-safe host path cleaning, and atomic CoW overlay creation.
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 use sandbox_core::SandboxError;
 
@@ -14,6 +17,21 @@ use crate::installer::{
 
 const QCOW2_MAGIC: u32 = 0x5146_49fb; // "QFI\xfb"
 const QCOW2_V2_MIN_HEADER_BYTES: usize = 72;
+const QEMU_IMG_CREATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Exit status and captured output from an external `qemu-img` invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelperCommandOutput {
+    pub success: bool,
+    pub status_label: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Driven callback executing `qemu-img` inside OS process confinement (e.g. Win32 Job Object +
+/// handle whitelist + timeout) injected by the outer composition root.
+pub type HelperCommandRunner =
+    Arc<dyn Fn(&Path, &[OsString], Duration) -> Result<HelperCommandOutput, SandboxError> + Send + Sync>;
 
 /// Parsed fields from the big-endian header of a QCOW2 disk image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +148,24 @@ pub fn create_qcow2_overlay_atomic(
     overlay_path: &Path,
     virtual_disk_mb: Option<u32>,
 ) -> Result<Qcow2HeaderInfo, SandboxError> {
+    create_qcow2_overlay_atomic_with_runner(
+        qemu_img_bin,
+        base_qcow2,
+        overlay_path,
+        virtual_disk_mb,
+        None,
+    )
+}
+
+/// Same as [`create_qcow2_overlay_atomic`], executing `qemu-img` through an optional confined
+/// [`HelperCommandRunner`] injected by the composition root.
+pub fn create_qcow2_overlay_atomic_with_runner(
+    qemu_img_bin: &Path,
+    base_qcow2: &Path,
+    overlay_path: &Path,
+    virtual_disk_mb: Option<u32>,
+    runner: Option<&HelperCommandRunner>,
+) -> Result<Qcow2HeaderInfo, SandboxError> {
     let base_info = inspect_qcow2_header(base_qcow2)?;
     if base_info.backing_file_offset != 0 || base_info.backing_file_size != 0 {
         return Err(SandboxError::PolicyViolation(format!(
@@ -191,23 +227,41 @@ pub fn create_qcow2_overlay_atomic(
     let clean_tmp_overlay = clean_qemu_host_path(&tmp_overlay)?;
     let mut tmp_guard = TempFileGuard::new(clean_tmp_overlay.clone());
 
-    let mut cmd = Command::new(qemu_img_bin);
-    cmd.args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
-        .arg(&clean_base)
-        .arg(&clean_tmp_overlay);
+    let mut args: Vec<OsString> = vec![
+        OsString::from("create"),
+        OsString::from("-f"),
+        OsString::from("qcow2"),
+        OsString::from("-F"),
+        OsString::from("qcow2"),
+        OsString::from("-b"),
+        clean_base.as_os_str().to_os_string(),
+        clean_tmp_overlay.as_os_str().to_os_string(),
+    ];
     if let Some(mb) = virtual_disk_mb {
-        cmd.arg(format!("{mb}M"));
+        args.push(OsString::from(format!("{mb}M")));
     }
 
-    let output = cmd
-        .output()
-        .map_err(|err| classify_qemu_img_error(qemu_img_bin, &err))?;
-    if !output.status.success() {
+    let output = match runner {
+        Some(run) => run(qemu_img_bin, &args, QEMU_IMG_CREATE_TIMEOUT)?,
+        None => {
+            let raw = Command::new(qemu_img_bin)
+                .args(&args)
+                .output()
+                .map_err(|err| classify_qemu_img_error(qemu_img_bin, &err))?;
+            HelperCommandOutput {
+                success: raw.status.success(),
+                status_label: raw.status.to_string(),
+                stdout: raw.stdout,
+                stderr: raw.stderr,
+            }
+        }
+    };
+    if !output.success {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(SandboxError::Internal(format!(
             "qemu-img create failed with status {} (stderr='{}', stdout='{}')",
-            output.status,
+            output.status_label,
             stderr.trim(),
             stdout.trim()
         )));
