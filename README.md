@@ -457,6 +457,13 @@ Security policies enforced automatically by `sandbox-docker-compat`:
 | `sandbox_copy_out` | Safely copy and extract a guest file/directory to the host (`src_guest`, `dst_host`). |
 | `sandbox_destroy` | Idempotently destroy a sandbox and verify `AllResourcesCleaned`. |
 
+### 7.3 Bundled Agent Skill (`skills/sandbox-cli`)
+
+For CLI-driven coding agents (Antigravity, Claude Code, Cursor, Codex), a minimal progressive-disclosure skill is provided at [`skills/sandbox-cli/SKILL.md`](skills/sandbox-cli/SKILL.md) (with container/daemon details in [`skills/sandbox-cli/references/containers-and-daemon.md`](skills/sandbox-cli/references/containers-and-daemon.md)).
+
+- **Antigravity (`skills.json`):** Add `{ "entries": [{ "path": "skills" }] }` to `.agents/skills.json`.
+- **Standalone / `npx skills`:** Copy `skills/sandbox-cli` into `.agents/skills/sandbox-cli` (or run `npx skills add OrgGem/mini-pod`).
+
 ---
 
 ## 8. Rust SDK Usage (`sandbox-client`)
