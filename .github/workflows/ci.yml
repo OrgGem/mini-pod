@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check sandbox-core with no default features
+        run: cargo check -p sandbox-core --no-default-features --locked
+
+      - name: Run Clippy across all workspace targets
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run unit and component test suite
+        run: cargo test --workspace --locked
+
+  guest-linux-musl:
+    name: Guest Static Musl Check & Test (rust:alpine)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run clippy and unit tests for tiny-init and sandbox-agent in pinned rust:alpine
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/src:ro" \
+            rust:alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 \
+            sh -euxc "apk add --no-cache musl-dev >/dev/null && \
+              rustup component add clippy >/dev/null && \
+              cargo clippy --manifest-path /src/Cargo.toml --locked -p sandbox-agent -p tiny-init --all-targets --target-dir /tmp/cargo-target -- -D warnings && \
+              cargo test --manifest-path /src/Cargo.toml --locked -p sandbox-agent -p tiny-init --target-dir /tmp/cargo-target"

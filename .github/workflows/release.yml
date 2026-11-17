@@ -1,0 +1,240 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for archive filenames when triggered manually (e.g. v0.1.0-rc2)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-host:
+    name: Host Binaries (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin_ext: .exe
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin_ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            bin_ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin_ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin_ext: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries (sandboxd, sandbox-cli, bundle-pack)
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} \
+            -p sandboxd \
+            -p sandbox-cli \
+            -p sandbox-image \
+            --bins
+
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${INPUT_VERSION:-dev}"
+          fi
+          STAGE_DIR="mini-pod-${VERSION}-${TARGET}"
+          mkdir -p "${STAGE_DIR}" dist
+          cp "target/${TARGET}/release/sandboxd" "${STAGE_DIR}/"
+          cp "target/${TARGET}/release/sandbox-cli" "${STAGE_DIR}/"
+          cp "target/${TARGET}/release/bundle-pack" "${STAGE_DIR}/"
+          chmod 0755 "${STAGE_DIR}/sandboxd" "${STAGE_DIR}/sandbox-cli" "${STAGE_DIR}/bundle-pack"
+          cp README.md BRD.md docs/release-candidate-v0.1.0.md "${STAGE_DIR}/"
+
+          ARCHIVE_NAME="${STAGE_DIR}.tar.gz"
+          tar -czf "dist/${ARCHIVE_NAME}" "${STAGE_DIR}"
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+            else
+              shasum -a 256 "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+            fi
+          )
+
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            $Version = $env:GITHUB_REF_NAME
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
+            $Version = $env:INPUT_VERSION
+          } else {
+            $Version = "dev"
+          }
+          $StageDir = "mini-pod-$Version-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          Copy-Item "target\$env:TARGET\release\sandboxd.exe" "$StageDir\"
+          Copy-Item "target\$env:TARGET\release\sandbox-cli.exe" "$StageDir\"
+          Copy-Item "target\$env:TARGET\release\bundle-pack.exe" "$StageDir\"
+          Copy-Item "README.md", "BRD.md", "docs\release-candidate-v0.1.0.md" "$StageDir\"
+
+          $ArchiveName = "$StageDir.zip"
+          $ArchivePath = Join-Path "dist" $ArchiveName
+          Compress-Archive -Path $StageDir -DestinationPath $ArchivePath -Force
+
+          $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            "$ArchivePath.sha256",
+            "$Hash  $ArchiveName`n",
+            (New-Object System.Text.UTF8Encoding($false))
+          )
+
+      - name: Upload host release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-guest-linux-musl:
+    name: Guest Static Musl Binaries (${{ matrix.guest_arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - guest_arch: x86_64
+            os: ubuntu-latest
+            platform: linux/amd64
+          - guest_arch: aarch64
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build static musl tiny-init and sandbox-agent in pinned rust:alpine
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          GUEST_ARCH: ${{ matrix.guest_arch }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${INPUT_VERSION:-dev}"
+          fi
+          STAGE_DIR="mini-pod-guest-bins-${VERSION}-${GUEST_ARCH}-linux-musl"
+          mkdir -p "${STAGE_DIR}" dist
+          chmod 0777 "${STAGE_DIR}"
+
+          docker run --rm --platform "${PLATFORM}" \
+            -v "${GITHUB_WORKSPACE}:/src:ro" \
+            -v "${GITHUB_WORKSPACE}/${STAGE_DIR}:/out" \
+            rust:alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 \
+            sh -euxc '
+              apk add --no-cache musl-dev file binutils >/dev/null
+              RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-Wl,--build-id=none" \
+                cargo build --manifest-path /src/Cargo.toml --locked \
+                --profile guest-release \
+                -p tiny-init \
+                -p sandbox-agent \
+                --target-dir /tmp/cargo-target
+              cp /tmp/cargo-target/guest-release/tiny-init /out/tiny-init
+              cp /tmp/cargo-target/guest-release/sandbox-agent /out/sandbox-agent
+              chmod 0755 /out/tiny-init /out/sandbox-agent
+              file /out/tiny-init /out/sandbox-agent
+            '
+
+          ARCHIVE_NAME="${STAGE_DIR}.tar.gz"
+          tar -czf "dist/${ARCHIVE_NAME}" "${STAGE_DIR}"
+          (
+            cd dist
+            sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          )
+
+      - name: Upload guest musl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-${{ matrix.guest_arch }}-linux-musl
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - build-host
+      - build-guest-linux-musl
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          cat *.sha256 | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/*.zip
+            release-assets/*.tar.gz
+            release-assets/*.sha256
+            release-assets/SHA256SUMS.txt

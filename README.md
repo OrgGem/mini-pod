@@ -12,7 +12,12 @@ Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with Ed25519-signed Po
 ## Table of Contents
 
 1. [Architecture (4-Layer Clean Workspace)](#1-architecture-4-layer-clean-workspace)
+   - [1.1 Target Use Cases & When Not to Use](#11-target-use-cases--when-not-to-use)
 2. [System Requirements & Installation](#2-system-requirements--installation)
+   - [2.1 Prerequisites](#21-prerequisites)
+   - [2.2 Download Prebuilt Release Binaries](#22-download-prebuilt-release-binaries)
+   - [2.3 Build & Install Binaries from Source](#23-build--install-binaries-from-source)
+   - [2.4 Quickstart Checklist (After Cloning)](#24-quickstart-checklist-after-cloning)
 3. [Building Signed Portable Runtime Bundles](#3-building-signed-portable-runtime-bundles)
 4. [Running the Daemon (`sandboxd serve`)](#4-running-the-daemon-sandboxd-serve)
 5. [CLI Usage Guide (`sandbox-cli`)](#5-cli-usage-guide-sandbox-cli)
@@ -58,6 +63,20 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 | [`bins/sandbox-cli`](bins/sandbox-cli) | 4 | CLI client (`status`, `spawn`, `exec`, `renew`, `copy-in`, `copy-out`, `docker-endpoint`, `destroy`). |
 | [`guest/tiny-init`](guest/tiny-init) & [`guest/sandbox-agent`](guest/sandbox-agent) | Guest | PID 1 read-only rootfs + overlay setup, zombie reaping, execution supervisor (per-exec cgroup v2 `cgroup.kill` + container exec process-tree termination on deadline or output budget), and Podman Unix socket relay. |
 
+### 1.1 Target Use Cases & When Not to Use
+
+| Target Use Case | Why `mini-pod` Fits |
+| --- | --- |
+| **1. AI Coding Agents & LLM Code Interpreters (`MCP` / Tool-Use)** | Isolates untrusted shell/Python/Node/build commands inside a dedicated guest kernel (`IsolationMode::VmRequired`), checks out pre-booted VMs from the Warm Pool in **`~3.5 ms` p50**, kills the entire guest process group/cgroup tree on `deadline` or `stdout`/`stderr` budget overflow, and defaults to zero-NIC `Isolated` networking or DNS-rebinding-safe `DomainAllowList` filtering via `HostEgressProxy`. |
+| **2. Unprivileged Testcontainers & CI Integration Testing** | Runs an isolated Podman daemon inside each micro-VM exposed via an owner-only `npipe://` (Windows) or `unix://` (Linux/macOS) Docker Engine API (`sandbox-docker-compat`), forwards published ports to Host `127.0.0.1`, supports the Testcontainers Ryuk reaper (`--allow-reaper-socket`), and rejects raw host bind mounts (`HostConfig.Binds`) and `--privileged` escalation. |
+| **3. Online Judges, Untrusted Plugin Runners & Ephemeral Build Jobs** | Enforces an explicit `copy-in` -> `exec` -> `copy-out` pipeline with strict tar validation (rejecting `..`, symlinks, hardlinks, and Windows NTFS junctions/reparse points), uses one-way disposable `qcow2` Copy-on-Write overlays (never recycling dirty VMs), and reaps orphaned VMs/files after crashes via durable journals. |
+| **4. Standard-User Enterprise Workstations (Windows / macOS / Linux)** | Runs without Administrator/root privileges or custom kernel drivers; confines host QEMU processes via Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + handle whitelist) or Unix process groups/cgroup v2, and restricts control/Docker IPC to the owner SID/UID. |
+
+**When NOT to Use `mini-pod` (Current MVP Scope & Post-MVP Deferrals):**
+- **High-volume, real-time bidirectional host/guest Live Mounts:** MVP uses explicit bounded `copy-in` / `copy-out` tar transfers (`16 MiB` default, configurable via `--max-copy-bytes`) instead of `virtiofs`/`9p` shared mounts to eliminate host symlink/TOCTOU attack surfaces.
+- **GPU passthrough or native Windows containers:** Guest micro-VMs run a minimal Linux kernel (`linux-virt`) with static musl userland and Podman/crun.
+- **External VM state/memory snapshots, Windows ARM64 hosts, and native macOS `Virtualization.framework`:** Explicitly deferred post-MVP per [BRD.md](BRD.md).
+
 ---
 
 ## 2. System Requirements & Installation
@@ -89,7 +108,14 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 3. **Docker (Optional — only required when building guest bundles from source):**
    - Needed to run `scripts/build-portable-bundles.ps1` and `scripts/build-test-oci-images.ps1`.
 
-### 2.2 Build & Install Binaries from Source
+### 2.2 Download Prebuilt Release Binaries
+
+Prebuilt archives containing `sandboxd`, `sandbox-cli`, and `bundle-pack` (along with `SHA256SUMS.txt` and static `linux-musl` guest binaries) are built automatically by [`.github/workflows/release.yml`](.github/workflows/release.yml) and published on [GitHub Releases](https://github.com/OrgGem/mini-pod/releases) for:
+- **Windows (`x86_64`):** `mini-pod-<version>-x86_64-pc-windows-msvc.zip`
+- **Linux (`x86_64` / `aarch64`):** `mini-pod-<version>-x86_64-unknown-linux-gnu.tar.gz`, `mini-pod-<version>-aarch64-unknown-linux-gnu.tar.gz`
+- **macOS (`x86_64` / `aarch64`):** `mini-pod-<version>-x86_64-apple-darwin.tar.gz`, `mini-pod-<version>-aarch64-apple-darwin.tar.gz`
+
+### 2.3 Build & Install Binaries from Source
 
 Clone the repository and build the workspace in release mode:
 
@@ -112,6 +138,23 @@ Or install directly into `~/.cargo/bin`:
 cargo install --path bins/sandboxd
 cargo install --path bins/sandbox-cli
 ```
+
+### 2.4 Quickstart Checklist (After Cloning)
+
+1. **Install QEMU (`qemu-system-*` & `qemu-img`)** and enable hardware acceleration (`WHPX` on Windows, `/dev/kvm` on Linux, `HVF` on macOS).
+2. **Build host binaries:** `cargo build --release --bins`
+3. **Generate signed Portable Runtime Bundle:** `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1` (creates `.cache/keys/dev-bundle.pub` and `.cache/bundles-src/x86_64`).
+4. **Start daemon (Terminal 1):**
+   ```powershell
+   .\target\release\sandboxd.exe serve --bundle-dir .cache\bundles-src\x86_64 --pub-key-file .cache\keys\dev-bundle.pub --state-dir "$env:LOCALAPPDATA\minipod\state" --warm-pool-size 1
+   ```
+5. **Run a sandbox command (Terminal 2):**
+   ```powershell
+   .\target\release\sandbox-cli.exe --json status
+   .\target\release\sandbox-cli.exe --json spawn --rss-mb 512 --ttl-secs 300
+   .\target\release\sandbox-cli.exe exec <SANDBOX_ID> -- /bin/uname -a
+   .\target\release\sandbox-cli.exe destroy <SANDBOX_ID>
+   ```
 
 ---
 
