@@ -29,6 +29,7 @@ GLOBAL OPTIONS:
 SUBCOMMANDS:
     status
     list
+    tui [--refresh-ms <N>]
     spawn [OPTIONS]
         --isolation <vm|shared-kernel>
         --accel <required|preferred|software>
@@ -75,6 +76,9 @@ pub enum CliOutcome {
 pub enum CliCommand {
     Status,
     List,
+    Tui {
+        refresh_interval: Duration,
+    },
     Spawn(SandboxSpec),
     Exec {
         id: SandboxId,
@@ -174,6 +178,18 @@ where
                 true => return Ok(CliOutcome::Help(USAGE_TEXT)),
                 false => CliCommand::List,
             }
+        }
+        "tui" => {
+            if check_help_in_rest(rest) {
+                return Ok(CliOutcome::Help(USAGE_TEXT));
+            }
+            let refresh_interval = parse_tui(rest, &mut endpoint_raw, &mut json_output)?;
+            if json_output {
+                return Err(SandboxError::InvalidSpec(
+                    "--json is not supported with interactive 'tui'".to_owned(),
+                ));
+            }
+            CliCommand::Tui { refresh_interval }
         }
         "spawn" => {
             if check_help_in_rest(rest) {
@@ -292,6 +308,41 @@ fn parse_no_args_subcommand(
         i += 1;
     }
     Ok(())
+}
+
+fn parse_tui(
+    rest: &[String],
+    endpoint_raw: &mut Option<String>,
+    json_output: &mut bool,
+) -> Result<Duration, SandboxError> {
+    let mut refresh_ms: u64 = 1000;
+    let mut i = 0usize;
+    while i < rest.len() {
+        if try_consume_global_flag(rest, &mut i, endpoint_raw, json_output)? {
+            i += 1;
+            continue;
+        }
+        let arg = rest[i].as_str();
+        let (flag, inline_val) = split_flag(arg);
+        match flag {
+            "--refresh-ms" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                refresh_ms = parse_int(&raw, flag)?;
+                if refresh_ms < 100 {
+                    return Err(SandboxError::InvalidSpec(
+                        "--refresh-ms must be at least 100".to_owned(),
+                    ));
+                }
+            }
+            other => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "unknown option '{other}' for 'tui'"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(Duration::from_millis(refresh_ms))
 }
 
 fn parse_spawn(
@@ -1014,6 +1065,9 @@ pub async fn execute_with_client(
             }
             Ok(0)
         }
+        CliCommand::Tui { refresh_interval } => {
+            crate::tui::run_tui(client, refresh_interval).await
+        }
         CliCommand::Spawn(spec) => {
             let lease = client.spawn(spec).await?;
             if json_mode {
@@ -1499,6 +1553,36 @@ mod tests {
                 id: SandboxId::new("sb-42"),
             }
         );
+
+        let CliOutcome::Run(tui_default) = parse_args_with(&args(&["tui"]), no_env).unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            tui_default.command,
+            CliCommand::Tui {
+                refresh_interval: Duration::from_millis(1000),
+            }
+        );
+
+        let CliOutcome::Run(tui_fast) =
+            parse_args_with(&args(&["tui", "--refresh-ms", "250"]), no_env).unwrap()
+        else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            tui_fast.command,
+            CliCommand::Tui {
+                refresh_interval: Duration::from_millis(250),
+            }
+        );
+        assert!(matches!(
+            parse_args_with(&args(&["tui", "--refresh-ms", "50"]), no_env),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            parse_args_with(&args(&["--json", "tui"]), no_env),
+            Err(SandboxError::InvalidSpec(_))
+        ));
     }
 
     #[test]

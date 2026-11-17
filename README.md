@@ -148,10 +148,13 @@ cargo install --path bins/sandbox-cli
    ```powershell
    .\target\release\sandboxd.exe serve --bundle-dir .cache\bundles-src\x86_64 --pub-key-file .cache\keys\dev-bundle.pub --state-dir "$env:LOCALAPPDATA\minipod\state" --warm-pool-size 1
    ```
-5. **Run a sandbox command (Terminal 2):**
+5. **Run a sandbox command or open the interactive TUI (Terminal 2):**
    ```powershell
+   .\target\release\sandbox-cli.exe tui
+   # Or scriptable CLI commands:
    .\target\release\sandbox-cli.exe --json status
    .\target\release\sandbox-cli.exe --json spawn --rss-mb 512 --ttl-secs 300
+   .\target\release\sandbox-cli.exe list
    .\target\release\sandbox-cli.exe exec <SANDBOX_ID> -- /bin/uname -a
    .\target\release\sandbox-cli.exe destroy <SANDBOX_ID>
    ```
@@ -264,12 +267,41 @@ cargo run --release -p sandbox-image --bin bundle-pack -- \
 
 `sandbox-cli` connects to `sandboxd` over the default owner-only endpoint (or `--endpoint <URI>` / `MINIPOD_ENDPOINT`). Add `--json` to any command for structured JSON output.
 
-### 5.1 Check Daemon Status
+### 5.1 Check Daemon Status & List Active Sandboxes
 
 ```bash
 sandbox-cli status
 sandbox-cli --json status
+
+sandbox-cli list
+sandbox-cli --json list
 ```
+
+### 5.1b Interactive Container Sandbox Console (`sandbox-cli tui`)
+
+Launch the full-screen keyboard-driven terminal dashboard for live sandbox VM and guest Podman container administration:
+
+```bash
+sandbox-cli tui
+sandbox-cli tui --refresh-ms 500
+```
+
+| Key | Scope | Action |
+| --- | --- | --- |
+| `Tab` / `Shift+Tab` / `1-3` | Global | Switch focus between **Sandboxes**, **Guest Containers**, and **Output & Activity Log** |
+| `s` | Sandboxes | Spawn a sandbox (`[1]` Warm-Pool Isolated, `[2]` Container Isolated, `[3]` Container + Internet) |
+| `r` | Sandboxes | Renew selected sandbox lease (`+300s`) |
+| `d` | Sandboxes | Bind & display owner-only `DOCKER_HOST` endpoint (`Standard` or `Testcontainers` mode) |
+| `e` | Sandboxes | Execute a shell command inside the selected Guest VM |
+| `D` / `Del` | Sandboxes | Destroy selected sandbox (with `y/n` confirmation) |
+| `c` / `Enter` | Containers | Inspect/refresh `podman ps -a` inside the selected sandbox |
+| `i` | Containers | Stream a host OCI `.tar` archive (`docker save` / `podman save`) into air-gapped guest `podman load` |
+| `n` | Containers | Run a new detached container (`podman run -d ...`) |
+| `x` | Containers | Execute a command directly inside the selected container (`ExecTarget::Container`) |
+| `l` | Containers | Tail container logs (`podman logs --tail 100`) into Output pane |
+| `S` | Containers | Start or Stop the selected container |
+| `X` / `Del` | Containers | Force-remove the selected container (with `y/n` confirmation) |
+| `R` / `?` / `q` | Global | Force refresh / Toggle keyboard help / Quit cleanly |
 
 ### 5.2 Spawn a Micro-VM Sandbox
 

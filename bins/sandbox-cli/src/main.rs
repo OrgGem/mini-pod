@@ -2,6 +2,7 @@
 //! Layer 4 CLI composition root: user commands routed through `sandbox-client`.
 
 mod cli;
+mod tui;
 
 use std::process::ExitCode;
 

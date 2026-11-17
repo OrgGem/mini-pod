@@ -491,6 +491,23 @@ async fn e2e_sandbox_cli_full_command_suite_and_tcp_rejection() {
         "expected policy diagnostic on plain tcp rejection, got: {bad_err}"
     );
 
+    // 9. Interactive TUI invoked without a TTY must fail fast cleanly without hanging.
+    let non_tty_tui = run_cli(vec![
+        "--endpoint".into(),
+        endpoint_arg.clone(),
+        "tui".into(),
+    ])
+    .await;
+    assert!(
+        !non_tty_tui.status.success(),
+        "tui without TTY must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&non_tty_tui.stderr).contains("interactive terminal"),
+        "expected interactive terminal diagnostic, got: {}",
+        String::from_utf8_lossy(&non_tty_tui.stderr)
+    );
+
     let _ = shutdown_tx.send(true);
     server_task.await.expect("join mock server task");
 }
