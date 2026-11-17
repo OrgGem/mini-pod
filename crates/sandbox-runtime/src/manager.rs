@@ -399,62 +399,52 @@ impl LocalRuntimeManager {
     /// Returns a deterministically sorted snapshot of all active sandboxes without holding the
     /// active-map mutex across OS process/RSS probes.
     pub fn list_active_sandboxes(&self) -> Vec<ActiveSandboxSummary> {
+        struct RawSandboxEntry {
+            id: SandboxId,
+            session: Arc<dyn VmSessionPort>,
+            network: NetworkPolicy,
+            expires_at: Instant,
+            reserved_rss_mb: u64,
+            host_rss_budget_mb: Option<u32>,
+            host_storage_budget_mb: u32,
+        }
+
         let now = Instant::now();
-        let raw_entries: Vec<(
-            SandboxId,
-            Arc<dyn VmSessionPort>,
-            NetworkPolicy,
-            Instant,
-            u64,
-            Option<u32>,
-            u32,
-        )> = {
+        let raw_entries: Vec<RawSandboxEntry> = {
             let active = lock_unpoisoned(&self.active);
             active
                 .iter()
-                .map(|(id, entry)| {
-                    (
-                        id.clone(),
-                        Arc::clone(&entry.session),
-                        entry.network_policy.clone(),
-                        entry.expires_at,
-                        entry.reserved_rss_mb,
-                        entry.host_rss_budget_mb,
-                        entry.host_storage_budget_mb,
-                    )
+                .map(|(id, entry)| RawSandboxEntry {
+                    id: id.clone(),
+                    session: Arc::clone(&entry.session),
+                    network: entry.network_policy.clone(),
+                    expires_at: entry.expires_at,
+                    reserved_rss_mb: entry.reserved_rss_mb,
+                    host_rss_budget_mb: entry.host_rss_budget_mb,
+                    host_storage_budget_mb: entry.host_storage_budget_mb,
                 })
                 .collect()
         };
 
         let mut summaries: Vec<ActiveSandboxSummary> = raw_entries
             .into_iter()
-            .map(
-                |(
-                    id,
-                    session,
-                    network,
-                    expires_at,
-                    reserved_rss_mb,
-                    host_rss_budget_mb,
-                    host_storage_budget_mb,
-                )| {
-                    let remaining_ttl_ms = u64::try_from(
-                        expires_at.saturating_duration_since(now).as_millis(),
-                    )
-                    .unwrap_or(u64::MAX);
-                    ActiveSandboxSummary {
-                        id,
-                        pid: session.pid(),
-                        alive: session.is_alive(),
-                        network,
-                        remaining_ttl_ms,
-                        live_rss_bytes: session.current_rss_bytes(),
-                        reserved_rss_mb,
-                        host_rss_budget_mb,
-                        host_storage_budget_mb,
-                    }
-                },
-            )
+            .map(|raw| {
+                let remaining_ttl_ms = u64::try_from(
+                    raw.expires_at.saturating_duration_since(now).as_millis(),
+                )
+                .unwrap_or(u64::MAX);
+                ActiveSandboxSummary {
+                    id: raw.id,
+                    pid: raw.session.pid(),
+                    alive: raw.session.is_alive(),
+                    network: raw.network,
+                    remaining_ttl_ms,
+                    live_rss_bytes: raw.session.current_rss_bytes(),
+                    reserved_rss_mb: raw.reserved_rss_mb,
+                    host_rss_budget_mb: raw.host_rss_budget_mb,
+                    host_storage_budget_mb: raw.host_storage_budget_mb,
+                }
+            })
             .collect();
         summaries.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         summaries

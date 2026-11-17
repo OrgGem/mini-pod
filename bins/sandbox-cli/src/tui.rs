@@ -397,6 +397,7 @@ pub struct TuiApp {
     pub output_scroll_from_bottom: usize,
     pub modal: Option<Modal>,
     pub busy_label: Option<String>,
+    pub pending_select_sandbox: Option<SandboxId>,
     pub poll_in_flight: bool,
     pub should_quit: bool,
 }
@@ -417,6 +418,7 @@ impl TuiApp {
             output_scroll_from_bottom: 0,
             modal: None,
             busy_label: None,
+            pending_select_sandbox: None,
             poll_in_flight: false,
             should_quit: false,
         };
@@ -960,11 +962,20 @@ impl TuiApp {
                             })
                         }
                         PromptKind::LoadImageTar { sandbox_id } => {
+                            let unquoted = trimmed
+                                .trim_matches('"')
+                                .trim_matches('\'')
+                                .trim()
+                                .to_owned();
+                            if unquoted.is_empty() {
+                                self.push_log(LogTone::Warn, "Archive path was empty; cancelled.");
+                                return None;
+                            }
                             self.busy_label =
                                 Some(format!("Streaming OCI image tar into {sandbox_id}..."));
                             Some(TuiCommand::LoadImageTar {
                                 sandbox_id,
-                                host_tar_path: PathBuf::from(trimmed),
+                                host_tar_path: PathBuf::from(unquoted),
                             })
                         }
                     }
@@ -1026,8 +1037,9 @@ impl TuiApp {
                         .retain(|k, _| live_ids.contains(k));
                     self.container_errors.retain(|k, _| live_ids.contains(k));
                     self.sandboxes = list;
-                    if let Some(prev_id) = prev_selected_id {
-                        if let Some(pos) = self.sandboxes.iter().position(|s| s.id == prev_id) {
+                    let preferred_id = self.pending_select_sandbox.take().or(prev_selected_id);
+                    if let Some(target_id) = preferred_id {
+                        if let Some(pos) = self.sandboxes.iter().position(|s| s.id == target_id) {
                             self.selected_sandbox = pos;
                         }
                     }
@@ -1075,6 +1087,8 @@ impl TuiApp {
                 if let Some(target_id) = select_sandbox {
                     if let Some(pos) = self.sandboxes.iter().position(|s| s.id == target_id) {
                         self.selected_sandbox = pos;
+                    } else {
+                        self.pending_select_sandbox = Some(target_id);
                     }
                 }
                 if refresh_all {
@@ -1631,6 +1645,15 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal, root: Rect) {
                 .borders(Borders::ALL)
                 .title(prompt.kind.title())
                 .border_style(Style::default().fg(Color::Yellow));
+            let avail = usize::from(area.width.saturating_sub(5)).max(1);
+            let scroll_chars = prompt.cursor_chars.saturating_sub(avail.saturating_sub(1));
+            let visible_input: String = prompt
+                .input
+                .chars()
+                .skip(scroll_chars)
+                .take(avail)
+                .collect();
+            let cursor_offset = (prompt.cursor_chars - scroll_chars) as u16;
             let lines = vec![
                 Line::from(Span::styled(
                     prompt.kind.hint(),
@@ -1639,7 +1662,7 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal, root: Rect) {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("> ", Style::default().fg(Color::Yellow)),
-                    Span::raw(prompt.input.clone()),
+                    Span::raw(visible_input),
                 ]),
                 Line::from(Span::styled(
                     "[Enter] Run   [Esc] Cancel",
@@ -1648,12 +1671,7 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal, root: Rect) {
             ];
             f.render_widget(Paragraph::new(lines).block(block), area);
 
-            let prefix_cols = prompt
-                .input
-                .chars()
-                .take(prompt.cursor_chars)
-                .count() as u16;
-            let cx = (area.x + 3 + prefix_cols).min(area.x + area.width.saturating_sub(2));
+            let cx = (area.x + 3 + cursor_offset).min(area.x + area.width.saturating_sub(2));
             let cy = area.y + 3;
             if cy < area.y + area.height {
                 f.set_cursor_position((cx, cy));
@@ -2149,12 +2167,14 @@ fn dispatch_tui_command(
                         "stop".to_owned(),
                         "-t".to_owned(),
                         "3".to_owned(),
+                        "--".to_owned(),
                         container_id.clone(),
                     ]
                 } else {
                     vec![
                         "/usr/bin/podman".to_owned(),
                         "start".to_owned(),
+                        "--".to_owned(),
                         container_id.clone(),
                     ]
                 };
@@ -2178,6 +2198,7 @@ fn dispatch_tui_command(
                     "logs".to_owned(),
                     "--tail".to_owned(),
                     "100".to_owned(),
+                    "--".to_owned(),
                     container_id.clone(),
                 ];
                 let req = build_exec_req(ExecTarget::Guest, argv, 20);
@@ -2198,6 +2219,7 @@ fn dispatch_tui_command(
                     "/usr/bin/podman".to_owned(),
                     "rm".to_owned(),
                     "-f".to_owned(),
+                    "--".to_owned(),
                     container_id.clone(),
                 ];
                 let req = build_exec_req(ExecTarget::Guest, argv, 30);
@@ -2515,5 +2537,45 @@ f6e5d4c3b2a1\tjob-1\talpine:3.20\texited\tExited (0) 3 minutes ago\t
         let small_backend = TestBackend::new(72, 22);
         let mut small_term = Terminal::new(small_backend).unwrap();
         small_term.draw(|f| draw_ui(f, &app)).unwrap();
+        app.handle_event(press(KeyCode::Esc));
+
+        //Quoted path in LoadImageTar ('i') strips Explorer surrounding quotes cleanly.
+        app.handle_event(press(KeyCode::Char('i')));
+        for ch in "\"D:\\images\\echo.tar\"".chars() {
+            app.handle_event(press(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            app.handle_event(press(KeyCode::Enter)),
+            Some(TuiCommand::LoadImageTar {
+                sandbox_id: SandboxId::new("sb-ctr-1"),
+                host_tar_path: PathBuf::from(r"D:\images\echo.tar"),
+            })
+        );
+
+        // Newly spawned sandbox ID in ActionFinished is selected once the next Snapshot arrives.
+        let follow_up = app.apply_bg_event(BgEvent::ActionFinished {
+            busy_done: true,
+            headline: OutputLine {
+                tone: LogTone::Success,
+                text: "spawned".to_owned(),
+            },
+            stdout: String::new(),
+            stderr: String::new(),
+            refresh_all: true,
+            refresh_containers_for: None,
+            select_sandbox: Some(SandboxId::new("sb-ctr-2")),
+        });
+        assert!(matches!(follow_up, Some(TuiCommand::RefreshAll { .. })));
+        app.apply_bg_event(BgEvent::Snapshot {
+            status: Ok(DaemonStatusInfo {
+                active_sandboxes: 2,
+                warm_ready_vms: 0,
+                effective_host_rss_mb: 768,
+                reserved_host_storage_mb: 3072,
+                version: "0.1.0".to_owned(),
+            }),
+            sandboxes: Ok(vec![sample_sandbox("sb-ctr-1"), sample_sandbox("sb-ctr-2")]),
+        });
+        assert_eq!(app.selected_sandbox, 1);
     }
 }
