@@ -28,6 +28,7 @@ GLOBAL OPTIONS:
 
 SUBCOMMANDS:
     status
+    list
     spawn [OPTIONS]
         --isolation <vm|shared-kernel>
         --accel <required|preferred|software>
@@ -73,6 +74,7 @@ pub enum CliOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     Status,
+    List,
     Spawn(SandboxSpec),
     Exec {
         id: SandboxId,
@@ -160,10 +162,17 @@ where
 
     let command = match subcmd {
         "status" => {
-            parse_no_args_subcommand(rest, &mut endpoint_raw, &mut json_output)?;
+            parse_no_args_subcommand(rest, "status", &mut endpoint_raw, &mut json_output)?;
             match check_help_in_rest(rest) {
                 true => return Ok(CliOutcome::Help(USAGE_TEXT)),
                 false => CliCommand::Status,
+            }
+        }
+        "list" => {
+            parse_no_args_subcommand(rest, "list", &mut endpoint_raw, &mut json_output)?;
+            match check_help_in_rest(rest) {
+                true => return Ok(CliOutcome::Help(USAGE_TEXT)),
+                false => CliCommand::List,
             }
         }
         "spawn" => {
@@ -265,6 +274,7 @@ fn check_help_before_double_dash(rest: &[String]) -> bool {
 
 fn parse_no_args_subcommand(
     rest: &[String],
+    subcmd: &str,
     endpoint_raw: &mut Option<String>,
     json_output: &mut bool,
 ) -> Result<(), SandboxError> {
@@ -276,7 +286,7 @@ fn parse_no_args_subcommand(
         }
         if !try_consume_global_flag(rest, &mut i, endpoint_raw, json_output)? {
             return Err(SandboxError::InvalidSpec(format!(
-                "unexpected argument '{arg}' for 'status'"
+                "unexpected argument '{arg}' for '{subcmd}'"
             )));
         }
         i += 1;
@@ -960,6 +970,50 @@ pub async fn execute_with_client(
             }
             Ok(0)
         }
+        CliCommand::List => {
+            let sandboxes = client.list_sandboxes().await?;
+            if json_mode {
+                let items: Vec<Value> = sandboxes
+                    .iter()
+                    .map(|s| s.to_json_value())
+                    .collect();
+                print_json(&json!({ "sandboxes": items }));
+            } else if sandboxes.is_empty() {
+                println!("no active sandboxes");
+            } else {
+                println!(
+                    "{:<24} {:<8} {:<6} {:<16} {:<14} {:<10} DOCKER_ENDPOINT",
+                    "SANDBOX_ID", "PID", "STATE", "NETWORK", "RSS_MB", "TTL_SECS"
+                );
+                for s in sandboxes {
+                    let state_lbl = if s.alive { "alive" } else { "exited" };
+                    let rss_lbl = match (s.live_rss_bytes, s.host_rss_budget_mb) {
+                        (Some(b), Some(cap)) => {
+                            format!("{}/{}", b.div_ceil(1024 * 1024), cap)
+                        }
+                        (Some(b), None) => format!("{}", b.div_ceil(1024 * 1024)),
+                        (None, Some(cap)) => format!("-/{cap}"),
+                        (None, None) => "-".to_owned(),
+                    };
+                    let docker_lbl = match (&s.docker_endpoint, s.allow_reaper_socket) {
+                        (Some(uri), true) => format!("{uri} (ryuk)"),
+                        (Some(uri), false) => uri.clone(),
+                        (None, _) => "-".to_owned(),
+                    };
+                    println!(
+                        "{:<24} {:<8} {:<6} {:<16} {:<14} {:<10} {}",
+                        s.id.as_str(),
+                        s.pid,
+                        state_lbl,
+                        format_network_short(&s.network),
+                        rss_lbl,
+                        s.remaining_ttl_ms / 1000,
+                        docker_lbl,
+                    );
+                }
+            }
+            Ok(0)
+        }
         CliCommand::Spawn(spec) => {
             let lease = client.spawn(spec).await?;
             if json_mode {
@@ -1153,6 +1207,15 @@ fn print_json(val: &Value) {
         "{}",
         serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string())
     );
+}
+
+pub(crate) fn format_network_short(network: &NetworkPolicy) -> String {
+    match network {
+        NetworkPolicy::Isolated => "isolated".to_owned(),
+        NetworkPolicy::InternetOnly => "internet".to_owned(),
+        NetworkPolicy::DomainAllowList { rules } => format!("allowlist({})", rules.len()),
+        NetworkPolicy::Unrestricted => "unrestricted".to_owned(),
+    }
 }
 
 fn enforcement_str(level: EnforcementLevel) -> &'static str {
@@ -1471,7 +1534,7 @@ mod tests {
     async fn execute_with_client_propagates_exec_exit_codes_and_runs_rpcs() {
         use sandbox_client::{
             read_control_frame, write_control_frame, ControlRequest, ControlResponse,
-            DaemonStatusInfo, ExecWireEvent,
+            DaemonStatusInfo, ExecWireEvent, SandboxSummaryInfo,
         };
         use sandbox_core::{CapabilityReport, SandboxLease};
         use tokio::io::duplex;
@@ -1495,6 +1558,26 @@ mod tests {
                             reserved_host_storage_mb: 1024,
                             version: "0.1.0".to_owned(),
                         });
+                        write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    ControlRequest::ListSandboxes => {
+                        let resp = ControlResponse::SandboxList {
+                            sandboxes: vec![SandboxSummaryInfo {
+                                id: SandboxId::new("sb-cli-1"),
+                                pid: 1234,
+                                alive: true,
+                                network: NetworkPolicy::Isolated,
+                                remaining_ttl_ms: 120_000,
+                                live_rss_bytes: Some(200 * 1024 * 1024),
+                                reserved_rss_mb: 256,
+                                host_rss_budget_mb: Some(512),
+                                host_storage_budget_mb: 1024,
+                                docker_endpoint: None,
+                                allow_reaper_socket: false,
+                            }],
+                        };
                         write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
                             .await
                             .unwrap();
@@ -1564,6 +1647,18 @@ mod tests {
 
         assert_eq!(
             execute_with_client(&client, true, CliCommand::Status)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            execute_with_client(&client, false, CliCommand::List)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            execute_with_client(&client, true, CliCommand::List)
                 .await
                 .unwrap(),
             0

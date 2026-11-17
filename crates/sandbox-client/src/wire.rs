@@ -153,10 +153,62 @@ impl DaemonStatusInfo {
     }
 }
 
+/// Live summary of an active sandbox returned by `ControlRequest::ListSandboxes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxSummaryInfo {
+    pub id: SandboxId,
+    pub pid: u32,
+    pub alive: bool,
+    pub network: NetworkPolicy,
+    pub remaining_ttl_ms: u64,
+    pub live_rss_bytes: Option<u64>,
+    pub reserved_rss_mb: u64,
+    pub host_rss_budget_mb: Option<u32>,
+    pub host_storage_budget_mb: u32,
+    pub docker_endpoint: Option<String>,
+    pub allow_reaper_socket: bool,
+}
+
+impl SandboxSummaryInfo {
+    pub fn to_json_value(&self) -> Value {
+        json!({
+            "id": self.id.as_str(),
+            "pid": self.pid,
+            "alive": self.alive,
+            "network": encode_network_policy(&self.network),
+            "remaining_ttl_ms": self.remaining_ttl_ms,
+            "live_rss_bytes": self.live_rss_bytes,
+            "reserved_rss_mb": self.reserved_rss_mb,
+            "host_rss_budget_mb": self.host_rss_budget_mb,
+            "host_storage_budget_mb": self.host_storage_budget_mb,
+            "docker_endpoint": self.docker_endpoint,
+            "allow_reaper_socket": self.allow_reaper_socket,
+        })
+    }
+
+    pub fn from_json_value(val: &Value) -> Result<Self, SandboxError> {
+        let obj = expect_object(val, "SandboxSummaryInfo")?;
+        Ok(Self {
+            id: SandboxId::new(req_string(obj, "id", "SandboxSummaryInfo")?),
+            pid: req_u32(obj, "pid", "SandboxSummaryInfo")?,
+            alive: req_bool(obj, "alive", "SandboxSummaryInfo")?,
+            network: decode_network_policy(req_field(obj, "network", "SandboxSummaryInfo")?)?,
+            remaining_ttl_ms: req_u64(obj, "remaining_ttl_ms", "SandboxSummaryInfo")?,
+            live_rss_bytes: opt_u64(obj, "live_rss_bytes", "SandboxSummaryInfo")?,
+            reserved_rss_mb: req_u64(obj, "reserved_rss_mb", "SandboxSummaryInfo")?,
+            host_rss_budget_mb: opt_u32(obj, "host_rss_budget_mb", "SandboxSummaryInfo")?,
+            host_storage_budget_mb: req_u32(obj, "host_storage_budget_mb", "SandboxSummaryInfo")?,
+            docker_endpoint: opt_string(obj, "docker_endpoint", "SandboxSummaryInfo")?,
+            allow_reaper_socket: req_bool(obj, "allow_reaper_socket", "SandboxSummaryInfo")?,
+        })
+    }
+}
+
 /// Control request sent from `sandbox-client` (or CLI/MCP) to `sandboxd`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlRequest {
     Status,
+    ListSandboxes,
     Spawn {
         spec: SandboxSpec,
     },
@@ -192,6 +244,7 @@ impl ControlRequest {
     pub fn to_json_value(&self) -> Value {
         match self {
             Self::Status => json!({ "type": "Status" }),
+            Self::ListSandboxes => json!({ "type": "ListSandboxes" }),
             Self::Spawn { spec } => json!({
                 "type": "Spawn",
                 "spec": encode_sandbox_spec(spec),
@@ -243,6 +296,7 @@ impl ControlRequest {
         let kind = req_string(obj, "type", "ControlRequest")?;
         match kind.as_str() {
             "Status" => Ok(Self::Status),
+            "ListSandboxes" => Ok(Self::ListSandboxes),
             "Spawn" => Ok(Self::Spawn {
                 spec: decode_sandbox_spec(req_field(obj, "spec", "ControlRequest::Spawn")?)?,
             }),
@@ -297,6 +351,7 @@ impl ControlRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlResponse {
     Status(DaemonStatusInfo),
+    SandboxList { sandboxes: Vec<SandboxSummaryInfo> },
     Spawned(SandboxLease),
     Ack,
     ExecStarted { stream_id: u32 },
@@ -313,6 +368,10 @@ impl ControlResponse {
             Self::Status(info) => json!({
                 "type": "Status",
                 "status": info.to_json_value(),
+            }),
+            Self::SandboxList { sandboxes } => json!({
+                "type": "SandboxList",
+                "sandboxes": sandboxes.iter().map(SandboxSummaryInfo::to_json_value).collect::<Vec<_>>(),
             }),
             Self::Spawned(lease) => json!({
                 "type": "Spawned",
@@ -352,6 +411,20 @@ impl ControlResponse {
                 "status",
                 "ControlResponse::Status",
             )?)?)),
+            "SandboxList" => {
+                let arr = req_field(obj, "sandboxes", "ControlResponse::SandboxList")?
+                    .as_array()
+                    .ok_or_else(|| {
+                        SandboxError::Transport(
+                            "ControlResponse::SandboxList.sandboxes must be an array".to_owned(),
+                        )
+                    })?;
+                let mut sandboxes = Vec::with_capacity(arr.len());
+                for item in arr {
+                    sandboxes.push(SandboxSummaryInfo::from_json_value(item)?);
+                }
+                Ok(Self::SandboxList { sandboxes })
+            }
             "Spawned" => Ok(Self::Spawned(decode_sandbox_lease(req_field(
                 obj,
                 "lease",
@@ -1126,6 +1199,15 @@ fn req_u64(obj: &Map<String, Value>, key: &str, ctx: &str) -> Result<u64, Sandbo
         .ok_or_else(|| SandboxError::Transport(format!("{ctx}.{key} must be an unsigned integer")))
 }
 
+fn opt_u64(obj: &Map<String, Value>, key: &str, ctx: &str) -> Result<Option<u64>, SandboxError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            SandboxError::Transport(format!("{ctx}.{key} must be an unsigned integer or null"))
+        }),
+    }
+}
+
 fn req_usize(obj: &Map<String, Value>, key: &str, ctx: &str) -> Result<usize, SandboxError> {
     let raw = req_u64(obj, key, ctx)?;
     usize::try_from(raw)
@@ -1314,6 +1396,7 @@ mod tests {
 
         let requests = [
             ControlRequest::Status,
+            ControlRequest::ListSandboxes,
             ControlRequest::Spawn {
                 spec: sample_spec(allow_list, true),
             },
@@ -1376,6 +1459,36 @@ mod tests {
                 reserved_host_storage_mb: 8192,
                 version: "0.1.0".to_owned(),
             }),
+            ControlResponse::SandboxList {
+                sandboxes: vec![
+                    SandboxSummaryInfo {
+                        id: SandboxId::new("sb-1"),
+                        pid: 4242,
+                        alive: true,
+                        network: NetworkPolicy::Isolated,
+                        remaining_ttl_ms: 299_500,
+                        live_rss_bytes: Some(268_435_456),
+                        reserved_rss_mb: 320,
+                        host_rss_budget_mb: Some(512),
+                        host_storage_budget_mb: 1024,
+                        docker_endpoint: None,
+                        allow_reaper_socket: false,
+                    },
+                    SandboxSummaryInfo {
+                        id: SandboxId::new("sb-2"),
+                        pid: 5151,
+                        alive: true,
+                        network: NetworkPolicy::InternetOnly,
+                        remaining_ttl_ms: 590_000,
+                        live_rss_bytes: None,
+                        reserved_rss_mb: 576,
+                        host_rss_budget_mb: None,
+                        host_storage_budget_mb: 2048,
+                        docker_endpoint: Some(r"\\.\pipe\minipod-docker-1".to_owned()),
+                        allow_reaper_socket: true,
+                    },
+                ],
+            },
             ControlResponse::Spawned(SandboxLease {
                 id: SandboxId::new("sb-42"),
                 ttl: Duration::from_secs(120),

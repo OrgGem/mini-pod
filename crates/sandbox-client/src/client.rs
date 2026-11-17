@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use crate::safe_tar::{extract_tar_bytes_safely, pack_path_to_tar_bytes};
 use crate::wire::{
     read_control_frame, write_control_frame, ControlRequest, ControlResponse, DaemonStatusInfo,
-    ExecWireClientMsg, ExecWireEvent, MAX_CONTROL_FRAME_BYTES,
+    ExecWireClientMsg, ExecWireEvent, SandboxSummaryInfo, MAX_CONTROL_FRAME_BYTES,
 };
 
 /// Default client-side tar archive byte budget (16 MiB).
@@ -617,6 +617,14 @@ impl SandboxClient {
         }
     }
 
+    /// Lists live metadata for all active sandboxes owned by `sandboxd`.
+    pub async fn list_sandboxes(&self) -> Result<Vec<SandboxSummaryInfo>, SandboxError> {
+        match self.rpc(ControlRequest::ListSandboxes).await? {
+            ControlResponse::SandboxList { sandboxes } => Ok(sandboxes),
+            other => Err(unexpected_response("ListSandboxes", &other)),
+        }
+    }
+
     /// Spawns a new sandbox instance satisfying `spec`.
     pub async fn spawn(&self, spec: SandboxSpec) -> Result<SandboxLease, SandboxError> {
         match self.rpc(ControlRequest::Spawn { spec }).await? {
@@ -1104,6 +1112,21 @@ mod tests {
                         reserved_host_storage_mb: 2048,
                         version: "0.1.0-test".to_owned(),
                     }),
+                    ControlRequest::ListSandboxes => ControlResponse::SandboxList {
+                        sandboxes: vec![SandboxSummaryInfo {
+                            id: SandboxId::new("sb-test-1"),
+                            pid: 9001,
+                            alive: true,
+                            network: NetworkPolicy::Isolated,
+                            remaining_ttl_ms: 59_000,
+                            live_rss_bytes: Some(256 * 1024 * 1024),
+                            reserved_rss_mb: 320,
+                            host_rss_budget_mb: Some(512),
+                            host_storage_budget_mb: 2048,
+                            docker_endpoint: None,
+                            allow_reaper_socket: false,
+                        }],
+                    },
                     ControlRequest::Spawn { spec } => {
                         assert_eq!(spec.budget.guest_vcpus, 1);
                         ControlResponse::Spawned(SandboxLease {
@@ -1170,6 +1193,11 @@ mod tests {
         assert_eq!(status.active_sandboxes, 1);
         assert_eq!(status.warm_ready_vms, 2);
         assert_eq!(status.version, "0.1.0-test");
+
+        let sandboxes = client.list_sandboxes().await.unwrap();
+        assert_eq!(sandboxes.len(), 1);
+        assert_eq!(sandboxes[0].id, SandboxId::new("sb-test-1"));
+        assert_eq!(sandboxes[0].pid, 9001);
 
         let lease = client.spawn(test_spec()).await.unwrap();
         assert_eq!(lease.id, SandboxId::new("sb-test-1"));

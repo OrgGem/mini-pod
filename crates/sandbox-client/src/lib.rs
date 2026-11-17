@@ -14,6 +14,6 @@ pub use client::{
 pub use safe_tar::{extract_tar_bytes_safely, pack_path_to_tar_bytes};
 pub use wire::{
     decode_base64, encode_base64, read_control_frame, write_control_frame, ControlRequest,
-    ControlResponse, DaemonStatusInfo, ExecWireClientMsg, ExecWireEvent, WireError,
-    MAX_CONTROL_FRAME_BYTES,
+    ControlResponse, DaemonStatusInfo, ExecWireClientMsg, ExecWireEvent, SandboxSummaryInfo,
+    WireError, MAX_CONTROL_FRAME_BYTES,
 };

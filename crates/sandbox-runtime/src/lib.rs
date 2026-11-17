@@ -32,7 +32,8 @@ pub use journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
 };
 pub use manager::{
-    validate_guest_path, LocalRuntimeManager, ReconciliationReport, RuntimeManagerConfig,
+    validate_guest_path, ActiveSandboxSummary, LocalRuntimeManager, ReconciliationReport,
+    RuntimeManagerConfig,
 };
 pub use ports::{
     BundleReadGuard, DiskOverlayPort, PreBootJournalHook, PreparedOverlay, SandboxTunnelPort,

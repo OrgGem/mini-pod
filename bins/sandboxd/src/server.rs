@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use sandbox_client::{
     read_control_frame, write_control_frame, ControlEndpoint, ControlRequest, ControlResponse,
-    DaemonStatusInfo, ExecWireClientMsg, ExecWireEvent, WireError,
+    DaemonStatusInfo, ExecWireClientMsg, ExecWireEvent, SandboxSummaryInfo, WireError,
 };
 use sandbox_core::{DestroyStatus, NetworkPolicy, SandboxError, SandboxId};
 #[cfg(windows)]
@@ -140,6 +140,43 @@ impl DaemonState {
     /// Returns current active sandbox, warm pool, and host budget counters.
     pub fn status(&self) -> DaemonStatusInfo {
         daemon_status_info(&self.runtime)
+    }
+
+    /// Returns a live snapshot of all active sandboxes enriched with any bound Docker compat URI.
+    pub fn list_sandboxes(&self) -> Vec<SandboxSummaryInfo> {
+        let active = self.runtime.list_active_sandboxes();
+        let docker_snapshot: HashMap<SandboxId, (String, bool)> = {
+            let map = self
+                .docker_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .map(|(id, entry)| (id.clone(), (entry.uri.clone(), entry.allow_reaper_socket)))
+                .collect()
+        };
+
+        active
+            .into_iter()
+            .map(|entry| {
+                let (docker_endpoint, allow_reaper_socket) = docker_snapshot
+                    .get(&entry.id)
+                    .map(|(uri, reaper)| (Some(uri.clone()), *reaper))
+                    .unwrap_or((None, false));
+                SandboxSummaryInfo {
+                    id: entry.id,
+                    pid: entry.pid,
+                    alive: entry.alive,
+                    network: entry.network,
+                    remaining_ttl_ms: entry.remaining_ttl_ms,
+                    live_rss_bytes: entry.live_rss_bytes,
+                    reserved_rss_mb: entry.reserved_rss_mb,
+                    host_rss_budget_mb: entry.host_rss_budget_mb,
+                    host_storage_budget_mb: entry.host_storage_budget_mb,
+                    docker_endpoint,
+                    allow_reaper_socket,
+                }
+            })
+            .collect()
     }
 
     /// Lazily binds (or returns the cached) owner-only local IPC Docker compatibility listener
@@ -796,6 +833,9 @@ where
 async fn dispatch_unary_request(state: &DaemonState, req: ControlRequest) -> ControlResponse {
     match req {
         ControlRequest::Status => ControlResponse::Status(state.status()),
+        ControlRequest::ListSandboxes => ControlResponse::SandboxList {
+            sandboxes: state.list_sandboxes(),
+        },
         ControlRequest::Spawn { spec } => match state.runtime.spawn(spec).await {
             Ok(lease) => ControlResponse::Spawned(lease),
             Err(err) => ControlResponse::Error(WireError::from(err)),
@@ -1428,10 +1468,20 @@ mod tests {
             let map = state.docker_compat.lock().unwrap();
             assert_eq!(map.get(&iso_lease.id).unwrap().proxy_url, None);
         }
+        let listed = client.list_sandboxes().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let listed_main = listed.iter().find(|s| s.id == lease.id).unwrap();
+        assert_eq!(listed_main.docker_endpoint.as_deref(), Some(docker_uri_1.as_str()));
+        assert!(!listed_main.allow_reaper_socket);
+        let listed_iso = listed.iter().find(|s| s.id == iso_lease.id).unwrap();
+        assert!(listed_iso.docker_endpoint.is_some());
+        assert!(listed_iso.allow_reaper_socket);
+
         client.destroy(&iso_lease.id).await.unwrap();
 
         let destroyed = client.destroy(&lease.id).await.unwrap();
         assert_eq!(destroyed, DestroyStatus::AllResourcesCleaned);
+        assert!(client.list_sandboxes().await.unwrap().is_empty());
         {
             let map = state.docker_compat.lock().unwrap();
             assert!(!map.contains_key(&lease.id));

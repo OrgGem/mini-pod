@@ -9,10 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sandbox_client::{
     read_control_frame, write_control_frame, ControlEndpoint, ControlRequest, ControlResponse,
-    DaemonStatusInfo, ExecWireEvent,
+    DaemonStatusInfo, ExecWireEvent, SandboxSummaryInfo,
 };
 use sandbox_core::{
-    CapabilityReport, DestroyStatus, EnforcementLevel, ExecExitStatus, SandboxId, SandboxLease,
+    CapabilityReport, DestroyStatus, EnforcementLevel, ExecExitStatus, NetworkPolicy, SandboxId,
+    SandboxLease,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
@@ -128,6 +129,26 @@ where
                 reserved_host_storage_mb: 1024,
                 version: "0.1.0-mock".to_owned(),
             }),
+            ControlRequest::ListSandboxes => {
+                let sandboxes = if st.active_sandboxes == 0 {
+                    Vec::new()
+                } else {
+                    vec![SandboxSummaryInfo {
+                        id: SandboxId::new("sb-cli-e2e-1"),
+                        pid: 7777,
+                        alive: true,
+                        network: NetworkPolicy::Isolated,
+                        remaining_ttl_ms: 295_000,
+                        live_rss_bytes: Some(256 * 1024 * 1024),
+                        reserved_rss_mb: 320,
+                        host_rss_budget_mb: Some(512),
+                        host_storage_budget_mb: 1024,
+                        docker_endpoint: None,
+                        allow_reaper_socket: false,
+                    }]
+                };
+                ControlResponse::SandboxList { sandboxes }
+            }
             ControlRequest::Spawn { spec } => {
                 st.active_sandboxes += 1;
                 ControlResponse::Spawned(SandboxLease {
@@ -316,6 +337,24 @@ async fn e2e_sandbox_cli_full_command_suite_and_tcp_rejection() {
         .expect("spawn id string")
         .to_owned();
     assert_eq!(sandbox_id, "sb-cli-e2e-1");
+
+    // 2b. list (--json)
+    let out = run_cli(vec![
+        "--endpoint".into(),
+        endpoint_arg.clone(),
+        "--json".into(),
+        "list".into(),
+    ])
+    .await;
+    assert!(
+        out.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list_json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse list JSON");
+    assert_eq!(list_json["sandboxes"][0]["id"].as_str(), Some("sb-cli-e2e-1"));
+    assert_eq!(list_json["sandboxes"][0]["pid"].as_u64(), Some(7777));
 
     // 3. exec (exit 0 + stdout + stderr)
     let out = run_cli(vec![

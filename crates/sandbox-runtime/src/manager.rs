@@ -194,6 +194,20 @@ fn spawn_egress_acceptor(
     }
 }
 
+/// Point-in-time summary of an active sandbox owned by [`LocalRuntimeManager`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveSandboxSummary {
+    pub id: SandboxId,
+    pub pid: u32,
+    pub alive: bool,
+    pub network: NetworkPolicy,
+    pub remaining_ttl_ms: u64,
+    pub live_rss_bytes: Option<u64>,
+    pub reserved_rss_mb: u64,
+    pub host_rss_budget_mb: Option<u32>,
+    pub host_storage_budget_mb: u32,
+}
+
 struct ActiveSandbox {
     session: Arc<dyn VmSessionPort>,
     work_dir: PathBuf,
@@ -380,6 +394,70 @@ impl LocalRuntimeManager {
     pub fn active_sandbox_ids(&self) -> Vec<SandboxId> {
         let active = lock_unpoisoned(&self.active);
         active.keys().cloned().collect()
+    }
+
+    /// Returns a deterministically sorted snapshot of all active sandboxes without holding the
+    /// active-map mutex across OS process/RSS probes.
+    pub fn list_active_sandboxes(&self) -> Vec<ActiveSandboxSummary> {
+        let now = Instant::now();
+        let raw_entries: Vec<(
+            SandboxId,
+            Arc<dyn VmSessionPort>,
+            NetworkPolicy,
+            Instant,
+            u64,
+            Option<u32>,
+            u32,
+        )> = {
+            let active = lock_unpoisoned(&self.active);
+            active
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        Arc::clone(&entry.session),
+                        entry.network_policy.clone(),
+                        entry.expires_at,
+                        entry.reserved_rss_mb,
+                        entry.host_rss_budget_mb,
+                        entry.host_storage_budget_mb,
+                    )
+                })
+                .collect()
+        };
+
+        let mut summaries: Vec<ActiveSandboxSummary> = raw_entries
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    session,
+                    network,
+                    expires_at,
+                    reserved_rss_mb,
+                    host_rss_budget_mb,
+                    host_storage_budget_mb,
+                )| {
+                    let remaining_ttl_ms = u64::try_from(
+                        expires_at.saturating_duration_since(now).as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    ActiveSandboxSummary {
+                        id,
+                        pid: session.pid(),
+                        alive: session.is_alive(),
+                        network,
+                        remaining_ttl_ms,
+                        live_rss_bytes: session.current_rss_bytes(),
+                        reserved_rss_mb,
+                        host_rss_budget_mb,
+                        host_storage_budget_mb,
+                    }
+                },
+            )
+            .collect();
+        summaries.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        summaries
     }
 
     /// Returns the configured [`NetworkPolicy`] for an active, unexpired, living sandbox.
@@ -4350,5 +4428,43 @@ mod tests {
         assert_eq!(report.cleaned, 1);
         assert_eq!(report.remaining, 0);
         assert!(!ext_ipc_sock.exists());
+    }
+
+    #[tokio::test]
+    async fn list_active_sandboxes_returns_sorted_live_metadata_and_clears_on_destroy() {
+        let tmp = TestTempDir::new("mgr-list-active");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mgr = LocalRuntimeManager::new(base_config(tmp.path().join("state")), overlay, vm)
+            .unwrap();
+
+        assert!(mgr.list_active_sandboxes().is_empty());
+
+        let mut spec_a = valid_spec(Duration::from_secs(120));
+        spec_a.network = NetworkPolicy::Isolated;
+        let lease_a = mgr.spawn(spec_a).await.unwrap();
+
+        let mut spec_b = valid_spec(Duration::from_secs(300));
+        spec_b.network = NetworkPolicy::InternetOnly;
+        spec_b.budget.host_rss_budget_mb = Some(768);
+        spec_b.budget.host_storage_budget_mb = 2048;
+        let lease_b = mgr.spawn(spec_b).await.unwrap();
+
+        let listed = mgr.list_active_sandboxes();
+        assert_eq!(listed.len(), 2);
+        assert!(listed[0].id.as_str() < listed[1].id.as_str());
+
+        let found_b = listed.iter().find(|s| s.id == lease_b.id).unwrap();
+        assert!(found_b.alive);
+        assert!(found_b.pid > 0);
+        assert_eq!(found_b.network, NetworkPolicy::InternetOnly);
+        assert!(found_b.remaining_ttl_ms > 200_000);
+        assert_eq!(found_b.host_rss_budget_mb, Some(768));
+        assert_eq!(found_b.host_storage_budget_mb, 2048);
+
+        mgr.destroy(&lease_a.id).await.unwrap();
+        let remaining = mgr.list_active_sandboxes();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, lease_b.id);
     }
 }
