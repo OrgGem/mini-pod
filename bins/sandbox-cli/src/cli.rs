@@ -15,6 +15,9 @@ use sandbox_core::{
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
+use crate::compose::{execute_compose, ComposeAction};
+use crate::image_build::{build_image_in_sandbox, ImageBuildSpec};
+
 pub const USAGE_TEXT: &str = "\
 mini-pod sandbox command-line interface (routed via SandboxClient)
 
@@ -52,6 +55,21 @@ SUBCOMMANDS:
     renew <SANDBOX_ID> --ttl-secs <N>
     copy-in <SANDBOX_ID> <SRC_HOST> <DST_GUEST>
     copy-out <SANDBOX_ID> <SRC_GUEST> <DST_HOST>
+    build <SANDBOX_ID> <CONTEXT_DIR> -t <IMAGE[:TAG]> [OPTIONS]
+        -t, --tag <TAG>             Image name/tag (repeatable; required)
+        -f, --file <DOCKERFILE>     Dockerfile path relative to CONTEXT_DIR
+        --build-arg <K=V>           Build-time variable (repeatable)
+        --target <STAGE>            Target build stage
+        --no-cache                  Disable build layer cache
+        -o, --output-tar <PATH>     Export built image to a host .tar archive
+        --deadline-secs <N>         Build timeout in seconds (default: 300)
+    compose <SANDBOX_ID> <up|ps|logs|down> [OPTIONS]
+        -f, --file <COMPOSE_FILE>   Compose file path (default: compose.yaml / docker-compose.yml)
+        -p, --project-name <NAME>   Override Compose project name
+        --build                     Force rebuild of `build:` services (`up`)
+        --deadline-secs <N>         Build/pull timeout in seconds (`up`, default: 300)
+        --tail <N>                  Lines per container (`logs`, default: 100)
+        -v, --volumes               Remove named project volumes (`down`)
     docker-endpoint <SANDBOX_ID> [--allow-reaper-socket]
     destroy <SANDBOX_ID>
 ";
@@ -97,6 +115,14 @@ pub enum CliCommand {
         id: SandboxId,
         src_guest: String,
         dst_host: PathBuf,
+    },
+    Build {
+        id: SandboxId,
+        spec: Box<ImageBuildSpec>,
+    },
+    Compose {
+        id: SandboxId,
+        action: ComposeAction,
     },
     DockerEndpoint {
         id: SandboxId,
@@ -234,6 +260,23 @@ where
                 src_guest,
                 dst_host: PathBuf::from(dst_host),
             }
+        }
+        "build" => {
+            if check_help_in_rest(rest) {
+                return Ok(CliOutcome::Help(USAGE_TEXT));
+            }
+            let (id, spec) = parse_build(rest, &mut endpoint_raw, &mut json_output)?;
+            CliCommand::Build {
+                id,
+                spec: Box::new(spec),
+            }
+        }
+        "compose" => {
+            if check_help_in_rest(rest) {
+                return Ok(CliOutcome::Help(USAGE_TEXT));
+            }
+            let (id, action) = parse_compose(rest, &mut endpoint_raw, &mut json_output)?;
+            CliCommand::Compose { id, action }
         }
         "docker-endpoint" => {
             if check_help_in_rest(rest) {
@@ -726,6 +769,245 @@ fn parse_copy_pair(
     Ok((id, src, dst))
 }
 
+fn parse_build(
+    rest: &[String],
+    endpoint_raw: &mut Option<String>,
+    json_output: &mut bool,
+) -> Result<(SandboxId, ImageBuildSpec), SandboxError> {
+    const DEFAULT_BUILD_DEADLINE_SECS: u64 = 300;
+
+    let mut positionals: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut dockerfile: Option<String> = None;
+    let mut build_args: Vec<(String, String)> = Vec::new();
+    let mut target: Option<String> = None;
+    let mut no_cache = false;
+    let mut output_tar: Option<PathBuf> = None;
+    let mut deadline_secs = DEFAULT_BUILD_DEADLINE_SECS;
+
+    let mut i = 0usize;
+    while i < rest.len() {
+        if try_consume_global_flag(rest, &mut i, endpoint_raw, json_output)? {
+            i += 1;
+            continue;
+        }
+        let arg = rest[i].as_str();
+        let (flag, inline_val) = split_flag(arg);
+        match flag {
+            "-t" | "--tag" => {
+                tags.push(take_flag_value(rest, &mut i, flag, inline_val)?);
+            }
+            "-f" | "--file" => {
+                dockerfile = Some(take_flag_value(rest, &mut i, flag, inline_val)?);
+            }
+            "--build-arg" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                let (k, v) = raw.split_once('=').ok_or_else(|| {
+                    SandboxError::InvalidSpec(format!(
+                        "invalid --build-arg '{raw}'; expected KEY=VALUE"
+                    ))
+                })?;
+                build_args.push((k.to_owned(), v.to_owned()));
+            }
+            "--target" => {
+                target = Some(take_flag_value(rest, &mut i, flag, inline_val)?);
+            }
+            "--no-cache" => {
+                if inline_val.is_some() {
+                    return Err(SandboxError::InvalidSpec(
+                        "--no-cache does not take a value".to_owned(),
+                    ));
+                }
+                no_cache = true;
+            }
+            "-o" | "--output-tar" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                output_tar = Some(PathBuf::from(raw));
+            }
+            "--deadline-secs" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                deadline_secs = parse_int(&raw, flag)?;
+            }
+            _ if arg.starts_with('-') => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "unknown option '{arg}' for 'build'"
+                )));
+            }
+            _ => positionals.push(arg.to_owned()),
+        }
+        i += 1;
+    }
+
+    if positionals.len() != 2 {
+        return Err(SandboxError::InvalidSpec(format!(
+            "'build' requires <sandbox-id> <context-dir> (got {} positional arguments)",
+            positionals.len()
+        )));
+    }
+    let mut iter = positionals.into_iter();
+    let id = req_sandbox_id(iter.next(), "build")?;
+    let ctx_raw = iter.next().expect("checked len 2");
+
+    let mut spec = ImageBuildSpec {
+        context_dir: PathBuf::from(ctx_raw),
+        dockerfile,
+        tags,
+        build_args,
+        target,
+        no_cache,
+        output_tar,
+        deadline: Duration::from_secs(deadline_secs),
+    };
+    spec.validate_and_normalize()?;
+    Ok((id, spec))
+}
+
+fn parse_compose(
+    rest: &[String],
+    endpoint_raw: &mut Option<String>,
+    json_output: &mut bool,
+) -> Result<(SandboxId, ComposeAction), SandboxError> {
+    const DEFAULT_COMPOSE_DEADLINE_SECS: u64 = 300;
+    const DEFAULT_COMPOSE_TAIL: u32 = 100;
+
+    let mut positionals: Vec<String> = Vec::new();
+    let mut file: Option<PathBuf> = None;
+    let mut project: Option<String> = None;
+    let mut build = false;
+    let mut volumes = false;
+    let mut deadline_secs: Option<u64> = None;
+    let mut tail: Option<u32> = None;
+
+    let mut i = 0usize;
+    while i < rest.len() {
+        if try_consume_global_flag(rest, &mut i, endpoint_raw, json_output)? {
+            i += 1;
+            continue;
+        }
+        let arg = rest[i].as_str();
+        let (flag, inline_val) = split_flag(arg);
+        match flag {
+            "-f" | "--file" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                file = Some(PathBuf::from(raw));
+            }
+            "-p" | "--project-name" => {
+                project = Some(take_flag_value(rest, &mut i, flag, inline_val)?);
+            }
+            "--build" => {
+                if inline_val.is_some() {
+                    return Err(SandboxError::InvalidSpec(
+                        "--build does not take a value".to_owned(),
+                    ));
+                }
+                build = true;
+            }
+            "-v" | "--volumes" => {
+                if inline_val.is_some() {
+                    return Err(SandboxError::InvalidSpec(
+                        "--volumes does not take a value".to_owned(),
+                    ));
+                }
+                volumes = true;
+            }
+            "--deadline-secs" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                let parsed: u64 = parse_int(&raw, flag)?;
+                if parsed == 0 {
+                    return Err(SandboxError::InvalidSpec(
+                        "--deadline-secs must be greater than zero".to_owned(),
+                    ));
+                }
+                deadline_secs = Some(parsed);
+            }
+            "--tail" => {
+                let raw = take_flag_value(rest, &mut i, flag, inline_val)?;
+                tail = Some(parse_int(&raw, flag)?);
+            }
+            "-d" | "--detach" => {
+                // Accepted as a no-op alias on `compose up` since sandbox compose stacks always run detached.
+                if inline_val.is_some() {
+                    return Err(SandboxError::InvalidSpec(
+                        "--detach does not take a value".to_owned(),
+                    ));
+                }
+            }
+            _ if arg.starts_with('-') => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "unknown option '{arg}' for 'compose'"
+                )));
+            }
+            _ => positionals.push(arg.to_owned()),
+        }
+        i += 1;
+    }
+
+    if positionals.len() < 2 {
+        return Err(SandboxError::InvalidSpec(
+            "'compose' requires <sandbox-id> <up|ps|logs|down>".to_owned(),
+        ));
+    }
+
+    let id = req_sandbox_id(Some(positionals[0].clone()), "compose")?;
+    let sub = positionals[1].as_str();
+
+    let action = match sub {
+        "up" => {
+            if positionals.len() > 2 || volumes || tail.is_some() {
+                return Err(SandboxError::InvalidSpec(
+                    "invalid arguments for 'compose up'".to_owned(),
+                ));
+            }
+            ComposeAction::Up {
+                file,
+                project,
+                build,
+                deadline: Duration::from_secs(deadline_secs.unwrap_or(DEFAULT_COMPOSE_DEADLINE_SECS)),
+            }
+        }
+        "ps" => {
+            if positionals.len() > 2 || build || volumes || deadline_secs.is_some() || tail.is_some() {
+                return Err(SandboxError::InvalidSpec(
+                    "invalid arguments for 'compose ps'".to_owned(),
+                ));
+            }
+            ComposeAction::Ps { file, project }
+        }
+        "logs" => {
+            if positionals.len() > 3 || build || volumes || deadline_secs.is_some() {
+                return Err(SandboxError::InvalidSpec(
+                    "invalid arguments for 'compose logs'".to_owned(),
+                ));
+            }
+            ComposeAction::Logs {
+                file,
+                project,
+                tail: tail.unwrap_or(DEFAULT_COMPOSE_TAIL),
+                service: positionals.get(2).cloned(),
+            }
+        }
+        "down" => {
+            if positionals.len() > 2 || build || deadline_secs.is_some() || tail.is_some() {
+                return Err(SandboxError::InvalidSpec(
+                    "invalid arguments for 'compose down'".to_owned(),
+                ));
+            }
+            ComposeAction::Down {
+                file,
+                project,
+                volumes,
+            }
+        }
+        other => {
+            return Err(SandboxError::InvalidSpec(format!(
+                "unknown compose action '{other}'; expected 'up', 'ps', 'logs', or 'down'"
+            )));
+        }
+    };
+
+    Ok((id, action))
+}
+
 fn parse_docker_endpoint(
     rest: &[String],
     endpoint_raw: &mut Option<String>,
@@ -1197,6 +1479,36 @@ pub async fn execute_with_client(
             }
             Ok(0)
         }
+        CliCommand::Build { id, spec } => {
+            let res = build_image_in_sandbox(client, &id, *spec, !json_mode).await?;
+            let code = exit_status_to_code(res.exit);
+            if json_mode {
+                print_json(&json!({
+                    "id": id.as_str(),
+                    "tags": res.tags,
+                    "exit_code": res.exit.code,
+                    "timed_out": res.exit.timed_out,
+                    "exported_tar_bytes": res.exported_tar_bytes,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                }));
+            } else if code == 0 {
+                if let Some(bytes) = res.exported_tar_bytes {
+                    println!(
+                        "built {} in {} (exported {} bytes)",
+                        res.tags.join(", "),
+                        id,
+                        bytes
+                    );
+                } else {
+                    println!("built {} in {}", res.tags.join(", "), id);
+                }
+            }
+            Ok(code)
+        }
+        CliCommand::Compose { id, action } => {
+            execute_compose(client, &id, json_mode, action).await
+        }
         CliCommand::DockerEndpoint {
             id,
             allow_reaper_socket,
@@ -1583,6 +1895,92 @@ mod tests {
             parse_args_with(&args(&["--json", "tui"]), no_env),
             Err(SandboxError::InvalidSpec(_))
         ));
+
+        let CliOutcome::Run(build_cmd) = parse_args_with(
+            &args(&[
+                "build",
+                "sb-42",
+                "-t",
+                "demo:v1",
+                "-f",
+                "docker/Dockerfile",
+                "--build-arg",
+                "MODE=release",
+                "--no-cache",
+                "-o",
+                "./demo.tar",
+                "./app",
+            ]),
+            no_env,
+        )
+        .unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            build_cmd.command,
+            CliCommand::Build {
+                id: SandboxId::new("sb-42"),
+                spec: Box::new(ImageBuildSpec {
+                    context_dir: PathBuf::from("./app"),
+                    dockerfile: Some("docker/Dockerfile".to_owned()),
+                    tags: vec!["demo:v1".to_owned()],
+                    build_args: vec![("MODE".to_owned(), "release".to_owned())],
+                    target: None,
+                    no_cache: true,
+                    output_tar: Some(PathBuf::from("./demo.tar")),
+                    deadline: Duration::from_secs(300),
+                }),
+            }
+        );
+
+        let CliOutcome::Run(compose_up) = parse_args_with(
+            &args(&[
+                "compose",
+                "sb-42",
+                "up",
+                "-d",
+                "-f",
+                "compose.yaml",
+                "-p",
+                "stack1",
+                "--build",
+            ]),
+            no_env,
+        )
+        .unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            compose_up.command,
+            CliCommand::Compose {
+                id: SandboxId::new("sb-42"),
+                action: ComposeAction::Up {
+                    file: Some(PathBuf::from("compose.yaml")),
+                    project: Some("stack1".to_owned()),
+                    build: true,
+                    deadline: Duration::from_secs(300),
+                },
+            }
+        );
+
+        let CliOutcome::Run(compose_down) = parse_args_with(
+            &args(&["compose", "sb-42", "down", "-p", "stack1", "-v"]),
+            no_env,
+        )
+        .unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(
+            compose_down.command,
+            CliCommand::Compose {
+                id: SandboxId::new("sb-42"),
+                action: ComposeAction::Down {
+                    file: None,
+                    project: Some("stack1".to_owned()),
+                    volumes: true,
+                },
+            }
+        );
     }
 
     #[test]

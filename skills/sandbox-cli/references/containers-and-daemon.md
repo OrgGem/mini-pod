@@ -13,11 +13,30 @@ sandbox-cli --json spawn \
   --disk-mb 1024 --storage-mb 2048 --ttl-secs 600
 ```
 
-### Option A: Direct Guest Podman (`exec`)
+### Option A: Native `build` & `compose` Subcommands (Zero Host Docker Needed)
+
+- **Build an image from a local folder + `Dockerfile`:**
+  ```bash
+  sandbox-cli --json build <ID> ./my-service \
+    -t my-service:v1 \
+    -f Dockerfile \
+    --build-arg ENV=prod \
+    -o ./dist/my-service.tar
+  ```
+- **Deploy, inspect, and tear down a `compose.yaml` / `docker-compose.yml` stack:**
+  *(Supports `build:`, `image:`, `depends_on:`, `ports:` forwarded onto Host `127.0.0.1`, named `volumes:`, `tmpfs:`, `networks:` with automatic service DNS aliases, `environment:` / `env_file:`; rejects unsafe host bind mounts and `privileged: true`)*:
+  ```bash
+  sandbox-cli --json compose <ID> up -f ./compose.yaml --build
+  sandbox-cli --json compose <ID> ps -f ./compose.yaml
+  sandbox-cli --json compose <ID> logs -f ./compose.yaml --tail 50
+  sandbox-cli --json compose <ID> down -f ./compose.yaml -v
+  ```
+
+### Option B: Direct Guest Podman (`exec`)
 - **Air-gapped (`--network isolated`):** Load an OCI archive without internet:
   - Small `.tar` (`<= 16 MiB`):
     ```bash
-    sandbox-cli --json copy-in <ID> ./image.tar /tmp/image.tar
+    sandbox-cli --json copy-in <ID> ./image.tar /tmp
     sandbox-cli --json exec <ID> -- /usr/bin/podman load -i /tmp/image.tar
     sandbox-cli --json exec <ID> -- /bin/rm -f /tmp/image.tar
     ```
@@ -29,7 +48,7 @@ sandbox-cli --json spawn \
   sandbox-cli --json exec <ID> -- /usr/bin/podman logs --tail 100 app
   ```
 
-### Option B: Host `DOCKER_HOST` Compatibility & Testcontainers
+### Option C: Host `DOCKER_HOST` Compatibility & Testcontainers
 Expose the guest's Podman Engine API on an owner-only Host Unix socket or Windows Named Pipe (published container ports automatically tunnel to `127.0.0.1:<ephemeral_port>` on the Host):
 
 ```bash

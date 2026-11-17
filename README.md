@@ -295,6 +295,8 @@ sandbox-cli tui --refresh-ms 500
 | `e` | Sandboxes | Execute a shell command inside the selected Guest VM |
 | `D` / `Del` | Sandboxes | Destroy selected sandbox (with `y/n` confirmation) |
 | `c` / `Enter` | Containers | Inspect/refresh `podman ps -a` inside the selected sandbox |
+| `b` | Containers | Build an OCI image from a host directory + `Dockerfile` (`<context_dir> <image:tag>`) |
+| `C` (`Shift+c`) | Containers | Deploy a multi-container `compose.yaml` / `docker-compose.yml` stack into the sandbox |
 | `i` | Containers | Stream a host OCI `.tar` archive (`docker save` / `podman save`) into air-gapped guest `podman load` |
 | `n` | Containers | Run a new detached container (`podman run -d ...`) |
 | `x` | Containers | Execute a command directly inside the selected container (`ExecTarget::Container`) |
@@ -360,6 +362,25 @@ sandbox-cli renew <SANDBOX_ID> --ttl-secs 600
 
 # Destroy sandbox and reclaim all host processes, overlays, and journals (idempotent)
 sandbox-cli destroy <SANDBOX_ID>
+```
+
+### 5.5 Build Local Images (`Dockerfile`) & Run `compose.yaml` Stacks (No Host Docker Required)
+
+`sandbox-cli` includes native `build` and `compose` subcommands that work on clean hosts **without Docker Desktop, `docker.exe`, or `docker-compose` installed**:
+
+```bash
+# 1. Build an OCI image inside the sandbox from a local folder + Dockerfile (up to 128 MiB context)
+#    Optional `-o` exports the built image back to a host `.tar` archive.
+sandbox-cli build <SANDBOX_ID> ./my-app -t my-app:v1 -f Dockerfile --build-arg ENV=prod -o ./my-app.tar
+
+# 2. Bring up a multi-service Compose stack (builds `build:` services, orders `depends_on:`,
+#    creates Podman DNS networks & named `volumes:`, and forwards `ports:` to Host 127.0.0.1)
+sandbox-cli compose <SANDBOX_ID> up -f ./compose.yaml --build
+
+# 3. Check stack status, view service logs, and tear down (including named volumes with `-v`)
+sandbox-cli compose <SANDBOX_ID> ps -f ./compose.yaml
+sandbox-cli compose <SANDBOX_ID> logs -f ./compose.yaml --tail 100
+sandbox-cli compose <SANDBOX_ID> down -f ./compose.yaml -v
 ```
 
 ---

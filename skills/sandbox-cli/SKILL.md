@@ -89,6 +89,8 @@ sandbox-cli --json destroy <SANDBOX_ID>
 | `exec <ID> [FLAGS] -- <ARGV...>` | Run command in Guest VM (or `--container <NAME>` inside a Podman container) |
 | `renew <ID> --ttl-secs <N>` | Reset sandbox lease TTL to `<N>` seconds from now |
 | `copy-out <ID> <GUEST> <HOST>` | Download file/dir safely from guest to host |
+| `build <ID> <CONTEXT_DIR> -t <TAG> [FLAGS]` | Build image from host folder + `Dockerfile` inside VM (`-f`, `--build-arg`, `--target`, `-o <OUT.tar>`) |
+| `compose <ID> <up\|ps\|logs\|down> [FLAGS]` | Run/inspect/tear down multi-container `compose.yaml` stacks natively (0 Host Docker needed) |
 | `docker-endpoint <ID> [--allow-reaper-socket]` | Bind owner-only `DOCKER_HOST` socket/pipe for Docker CLI, `bollard`, or Testcontainers |
 | `destroy <ID>` | Idempotently kill VM and clean overlays, sockets, and journals |
 

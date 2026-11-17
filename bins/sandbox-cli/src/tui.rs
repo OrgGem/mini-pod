@@ -28,6 +28,8 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::cli::format_network_short;
+use crate::compose::{compose_up_in_sandbox, load_compose_spec_from_path, split_shell_words};
+use crate::image_build::{build_image_in_sandbox, ImageBuildSpec};
 
 // shortcut: cap TUI output buffer at 500 lines, add disk transcript export if full history is needed
 const MAX_OUTPUT_LINES: usize = 500;
@@ -184,6 +186,12 @@ pub enum PromptKind {
     LoadImageTar {
         sandbox_id: SandboxId,
     },
+    BuildImage {
+        sandbox_id: SandboxId,
+    },
+    ComposeUp {
+        sandbox_id: SandboxId,
+    },
 }
 
 impl PromptKind {
@@ -202,6 +210,12 @@ impl PromptKind {
             Self::LoadImageTar { sandbox_id } => {
                 format!(" Load Host OCI Image Tarball into {sandbox_id} (podman load) ")
             }
+            Self::BuildImage { sandbox_id } => {
+                format!(" Build Image from Host Folder + Dockerfile in {sandbox_id} ")
+            }
+            Self::ComposeUp { sandbox_id } => {
+                format!(" Deploy Compose Stack (compose.yaml) into {sandbox_id} ")
+            }
         }
     }
 
@@ -214,6 +228,12 @@ impl PromptKind {
             }
             Self::LoadImageTar { .. } => {
                 "Host file path to `docker save` / `podman save` .tar (e.g. .cache/test-images/echo-http.tar)"
+            }
+            Self::BuildImage { .. } => {
+                "Enter `<context_dir> <image:tag>` (e.g. ./my-app my-app:latest)"
+            }
+            Self::ComposeUp { .. } => {
+                "Host path to `compose.yaml` / `docker-compose.yml` (e.g. ./docker-compose.yml)"
             }
         }
     }
@@ -346,6 +366,15 @@ pub enum TuiCommand {
     LoadImageTar {
         sandbox_id: SandboxId,
         host_tar_path: PathBuf,
+    },
+    BuildImage {
+        sandbox_id: SandboxId,
+        context_dir: PathBuf,
+        tag: String,
+    },
+    ComposeUp {
+        sandbox_id: SandboxId,
+        compose_path: PathBuf,
     },
     ToggleContainerState {
         sandbox_id: SandboxId,
@@ -645,6 +674,38 @@ impl TuiApp {
                 };
                 self.modal = Some(Modal::Prompt(PromptState::new(
                     PromptKind::LoadImageTar {
+                        sandbox_id: sb.id.clone(),
+                    },
+                    "",
+                )));
+                None
+            }
+            KeyCode::Char('b') => {
+                let Some(sb) = self.current_sandbox() else {
+                    self.push_log(
+                        LogTone::Warn,
+                        "Select a sandbox first before building a Dockerfile image.",
+                    );
+                    return None;
+                };
+                self.modal = Some(Modal::Prompt(PromptState::new(
+                    PromptKind::BuildImage {
+                        sandbox_id: sb.id.clone(),
+                    },
+                    "",
+                )));
+                None
+            }
+            KeyCode::Char('C') => {
+                let Some(sb) = self.current_sandbox() else {
+                    self.push_log(
+                        LogTone::Warn,
+                        "Select a sandbox first before deploying a Compose stack.",
+                    );
+                    return None;
+                };
+                self.modal = Some(Modal::Prompt(PromptState::new(
+                    PromptKind::ComposeUp {
                         sandbox_id: sb.id.clone(),
                     },
                     "",
@@ -976,6 +1037,62 @@ impl TuiApp {
                             Some(TuiCommand::LoadImageTar {
                                 sandbox_id,
                                 host_tar_path: PathBuf::from(unquoted),
+                            })
+                        }
+                        PromptKind::BuildImage { sandbox_id } => {
+                            let tokens = match split_shell_words(&trimmed) {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    self.push_log(LogTone::Error, format!("Invalid input: {err}"));
+                                    return None;
+                                }
+                            };
+                            if tokens.len() != 2 {
+                                self.push_log(
+                                    LogTone::Warn,
+                                    "Expected `<context_dir> <image:tag>` (quote path if it contains spaces).",
+                                );
+                                return None;
+                            }
+                            self.busy_label = Some(format!(
+                                "Building image '{}' in {sandbox_id}...",
+                                tokens[1]
+                            ));
+                            Some(TuiCommand::BuildImage {
+                                sandbox_id,
+                                context_dir: PathBuf::from(&tokens[0]),
+                                tag: tokens[1].clone(),
+                            })
+                        }
+                        PromptKind::ComposeUp { sandbox_id } => {
+                            let unquoted = trimmed
+                                .trim_matches('"')
+                                .trim_matches('\'')
+                                .trim()
+                                .to_owned();
+                            if unquoted.is_empty() {
+                                self.push_log(LogTone::Warn, "Compose path was empty; cancelled.");
+                                return None;
+                            }
+                            let mut path = PathBuf::from(&unquoted);
+                            if path.is_dir() {
+                                for candidate in [
+                                    "compose.yaml",
+                                    "compose.yml",
+                                    "docker-compose.yml",
+                                    "docker-compose.yaml",
+                                ] {
+                                    if path.join(candidate).is_file() {
+                                        path = path.join(candidate);
+                                        break;
+                                    }
+                                }
+                            }
+                            self.busy_label =
+                                Some(format!("Deploying Compose stack into {sandbox_id}..."));
+                            Some(TuiCommand::ComposeUp {
+                                sandbox_id,
+                                compose_path: path,
                             })
                         }
                     }
@@ -1529,18 +1646,22 @@ fn draw_footer(f: &mut Frame<'_>, _app: &TuiApp, area: Rect) {
         Span::styled("Containers: ", Style::default().fg(Color::DarkGray)),
         hotkey_span("c"),
         Span::raw(" List  "),
+        hotkey_span("b"),
+        Span::raw(" Build  "),
+        hotkey_span("C"),
+        Span::raw(" Compose  "),
         hotkey_span("i"),
         Span::raw(" Load .tar  "),
         hotkey_span("n"),
-        Span::raw(" Run Ctr  "),
+        Span::raw(" Run  "),
         hotkey_span("x"),
-        Span::raw(" Ctr Exec  "),
+        Span::raw(" Exec  "),
         hotkey_span("l"),
         Span::raw(" Logs  "),
         hotkey_span("S"),
         Span::raw(" Start/Stop  "),
         hotkey_span("X"),
-        Span::raw(" Rm Ctr"),
+        Span::raw(" Rm"),
     ]);
     f.render_widget(Paragraph::new(vec![line1, line2]), area);
 }
@@ -1678,7 +1799,7 @@ fn draw_modal(f: &mut Frame<'_>, modal: &Modal, root: Rect) {
             }
         }
         Modal::Help => {
-            let area = centered_rect(78, 19, root);
+            let area = centered_rect(78, 21, root);
             f.render_widget(Clear, area);
             let help_text = "\
 Navigation & Views:
@@ -1696,6 +1817,8 @@ Sandbox Lifecycle:
 
 Guest Podman Container Administration:
   c (or Enter on VM)      Refresh `podman ps -a` inside selected sandbox
+  b                       Build image from host folder + Dockerfile (`podman build`)
+  C (Shift+c)             Deploy Compose stack (`compose.yaml` / `docker-compose.yml`)
   i                       Stream host OCI `.tar` archive into guest (`podman load`)
   n                       Run new detached container (`podman run -d ...`)
   x                       Execute command inside selected container (`ExecTarget::Container`)
@@ -2149,6 +2272,143 @@ fn dispatch_tui_command(
                             stderr: String::new(),
                             refresh_all: false,
                             refresh_containers_for: None,
+                            select_sandbox: None,
+                        });
+                    }
+                }
+            });
+        }
+        TuiCommand::BuildImage {
+            sandbox_id,
+            context_dir,
+            tag,
+        } => {
+            tokio::spawn(async move {
+                let spec = ImageBuildSpec {
+                    context_dir: context_dir.clone(),
+                    dockerfile: None,
+                    tags: vec![tag.clone()],
+                    build_args: Vec::new(),
+                    target: None,
+                    no_cache: false,
+                    output_tar: None,
+                    deadline: Duration::from_secs(300),
+                };
+                match build_image_in_sandbox(&client, &sandbox_id, spec, false).await {
+                    Ok(res) if res.exit.code == Some(0) && !res.exit.timed_out => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Success,
+                                text: format!(
+                                    "[OK] Built image '{tag}' in {sandbox_id} from '{}'",
+                                    context_dir.display()
+                                ),
+                            },
+                            stdout: res.stdout,
+                            stderr: res.stderr,
+                            refresh_all: false,
+                            refresh_containers_for: None,
+                            select_sandbox: None,
+                        });
+                    }
+                    Ok(res) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Error,
+                                text: format!(
+                                    "[ERR] Build failed for '{tag}' (exit={:?}, timed_out={})",
+                                    res.exit.code, res.exit.timed_out
+                                ),
+                            },
+                            stdout: res.stdout,
+                            stderr: res.stderr,
+                            refresh_all: false,
+                            refresh_containers_for: None,
+                            select_sandbox: None,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Error,
+                                text: format!("[ERR] Build error for '{tag}': {err}"),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: false,
+                            refresh_containers_for: None,
+                            select_sandbox: None,
+                        });
+                    }
+                }
+            });
+        }
+        TuiCommand::ComposeUp {
+            sandbox_id,
+            compose_path,
+        } => {
+            tokio::spawn(async move {
+                let res = async {
+                    let spec = load_compose_spec_from_path(&compose_path, None)?;
+                    let started = compose_up_in_sandbox(
+                        &client,
+                        &sandbox_id,
+                        &spec,
+                        true,
+                        Duration::from_secs(300),
+                        false,
+                    )
+                    .await?;
+                    Ok::<_, SandboxError>((spec.project_name, started))
+                }
+                .await;
+
+                match res {
+                    Ok((proj, started)) => {
+                        let summary_lines: Vec<String> = started
+                            .iter()
+                            .map(|s| {
+                                let ports = if s.host_ports.is_empty() {
+                                    "no host ports".to_owned()
+                                } else {
+                                    s.host_ports.join(", ")
+                                };
+                                format!("  {} ({}) -> {}", s.service, s.container_name, ports)
+                            })
+                            .collect();
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Success,
+                                text: format!(
+                                    "[OK] Compose stack '{proj}' up in {sandbox_id} ({} service(s)):",
+                                    started.len()
+                                ),
+                            },
+                            stdout: summary_lines.join("\n"),
+                            stderr: String::new(),
+                            refresh_all: true,
+                            refresh_containers_for: Some(sandbox_id),
+                            select_sandbox: None,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Error,
+                                text: format!(
+                                    "[ERR] Compose up failed for '{}': {err}",
+                                    compose_path.display()
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: true,
+                            refresh_containers_for: Some(sandbox_id),
                             select_sandbox: None,
                         });
                     }
