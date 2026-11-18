@@ -1,0 +1,33 @@
+{
+  "name": "@orggem/mini-pod",
+  "version": "0.1.0",
+  "description": "Command-line client and daemon for the mini-pod sandbox runtime",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OrgGem/mini-pod.git",
+    "directory": "npm"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "sandbox-cli": "bin/sandbox-cli.js",
+    "sandboxd": "bin/sandboxd.js"
+  },
+  "files": [
+    "bin",
+    "launcher.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@orggem/mini-pod-win32-x64": "0.1.0",
+    "@orggem/mini-pod-linux-x64": "0.1.0",
+    "@orggem/mini-pod-linux-arm64": "0.1.0",
+    "@orggem/mini-pod-darwin-x64": "0.1.0",
+    "@orggem/mini-pod-darwin-arm64": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -115,6 +115,8 @@ Prebuilt archives containing `sandboxd`, `sandbox-cli`, and `bundle-pack` (along
 - **Linux (`x86_64` / `aarch64`):** `mini-pod-<version>-x86_64-unknown-linux-gnu.tar.gz`, `mini-pod-<version>-aarch64-unknown-linux-gnu.tar.gz`
 - **macOS (`x86_64` / `aarch64`):** `mini-pod-<version>-x86_64-apple-darwin.tar.gz`, `mini-pod-<version>-aarch64-apple-darwin.tar.gz`
 
+Once an npm release has been published, Node.js 18+ users can install the CLI and daemon with `npm install -g @orggem/mini-pod`. Optional platform packages must be enabled; Linux packages use glibc and do not support Alpine/musl. QEMU and a signed guest runtime bundle are installed separately. The [npm release procedure](docs/npm-release.md) describes how to build and publish the packages.
+
 ### 2.3 Build & Install Binaries from Source
 
 Clone the repository and build the workspace in release mode:

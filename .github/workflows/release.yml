@@ -60,12 +60,27 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binaries (sandboxd, sandbox-cli, bundle-pack)
+        shell: bash
         run: |
           cargo build --locked --release --target ${{ matrix.target }} \
             -p sandboxd \
             -p sandbox-cli \
             -p sandbox-image \
             --bins
+
+      - name: Smoke-test host binaries on native architecture
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BIN_EXT: ${{ matrix.bin_ext }}
+        run: |
+          set -euo pipefail
+          case "$TARGET:$(uname -m)" in
+            x86_64-apple-darwin:x86_64|aarch64-apple-darwin:arm64) ;;
+            *-apple-darwin:*) echo "Skipping non-native macOS target $TARGET"; exit 0 ;;
+          esac
+          "target/$TARGET/release/sandbox-cli$BIN_EXT" --help
+          "target/$TARGET/release/sandboxd$BIN_EXT" --help
 
       - name: Package release archive (Unix)
         if: runner.os != 'Windows'
@@ -141,6 +156,158 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-npm-main:
+    name: Build npm main package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Test npm packaging
+        run: node --test npm/test/*.test.js
+      - name: Check workspace and npm versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --no-deps --format-version 1 | node -e '
+            let json = "";
+            process.stdin.on("data", chunk => json += chunk);
+            process.stdin.on("end", () => {
+              const metadata = JSON.parse(json);
+              const versions = ["sandbox-cli", "sandboxd"].map(name => metadata.packages.find(pkg => pkg.name === name)?.version);
+              const expected = require("./npm/package.json").version;
+              if (versions.some(version => version !== expected)) {
+                console.error(`npm version ${expected} does not match Rust package versions ${versions.join(", ")}`);
+                process.exitCode = 1;
+              }
+            });'
+      - name: Stage and pack main package
+        shell: bash
+        env:
+          VERSION_LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.event.inputs.version || 'dev' }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "process.argv[1] === 'dev' ? require('./npm/package.json').version + '-dev' : process.argv[1].replace(/^v/, '')" "$VERSION_LABEL")"
+          mkdir -p npm-stage npm-dist
+          node npm/scripts/stage.js main "$VERSION" npm-stage/main
+          npm pack ./npm-stage/main --pack-destination ./npm-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-main
+          path: npm-dist/*.tgz
+          if-no-files-found: error
+
+  build-npm-platform:
+    name: Build npm platform package (${{ matrix.target }})
+    needs: [build-host, build-npm-main]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-${{ matrix.target }}
+          path: host-artifact
+      - name: Stage and pack platform package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION_LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.event.inputs.version || 'dev' }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "process.argv[1] === 'dev' ? require('./npm/package.json').version + '-dev' : process.argv[1].replace(/^v/, '')" "$VERSION_LABEL")"
+          mkdir -p extracted npm-stage npm-dist
+          shopt -s nullglob
+          archives=(host-artifact/*.zip host-artifact/*.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "Expected one host archive for ${TARGET}" >&2
+            exit 1
+          fi
+          checksums=(host-artifact/*.sha256)
+          if [ "${#checksums[@]}" -ne 1 ]; then
+            echo "Expected one host checksum for ${TARGET}" >&2
+            exit 1
+          fi
+          (cd host-artifact && sha256sum -c "$(basename "${checksums[0]}")")
+          if [[ "${archives[0]}" == *.zip ]]; then
+            unzip -q "${archives[0]}" -d extracted
+          else
+            tar -xzf "${archives[0]}" -C extracted
+          fi
+          directories=(extracted/*/)
+          if [ "${#directories[@]}" -ne 1 ]; then
+            echo "Expected one host archive directory for ${TARGET}" >&2
+            exit 1
+          fi
+          node npm/scripts/stage.js "$TARGET" "$VERSION" npm-stage/platform "${directories[0]}"
+          npm pack ./npm-stage/platform --pack-destination ./npm-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-platform-${{ matrix.target }}
+          path: npm-dist/*.tgz
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm packages
+    needs: [build-npm-main, build-npm-platform]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.NPM_PUBLISH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: npm-artifacts
+      - name: Publish platform packages, then main package
+        shell: bash
+        env:
+          VERSION_LABEL: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          TAG=latest
+          if [[ "$VERSION_LABEL" == *-* ]]; then TAG=next; fi
+          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            packages=("npm-artifacts/npm-platform-${target}/"*.tgz)
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "Expected one npm artifact for ${target}" >&2
+              exit 1
+            fi
+            npm publish "${packages[0]}" --access public --tag "$TAG"
+          done
+          packages=(npm-artifacts/npm-main/*.tgz)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "Expected one npm main artifact" >&2
+            exit 1
+          fi
+          npm publish "${packages[0]}" --access public --tag "$TAG"
+
   build-guest-linux-musl:
     name: Guest Static Musl Binaries (${{ matrix.guest_arch }})
     runs-on: ${{ matrix.os }}
@@ -215,9 +382,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Download all release artifacts
+      - name: Download host release artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: host-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download guest release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: guest-*
           path: release-assets
           merge-multiple: true
 

@@ -1,0 +1,103 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const test = require('node:test');
+
+const { platformPackage } = require('../launcher');
+const { stage } = require('../scripts/stage');
+const main = require('../package.json');
+
+function tempDir(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mini-pod-npm-test-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+function installFixture(root, { withBinaryPackage }) {
+  const stagedMain = path.join(root, 'staged-main');
+  stage('main', main.version, stagedMain);
+  const installRoot = path.join(root, 'install', 'node_modules', '@orggem');
+  const installedMain = path.join(installRoot, 'mini-pod');
+  fs.mkdirSync(installRoot, { recursive: true });
+  fs.cpSync(stagedMain, installedMain, { recursive: true });
+
+  if (withBinaryPackage) {
+    const binaryPackage = path.join(installRoot, 'mini-pod-win32-x64');
+    stage('x86_64-pc-windows-msvc', main.version, binaryPackage, path.resolve(__dirname, '../../target/release'));
+  }
+  return installedMain;
+}
+
+test('launcher maps supported platforms and requires glibc on Linux', () => {
+  assert.equal(platformPackage('win32', 'x64'), '@orggem/mini-pod-win32-x64');
+  assert.equal(platformPackage('darwin', 'arm64'), '@orggem/mini-pod-darwin-arm64');
+  assert.equal(platformPackage('linux', 'x64', '2.35'), '@orggem/mini-pod-linux-x64');
+  assert.throws(() => platformPackage('linux', 'x64', undefined), /glibc.*musl/i);
+  assert.throws(() => platformPackage('linux', 'arm64', undefined), /glibc.*musl/i);
+  assert.throws(() => platformPackage('win32', 'arm64'), /Unsupported platform/);
+});
+
+test('installed Windows package forwards arguments and stdio and preserves CLI exit status', { skip: process.platform !== 'win32' }, t => {
+  const root = tempDir(t);
+  const installedMain = installFixture(root, { withBinaryPackage: true });
+  const cli = path.join(installedMain, 'bin', 'sandbox-cli.js');
+  const help = spawnSync(process.execPath, [cli, '--help'], { encoding: 'utf8' });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /USAGE:/);
+  assert.match(help.stdout, /docker-endpoint/);
+
+  const invalid = spawnSync(process.execPath, [cli, '--definitely-invalid-option'], { encoding: 'utf8' });
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /sandbox-cli error/i);
+  assert.match(invalid.stderr, /definitely-invalid-option/);
+
+  const daemonHelp = spawnSync(process.execPath, [path.join(installedMain, 'bin', 'sandboxd.js'), '--help'], { encoding: 'utf8' });
+  assert.equal(daemonHelp.status, 0, daemonHelp.stderr);
+  assert.match(daemonHelp.stdout, /serve|mcp/);
+});
+
+test('missing optional binary dependency reports an actionable install error', { skip: process.platform !== 'win32' }, t => {
+  const root = tempDir(t);
+  const installedMain = installFixture(root, { withBinaryPackage: false });
+  const result = spawnSync(process.execPath, [path.join(installedMain, 'bin', 'sandbox-cli.js'), '--help'], { encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /binary package is missing/i);
+  assert.match(result.stderr, /optional dependencies/i);
+});
+
+test('Unix launcher forwards spaced arguments, stdio, and the binary exit status', { skip: process.platform === 'win32' }, t => {
+  const root = tempDir(t);
+  const stagedMain = path.join(root, 'staged-main');
+  stage('main', main.version, stagedMain);
+  const installRoot = path.join(root, 'install', 'node_modules', '@orggem');
+  const installedMain = path.join(installRoot, 'mini-pod');
+  fs.mkdirSync(installRoot, { recursive: true });
+  fs.cpSync(stagedMain, installedMain, { recursive: true });
+
+  const glibcVersion = process.platform === 'linux'
+    ? process.report.getReport().header.glibcVersionRuntime
+    : undefined;
+  const binaryPackageName = platformPackage(process.platform, process.arch, glibcVersion).split('/')[1];
+  const binaryPackage = path.join(installRoot, binaryPackageName);
+  const binaryDirectory = path.join(binaryPackage, 'bin');
+  fs.mkdirSync(binaryDirectory, { recursive: true });
+  fs.writeFileSync(path.join(binaryPackage, 'package.json'), JSON.stringify({ name: `@orggem/${binaryPackageName}`, version: main.version }));
+  const fakeBinary = path.join(binaryDirectory, 'sandbox-cli');
+  fs.writeFileSync(fakeBinary, [
+    '#!/usr/bin/env node',
+    'const args = process.argv.slice(2);',
+    'process.stdout.write(JSON.stringify(args) + "\\n");',
+    'if (args.includes("--fail")) { process.stderr.write("fake failure\\n"); process.exitCode = 7; }',
+    '',
+  ].join('\n'));
+  fs.chmodSync(fakeBinary, 0o755);
+
+  const result = spawnSync(process.execPath, [path.join(installedMain, 'bin', 'sandbox-cli.js'), 'a value with spaces', '--fail'], { encoding: 'utf8' });
+  assert.equal(result.status, 7);
+  assert.deepEqual(JSON.parse(result.stdout), ['a value with spaces', '--fail']);
+  assert.equal(result.stderr, 'fake failure\n');
+});
