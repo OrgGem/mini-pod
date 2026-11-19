@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use sandbox_core::{AccelerationPolicy, GuestArch, SandboxError};
 
