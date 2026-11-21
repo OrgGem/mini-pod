@@ -617,6 +617,14 @@ impl SandboxClient {
         }
     }
 
+    /// Returns diagnostics evaluated using the daemon's configured runtime inputs.
+    pub async fn doctor(&self) -> Result<serde_json::Value, SandboxError> {
+        match self.rpc(ControlRequest::Doctor).await? {
+            ControlResponse::Doctor { report } => Ok(report),
+            other => Err(unexpected_response("Doctor", &other)),
+        }
+    }
+
     /// Lists live metadata for all active sandboxes owned by `sandboxd`.
     pub async fn list_sandboxes(&self) -> Result<Vec<SandboxSummaryInfo>, SandboxError> {
         match self.rpc(ControlRequest::ListSandboxes).await? {

@@ -3,6 +3,7 @@
 
 mod cli;
 mod compose;
+mod doctor;
 mod image_build;
 mod run;
 mod tui;

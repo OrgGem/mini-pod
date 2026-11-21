@@ -208,6 +208,7 @@ impl SandboxSummaryInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlRequest {
     Status,
+    Doctor,
     ListSandboxes,
     Spawn {
         spec: SandboxSpec,
@@ -244,6 +245,7 @@ impl ControlRequest {
     pub fn to_json_value(&self) -> Value {
         match self {
             Self::Status => json!({ "type": "Status" }),
+            Self::Doctor => json!({ "type": "Doctor" }),
             Self::ListSandboxes => json!({ "type": "ListSandboxes" }),
             Self::Spawn { spec } => json!({
                 "type": "Spawn",
@@ -296,6 +298,7 @@ impl ControlRequest {
         let kind = req_string(obj, "type", "ControlRequest")?;
         match kind.as_str() {
             "Status" => Ok(Self::Status),
+            "Doctor" => Ok(Self::Doctor),
             "ListSandboxes" => Ok(Self::ListSandboxes),
             "Spawn" => Ok(Self::Spawn {
                 spec: decode_sandbox_spec(req_field(obj, "spec", "ControlRequest::Spawn")?)?,
@@ -351,6 +354,7 @@ impl ControlRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlResponse {
     Status(DaemonStatusInfo),
+    Doctor { report: Value },
     SandboxList { sandboxes: Vec<SandboxSummaryInfo> },
     Spawned(SandboxLease),
     Ack,
@@ -369,6 +373,7 @@ impl ControlResponse {
                 "type": "Status",
                 "status": info.to_json_value(),
             }),
+            Self::Doctor { report } => json!({ "type": "Doctor", "report": report }),
             Self::SandboxList { sandboxes } => json!({
                 "type": "SandboxList",
                 "sandboxes": sandboxes.iter().map(SandboxSummaryInfo::to_json_value).collect::<Vec<_>>(),
@@ -411,6 +416,17 @@ impl ControlResponse {
                 "status",
                 "ControlResponse::Status",
             )?)?)),
+            "Doctor" => {
+                let report = req_field(obj, "report", "ControlResponse::Doctor")?;
+                if !report.is_object() {
+                    return Err(SandboxError::Transport(
+                        "ControlResponse::Doctor.report must be an object".to_owned(),
+                    ));
+                }
+                Ok(Self::Doctor {
+                    report: report.clone(),
+                })
+            }
             "SandboxList" => {
                 let arr = req_field(obj, "sandboxes", "ControlResponse::SandboxList")?
                     .as_array()

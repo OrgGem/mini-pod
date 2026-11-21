@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::ServeConfig;
+use crate::doctor::{self, DoctorInputs};
 
 const CONTAINER_EGRESS_PROXY_URL: &str = "http://10.88.0.1:3128";
 const EXEC_CLIENT_MSG_QUEUE_DEPTH: usize = 32;
@@ -88,6 +89,7 @@ pub struct DaemonState {
     runtime: Arc<LocalRuntimeManager>,
     docker_compat: Arc<Mutex<HashMap<SandboxId, CachedDockerCompat>>>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    doctor_inputs: Option<DoctorInputs>,
 }
 
 impl DaemonState {
@@ -127,6 +129,7 @@ impl DaemonState {
             runtime,
             docker_compat,
             shutdown_tx,
+            doctor_inputs: None,
         }
     }
 
@@ -358,6 +361,12 @@ pub fn daemon_status_info(runtime: &LocalRuntimeManager) -> DaemonStatusInfo {
 /// Wires adapters into [`LocalRuntimeManager`], reconciles crash journals, starts the lease
 /// sweeper, and optionally pre-warms the Warm Pool.
 pub async fn build_runtime(cfg: &ServeConfig) -> Result<Arc<LocalRuntimeManager>, SandboxError> {
+    Ok(build_runtime_with_doctor(cfg).await?.0)
+}
+
+async fn build_runtime_with_doctor(
+    cfg: &ServeConfig,
+) -> Result<(Arc<LocalRuntimeManager>, DoctorInputs), SandboxError> {
     let verifier = cfg.pub_key.load_verifier()?;
     let bundle_dir = cfg.bundle_dir.clone();
     let verifier_for_check = verifier.clone();
@@ -369,6 +378,13 @@ pub async fn build_runtime(cfg: &ServeConfig) -> Result<Arc<LocalRuntimeManager>
 
     let qemu_img_bin = discover_qemu_img_binary(cfg.qemu_img_bin.as_deref())?;
     let qemu_bin = discover_qemu_binary_for_arch(cfg.arch, cfg.qemu_bin.as_deref())?;
+    let doctor_inputs = DoctorInputs {
+        bundle_dir: cfg.bundle_dir.clone(),
+        verifier: verifier.clone(),
+        qemu_bin: qemu_bin.clone(),
+        qemu_img_bin: qemu_img_bin.clone(),
+        arch: cfg.arch,
+    };
 
     let helper_runner = Arc::new(|prog: &Path, args: &[std::ffi::OsString], timeout: Duration| {
         let out = run_confined_command_bounded(prog, args, timeout, 1024 * 1024)?;
@@ -410,16 +426,18 @@ pub async fn build_runtime(cfg: &ServeConfig) -> Result<Arc<LocalRuntimeManager>
         let _replenisher = runtime.spawn_warm_pool_replenisher();
     }
 
-    Ok(runtime)
+    Ok((runtime, doctor_inputs))
 }
 
 /// Runs the local owner-only control daemon until SIGINT (`Ctrl-C`), `SIGTERM`, or `ControlRequest::Shutdown`.
 pub async fn run_serve(cfg: ServeConfig) -> Result<(), SandboxError> {
     cfg.endpoint.validate()?;
 
-    let runtime = build_runtime(&cfg).await?;
+    let (runtime, doctor_inputs) = build_runtime_with_doctor(&cfg).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let state = Arc::new(DaemonState::with_shutdown(runtime, shutdown_tx.clone()));
+    let mut daemon = DaemonState::with_shutdown(runtime, shutdown_tx.clone());
+    daemon.doctor_inputs = Some(doctor_inputs);
+    let state = Arc::new(daemon);
 
     let signal_tx = shutdown_tx;
     let signal_handle = tokio::spawn(async move {
@@ -833,6 +851,19 @@ where
 async fn dispatch_unary_request(state: &DaemonState, req: ControlRequest) -> ControlResponse {
     match req {
         ControlRequest::Status => ControlResponse::Status(state.status()),
+        ControlRequest::Doctor => {
+            let Some(inputs) = state.doctor_inputs.clone() else {
+                return ControlResponse::Doctor {
+                    report: doctor::unknown(),
+                };
+            };
+            match tokio::task::spawn_blocking(move || inputs.collect()).await {
+                Ok(report) => ControlResponse::Doctor { report },
+                Err(error) => ControlResponse::Error(WireError::from(SandboxError::Internal(
+                    format!("doctor task failed: {error}"),
+                ))),
+            }
+        }
         ControlRequest::ListSandboxes => ControlResponse::SandboxList {
             sandboxes: state.list_sandboxes(),
         },

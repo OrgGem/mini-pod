@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
 use crate::compose::{execute_compose, ComposeAction};
+use crate::doctor::execute_doctor;
 use crate::image_build::{build_image_in_sandbox, ImageBuildSpec};
 use crate::run::{execute_run, RunSpec};
 
@@ -32,6 +33,7 @@ GLOBAL OPTIONS:
 
 SUBCOMMANDS:
     status
+    doctor
     list
     tui [--refresh-ms <N>]
     spawn [OPTIONS]
@@ -97,6 +99,7 @@ pub enum CliOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     Status,
+    Doctor,
     List,
     Tui {
         refresh_interval: Duration,
@@ -201,6 +204,13 @@ where
             match check_help_in_rest(rest) {
                 true => return Ok(CliOutcome::Help(USAGE_TEXT)),
                 false => CliCommand::Status,
+            }
+        }
+        "doctor" => {
+            parse_no_args_subcommand(rest, "doctor", &mut endpoint_raw, &mut json_output)?;
+            match check_help_in_rest(rest) {
+                true => return Ok(CliOutcome::Help(USAGE_TEXT)),
+                false => CliCommand::Doctor,
             }
         }
         "list" => {
@@ -1380,6 +1390,7 @@ pub async fn execute_with_client(
     command: CliCommand,
 ) -> Result<u8, SandboxError> {
     match command {
+        CliCommand::Doctor => execute_doctor(client, json_mode).await,
         CliCommand::Status => {
             let info = client.status().await?;
             if json_mode {
