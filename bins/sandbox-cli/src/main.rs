@@ -10,7 +10,7 @@ mod tui;
 
 use std::process::ExitCode;
 
-use cli::{execute_cli, parse_env_args, CliOutcome};
+use cli::{execute_cli, parse_env_args, CliCommand, CliOutcome};
 
 fn main() -> ExitCode {
     let parsed = match parse_env_args() {
@@ -36,7 +36,19 @@ fn main() -> ExitCode {
         }
     };
 
-    match rt.block_on(execute_cli(parsed)) {
+    let bounded_shutdown = matches!(
+        &parsed.command,
+        CliCommand::Run(_) | CliCommand::Doctor { smoke: Some(_) }
+    );
+    let result = rt.block_on(execute_cli(parsed));
+    if bounded_shutdown {
+        // A cancelled stdout/stderr write can still be blocked in Tokio's blocking pool.
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    } else {
+        drop(rt);
+    }
+
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("sandbox-cli error: {err}");

@@ -366,6 +366,20 @@ async fn run_cli(endpoint: &str, extra: &[&str]) -> Output {
     .expect("join sandbox-cli task")
 }
 
+async fn run_cli_plain(endpoint: &str, extra: &[&str]) -> Output {
+    let endpoint = endpoint.to_owned();
+    let extra = extra.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sandbox-cli"))
+            .args(["--endpoint", &endpoint, "doctor", "--smoke"])
+            .args(extra)
+            .output()
+            .expect("execute plain sandbox-cli doctor subprocess")
+    })
+    .await
+    .expect("join plain sandbox-cli task")
+}
+
 fn parse_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
         panic!(
@@ -403,6 +417,27 @@ async fn doctor_smoke_runs_isolated_vm_and_reports_driver_accelerator() {
     assert_eq!(spec.network, NetworkPolicy::Isolated);
     assert_eq!(spec.budget.guest_vcpus, 1);
     drop(state);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn doctor_smoke_plain_output_shows_the_active_accelerator() {
+    let temp = TestTempDir::new("plain-accelerator");
+    let state = new_state(MockConfig::default());
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+
+    let output = run_cli_plain(&daemon.endpoint, &[]).await;
+
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("smoke accelerator: ok tcg"),
+        "plain doctor output must expose the active accelerator, got: {text}"
+    );
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["status", "doctor", "spawn", "accelerator", "exec", "destroy"]
+    );
     daemon.stop().await;
 }
 

@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sandbox_client::{ClientOutputKind, SandboxClient};
+use sandbox_client::{extract_tar_bytes_safely, ClientOutputKind, SandboxClient};
 use sandbox_core::safe_tar::ensure_safe_dir_path;
 use sandbox_core::{
     AccelerationPolicy, DestroyStatus, ExecExitStatus, ExecRequest, SandboxError, SandboxId,
@@ -246,7 +246,25 @@ async fn run_once(
     }
 
     let (signal_task, mut interrupted) = watch_interrupts()?;
-    let lease = match client.spawn(run.spec).await {
+    let spawn = client.spawn(run.spec);
+    tokio::pin!(spawn);
+    let spawn_result = tokio::select! {
+        result = &mut spawn => Some(result),
+        _ = interrupted.changed() => {
+            tokio::time::timeout(Duration::from_secs(2), &mut spawn).await.ok()
+        },
+    };
+    let Some(spawn_result) = spawn_result else {
+        report.interrupted = *interrupted.borrow();
+        report.error = Some("spawn interrupted before a sandbox ID was received".to_owned());
+        report.cleanup_status = "unknown";
+        report.cleanup_error = Some(
+            "no sandbox ID was received; allocation and cleanup cannot be confirmed".to_owned(),
+        );
+        signal_task.abort();
+        return Ok(report);
+    };
+    let lease = match spawn_result {
         Ok(lease) => lease,
         Err(error) => {
             report.interrupted = *interrupted.borrow();
@@ -442,7 +460,23 @@ async fn execute_workload(
     renewal: &mut watch::Receiver<Option<String>>,
     report: &mut RunReport,
 ) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now().checked_add(request.deadline);
+    let watchdog = async move {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(watchdog);
     let mut stream = tokio::select! {
+        biased;
+        _ = &mut watchdog => {
+            report.workload_status = "failed";
+            report.exit = Some(ExecExitStatus {
+                code: None, timed_out: true, stdout_truncated: false, stderr_truncated: false,
+            });
+            return Ok(());
+        },
         result = client.exec_stream(id, request.clone()) => result.map_err(|error| format!("failed to start execution: {error}"))?,
         _ = interrupted.changed() => {
             record_abort(interrupted, renewal, report);
@@ -455,69 +489,122 @@ async fn execute_workload(
     };
     stream.close_stdin();
     report.workload_status = "failed";
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
+    enum Completion {
+        Exited(ExecExitStatus),
+        BudgetExceeded(ClientOutputKind),
+    }
+    enum Outcome {
+        Finished(Result<Completion, String>),
+        TimedOut,
+        Interrupted,
+        LeaseFailed,
+    }
 
-    loop {
-        if !record_abort(interrupted, renewal, report) {
+    let outcome = {
+        let processing = async {
+            let mut stdout = tokio::io::stdout();
+            let mut stderr = tokio::io::stderr();
+            let mut stdout_bytes = 0u64;
+            let mut stderr_bytes = 0u64;
+            while let Some(chunk) = stream.next_output().await {
+                let (count, budget) = match chunk.stream {
+                    ClientOutputKind::Stdout => (&mut stdout_bytes, request.stdout_budget_bytes),
+                    ClientOutputKind::Stderr => (&mut stderr_bytes, request.stderr_budget_bytes),
+                };
+                let remaining = budget.saturating_sub(*count);
+                let allowed = chunk
+                    .data
+                    .len()
+                    .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                let bytes = &chunk.data[..allowed];
+                *count += allowed as u64;
+                if json_mode {
+                    match chunk.stream {
+                        ClientOutputKind::Stdout => report.stdout.extend_from_slice(bytes),
+                        ClientOutputKind::Stderr => report.stderr.extend_from_slice(bytes),
+                    }
+                } else {
+                    let output: &mut (dyn tokio::io::AsyncWrite + Unpin) = match chunk.stream {
+                        ClientOutputKind::Stdout => &mut stdout,
+                        ClientOutputKind::Stderr => &mut stderr,
+                    };
+                    output
+                        .write_all(bytes)
+                        .await
+                        .map_err(|error| format!("failed writing execution output: {error}"))?;
+                    output
+                        .flush()
+                        .await
+                        .map_err(|error| format!("failed flushing execution output: {error}"))?;
+                }
+                if allowed < chunk.data.len() {
+                    return Ok(Completion::BudgetExceeded(chunk.stream));
+                }
+            }
+            stream
+                .wait_exit()
+                .await
+                .map(Completion::Exited)
+                .map_err(|error| format!("execution failed: {error}"))
+        };
+        tokio::pin!(processing);
+        tokio::select! {
+            biased;
+            _ = &mut watchdog => Outcome::TimedOut,
+            _ = interrupted.changed() => Outcome::Interrupted,
+            _ = renewal.changed() => Outcome::LeaseFailed,
+            result = &mut processing => Outcome::Finished(result),
+        }
+    };
+
+    match outcome {
+        Outcome::Finished(Ok(Completion::Exited(exit))) => {
+            report.exit = Some(exit);
+            if exit.code == Some(0)
+                && !exit.timed_out
+                && !exit.stdout_truncated
+                && !exit.stderr_truncated
+            {
+                report.workload_status = "completed";
+            }
+            Ok(())
+        }
+        Outcome::Finished(Ok(Completion::BudgetExceeded(kind))) => {
             let _ = stream.cancel();
             let _ = tokio::time::timeout(Duration::from_secs(2), stream.wait_exit()).await;
-            return Err(report
+            report.exit = Some(ExecExitStatus {
+                code: None,
+                timed_out: false,
+                stdout_truncated: kind == ClientOutputKind::Stdout,
+                stderr_truncated: kind == ClientOutputKind::Stderr,
+            });
+            Ok(())
+        }
+        Outcome::Finished(Err(error)) => {
+            let _ = stream.cancel();
+            Err(error)
+        }
+        Outcome::TimedOut => {
+            let _ = stream.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.wait_exit()).await;
+            report.exit = Some(ExecExitStatus {
+                code: None,
+                timed_out: true,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+            Ok(())
+        }
+        Outcome::Interrupted | Outcome::LeaseFailed => {
+            let _ = stream.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.wait_exit()).await;
+            record_abort(interrupted, renewal, report);
+            Err(report
                 .error
                 .clone()
-                .unwrap_or_else(|| "interrupted".to_owned()));
-        }
-        let next = tokio::select! {
-            chunk = stream.next_output() => chunk,
-            _ = interrupted.changed() => continue,
-            _ = renewal.changed() => continue,
-        };
-        let Some(chunk) = next else { break };
-        if json_mode {
-            let (output, budget) = match chunk.stream {
-                ClientOutputKind::Stdout => (&mut report.stdout, request.stdout_budget_bytes),
-                ClientOutputKind::Stderr => (&mut report.stderr, request.stderr_budget_bytes),
-            };
-            if output.len() as u64 + chunk.data.len() as u64 > budget {
-                let _ = stream.cancel();
-                return Err("execution output exceeded its configured budget".to_owned());
-            }
-            output.extend_from_slice(&chunk.data);
-        } else {
-            let write_result = match chunk.stream {
-                ClientOutputKind::Stdout => match stdout.write_all(&chunk.data).await {
-                    Ok(()) => stdout.flush().await,
-                    Err(error) => Err(error),
-                },
-                ClientOutputKind::Stderr => match stderr.write_all(&chunk.data).await {
-                    Ok(()) => stderr.flush().await,
-                    Err(error) => Err(error),
-                },
-            };
-            if let Err(error) = write_result {
-                let _ = stream.cancel();
-                return Err(format!("failed writing execution output: {error}"));
-            }
+                .unwrap_or_else(|| "execution was stopped".to_owned()))
         }
     }
-    let exit = tokio::select! {
-        result = stream.wait_exit() => result.map_err(|error| format!("execution failed: {error}"))?,
-        _ = interrupted.changed() => {
-            let _ = stream.cancel();
-            record_abort(interrupted, renewal, report);
-            return Err(report.error.clone().unwrap_or_else(|| "interrupted".to_owned()));
-        },
-        _ = renewal.changed() => {
-            let _ = stream.cancel();
-            record_abort(interrupted, renewal, report);
-            return Err(report.error.clone().unwrap_or_else(|| "lease renewal stopped".to_owned()));
-        },
-    };
-    report.exit = Some(exit);
-    if exit.code == Some(0) && !exit.timed_out && !exit.stdout_truncated && !exit.stderr_truncated {
-        report.workload_status = "completed";
-    }
-    Ok(())
 }
 
 fn record_abort(
@@ -605,19 +692,42 @@ async fn copy_output(
     id: &SandboxId,
     source: &str,
     destination: &Path,
-    interrupted: &watch::Receiver<bool>,
-    renewal: &watch::Receiver<Option<String>>,
+    interrupted: &mut watch::Receiver<bool>,
+    renewal: &mut watch::Receiver<Option<String>>,
 ) -> Result<u64, String> {
+    if *interrupted.borrow() {
+        return Err("interrupted before downloading output".to_owned());
+    }
+    if let Some(error) = renewal.borrow().as_ref() {
+        return Err(error.clone());
+    }
+    let tar_bytes = tokio::select! {
+        biased;
+        _ = interrupted.changed() => return Err("interrupted while downloading output".to_owned()),
+        _ = renewal.changed() => return Err(renewal.borrow().clone().unwrap_or_else(|| "lease renewal monitor stopped".to_owned())),
+        result = client.copy_out_tar_bytes(id, source) => result.map_err(|error| error.to_string())?,
+    };
+    if *interrupted.borrow() {
+        return Err("interrupted before extracting output".to_owned());
+    }
+    if let Some(error) = renewal.borrow().as_ref() {
+        return Err(error.clone());
+    }
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut stage = OutputStage::create(parent).map_err(|error| error.to_string())?;
     let result = async {
-        let bytes = client
-            .copy_out_to_path(id, source, &stage.path)
-            .await
-            .map_err(|error| error.to_string())?;
+        let stage_path = stage.path.clone();
+        let max_bytes = client.max_copy_bytes();
+        let max_entries = client.max_copy_entries();
+        let bytes = tokio::task::spawn_blocking(move || {
+            extract_tar_bytes_safely(&tar_bytes, &stage_path, max_bytes, max_entries)
+        })
+        .await
+        .map_err(|error| format!("tar extract task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
         if *interrupted.borrow() {
             return Err("interrupted before publishing output".to_owned());
         }

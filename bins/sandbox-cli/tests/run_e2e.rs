@@ -80,6 +80,11 @@ struct MockRunConfig {
     create_destination_during_copy_out: Option<PathBuf>,
     wait_for_cancel: bool,
     disconnect_after_spawn: bool,
+    stall_spawn: bool,
+    stall_copy_out: bool,
+    never_reply_after_cancel: bool,
+    observe_cancel_after_output: bool,
+    renewal_error: bool,
 }
 
 impl MockRunConfig {
@@ -98,6 +103,11 @@ impl MockRunConfig {
             create_destination_during_copy_out: None,
             wait_for_cancel: false,
             disconnect_after_spawn: false,
+            stall_spawn: false,
+            stall_copy_out: false,
+            never_reply_after_cancel: false,
+            observe_cancel_after_output: false,
+            renewal_error: false,
         }
     }
 }
@@ -114,6 +124,12 @@ struct MockRunState {
     exec_started: Option<oneshot::Sender<()>>,
     release_exec: Option<oneshot::Receiver<()>>,
     renewed: Option<oneshot::Sender<u64>>,
+    spawn_observed: Option<oneshot::Sender<()>>,
+    release_spawn: Option<oneshot::Receiver<()>>,
+    copy_out_observed: Option<oneshot::Sender<()>>,
+    release_copy_out: Option<oneshot::Receiver<()>>,
+    cancel_observed: Option<oneshot::Sender<()>>,
+    release_cancel: Option<oneshot::Receiver<()>>,
 }
 
 impl MockRunState {
@@ -130,6 +146,12 @@ impl MockRunState {
             exec_started: None,
             release_exec: None,
             renewed: None,
+            spawn_observed: None,
+            release_spawn: None,
+            copy_out_observed: None,
+            release_copy_out: None,
+            cancel_observed: None,
+            release_cancel: None,
         }
     }
 }
@@ -159,6 +181,11 @@ where
                     create_destination_during_copy_out: None,
                     wait_for_cancel: st.config.wait_for_cancel,
                     disconnect_after_spawn: st.config.disconnect_after_spawn,
+                    stall_spawn: st.config.stall_spawn,
+                    stall_copy_out: st.config.stall_copy_out,
+                    never_reply_after_cancel: st.config.never_reply_after_cancel,
+                    observe_cancel_after_output: st.config.observe_cancel_after_output,
+                    renewal_error: st.config.renewal_error,
                 },
                 st.exec_observed.take(),
                 st.release_exec.take(),
@@ -194,7 +221,21 @@ where
                     ExecWireClientMsg::from_json_bytes(&frame),
                     Ok(ExecWireClientMsg::Cancel)
                 ) {
-                    state.lock().expect("mock state lock").requests.push("cancel");
+                    let (observed, release) = {
+                        let mut st = state.lock().expect("mock state lock");
+                        st.requests.push("cancel");
+                        (st.cancel_observed.take(), st.release_cancel.take())
+                    };
+                    if let Some(observed) = observed {
+                        let _ = observed.send(());
+                    }
+                    if config.never_reply_after_cancel {
+                        if let Some(release) = release {
+                            let _ = release.await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
                     break;
                 }
             }
@@ -210,46 +251,135 @@ where
             let _ = stream.shutdown().await;
             return;
         }
-        let events = [
+        let output_events = [
             ExecWireEvent::Stdout {
                 data: config.stdout,
             },
             ExecWireEvent::Stderr {
                 data: config.stderr,
             },
-            ExecWireEvent::Exit(config.exit),
         ];
-        for event in events {
+        for event in output_events {
             let bytes = event.to_json_bytes().expect("serialize ExecWireEvent");
             if write_control_frame(&mut stream, &bytes).await.is_err() {
                 return;
             }
+        }
+        if config.observe_cancel_after_output {
+            loop {
+                let Ok(Some(frame)) = read_control_frame(&mut stream).await else {
+                    return;
+                };
+                if matches!(
+                    ExecWireClientMsg::from_json_bytes(&frame),
+                    Ok(ExecWireClientMsg::Cancel)
+                ) {
+                    let observed = {
+                        let mut st = state.lock().expect("mock state lock");
+                        st.requests.push("cancel");
+                        st.cancel_observed.take()
+                    };
+                    if let Some(observed) = observed {
+                        let _ = observed.send(());
+                    }
+                    break;
+                }
+            }
+        }
+        let exit = ExecWireEvent::Exit(config.exit)
+            .to_json_bytes()
+            .expect("serialize successful guest exit");
+        if write_control_frame(&mut stream, &exit).await.is_err() {
+            return;
         }
         let _ = stream.shutdown().await;
         let _ = tokio::time::timeout(Duration::from_secs(1), read_control_frame(&mut stream)).await;
         return;
     }
 
+    if let ControlRequest::Spawn { spec } = req {
+        let (disconnect, stall, observed, release, lease) = {
+            let mut st = state.lock().expect("mock state lock");
+            st.requests.push("spawn");
+            st.sandbox_spec = Some(spec.clone());
+            let lease = SandboxLease {
+                id: SandboxId::new("sb-run-e2e-1"),
+                ttl: spec.lease_ttl,
+                capabilities: CapabilityReport {
+                    cpu_quota: EnforcementLevel::HardLimit,
+                    host_rss: EnforcementLevel::BestEffort,
+                    host_storage: EnforcementLevel::HardLimit,
+                    egress_filter: EnforcementLevel::HardLimit,
+                },
+            };
+            (
+                st.config.disconnect_after_spawn,
+                st.config.stall_spawn,
+                st.spawn_observed.take(),
+                st.release_spawn.take(),
+                lease,
+            )
+        };
+        if disconnect {
+            return;
+        }
+        if stall {
+            if let Some(observed) = observed {
+                let _ = observed.send(());
+            }
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            return;
+        }
+        let bytes = ControlResponse::Spawned(lease)
+            .to_json_bytes()
+            .expect("serialize Spawned response");
+        if write_control_frame(&mut stream, &bytes).await.is_ok() {
+            let _ = stream.shutdown().await;
+        }
+        return;
+    }
+
+    if let ControlRequest::CopyOutTar { id, src_guest } = req {
+        assert_eq!(id.as_str(), "sb-run-e2e-1");
+        let (stall, observed, release, tar_bytes) = {
+            let mut st = state.lock().expect("mock state lock");
+            st.requests.push("copy-out");
+            st.copy_out_source = Some(src_guest);
+            if let Some(path) = &st.config.create_destination_during_copy_out {
+                fs::create_dir_all(path).expect("create raced copy-out destination");
+                fs::write(path.join("sentinel.txt"), b"keep this destination")
+                    .expect("write raced destination sentinel");
+            }
+            (
+                st.config.stall_copy_out,
+                st.copy_out_observed.take(),
+                st.release_copy_out.take(),
+                st.config.output_tar.clone(),
+            )
+        };
+        if stall {
+            if let Some(observed) = observed {
+                let _ = observed.send(());
+            }
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            return;
+        }
+        let bytes = ControlResponse::CopyOutData { tar_bytes }
+            .to_json_bytes()
+            .expect("serialize CopyOutData response");
+        if write_control_frame(&mut stream, &bytes).await.is_ok() {
+            let _ = stream.shutdown().await;
+        }
+        return;
+    }
+
     let response = {
         let mut st = state.lock().expect("mock state lock");
         match req {
-            ControlRequest::Spawn { spec } => {
-                st.requests.push("spawn");
-                st.sandbox_spec = Some(spec.clone());
-                if st.config.disconnect_after_spawn {
-                    return;
-                }
-                ControlResponse::Spawned(SandboxLease {
-                    id: SandboxId::new("sb-run-e2e-1"),
-                    ttl: spec.lease_ttl,
-                    capabilities: CapabilityReport {
-                        cpu_quota: EnforcementLevel::HardLimit,
-                        host_rss: EnforcementLevel::BestEffort,
-                        host_storage: EnforcementLevel::HardLimit,
-                        egress_filter: EnforcementLevel::HardLimit,
-                    },
-                })
-            }
             ControlRequest::CopyInTar {
                 id,
                 dst_guest,
@@ -260,26 +390,20 @@ where
                 st.copied_in = Some((dst_guest, tar_bytes));
                 ControlResponse::Ack
             }
-            ControlRequest::CopyOutTar { id, src_guest } => {
-                assert_eq!(id.as_str(), "sb-run-e2e-1");
-                st.requests.push("copy-out");
-                st.copy_out_source = Some(src_guest);
-                if let Some(path) = &st.config.create_destination_during_copy_out {
-                    fs::create_dir_all(path).expect("create raced copy-out destination");
-                    fs::write(path.join("sentinel.txt"), b"keep this destination")
-                        .expect("write raced destination sentinel");
-                }
-                ControlResponse::CopyOutData {
-                    tar_bytes: st.config.output_tar.clone(),
-                }
-            }
             ControlRequest::RenewLease { id, ttl_ms } => {
                 assert_eq!(id.as_str(), "sb-run-e2e-1");
                 st.requests.push("renew");
                 if let Some(renewed) = st.renewed.take() {
                     let _ = renewed.send(ttl_ms);
                 }
-                ControlResponse::Ack
+                if st.config.renewal_error {
+                    ControlResponse::Error(sandbox_client::wire::WireError {
+                        kind: "LeaseExpired".to_owned(),
+                        message: "test lease renewal failure".to_owned(),
+                    })
+                } else {
+                    ControlResponse::Ack
+                }
             }
             ControlRequest::Destroy { id } => {
                 assert_eq!(id.as_str(), "sb-run-e2e-1");
@@ -410,6 +534,75 @@ async fn run_cli(args: Vec<String>) -> Output {
     })
     .await
     .expect("join sandbox-cli task")
+}
+
+fn spawn_interruptible_cli(args: &[String]) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sandbox-cli"));
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    command.spawn().expect("spawn isolated sandbox-cli child")
+}
+
+fn send_console_interrupt(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "$src = 'using System; using System.Runtime.InteropServices; public static class MiniPodCtrl {{ [DllImport(\"Kernel32.dll\", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint eventType, uint groupId); }}'; Add-Type -TypeDefinition $src; if (![MiniPodCtrl]::GenerateConsoleCtrlEvent(1, {pid})) {{ exit 1 }}"
+        );
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+fn kill_isolated_cli(pid: u32) {
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+}
+
+async fn wait_for_cli_output(
+    child: std::process::Child,
+    max_wait: Duration,
+) -> Output {
+    let pid = child.id();
+    let mut waiter = tokio::task::spawn_blocking(move || child.wait_with_output());
+    match tokio::time::timeout(max_wait, &mut waiter).await {
+        Ok(joined) => joined
+            .expect("join interrupted CLI process")
+            .expect("read interrupted CLI output"),
+        Err(_) => {
+            kill_isolated_cli(pid);
+            let _ = waiter.await;
+            panic!("sandbox-cli did not exit within {max_wait:?}");
+        }
+    }
+}
+
+fn plain_run_args(endpoint: &str) -> Vec<String> {
+    vec!["--endpoint".into(), endpoint.into(), "run".into()]
 }
 
 fn output_archive(temp: &TestTempDir) -> Vec<u8> {
@@ -825,6 +1018,361 @@ async fn run_handles_console_interrupt_by_cancelling_exec_and_destroying_sandbox
     assert_eq!(result["interrupted"], true);
     assert_eq!(result["workload"]["status"], "interrupted");
     assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["spawn", "exec", "cancel", "destroy"]
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_interrupt_during_stalled_copy_out_destroys_without_copy_reply() {
+    let temp = TestTempDir::new("mp-run-copyout-interrupt");
+    let mut config = MockRunConfig::success(output_archive(&temp));
+    config.stall_copy_out = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (copy_out_observed_tx, copy_out_observed_rx) = oneshot::channel();
+    let (release_copy_out_tx, release_copy_out_rx) = oneshot::channel();
+    {
+        let mut st = state.lock().expect("mock state lock");
+        st.copy_out_observed = Some(copy_out_observed_tx);
+        st.release_copy_out = Some(release_copy_out_rx);
+    }
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let destination = temp.path().join("stalled-copy-out-result");
+    let mut args = run_args(&daemon.endpoint);
+    args.extend([
+        "--output".into(),
+        "/work/result".into(),
+        destination.display().to_string(),
+        "--".into(),
+        "/bin/true".into(),
+    ]);
+    let mut child = spawn_interruptible_cli(&args);
+    let pid = child.id();
+
+    if tokio::time::timeout(Duration::from_secs(5), copy_out_observed_rx)
+        .await
+        .is_err()
+    {
+        kill_isolated_cli(pid);
+        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+        panic!("run did not issue CopyOutTar");
+    }
+    assert!(send_console_interrupt(pid), "send Ctrl+C to isolated CLI group");
+    let output = wait_for_cli_output(child, Duration::from_secs(8)).await;
+    let _ = release_copy_out_tx.send(());
+
+    assert_eq!(output.status.code(), Some(130));
+    let result = json_output(&output);
+    assert_eq!(result["interrupted"], true);
+    assert_eq!(result["workload"]["status"], "completed");
+    assert_eq!(result["copy_out"]["status"], "failed");
+    assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert!(!destination.exists(), "no output should publish without a copy-out reply");
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["spawn", "exec", "copy-out", "destroy"]
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_failed_lease_renewal_during_stalled_copy_out_still_destroys() {
+    let temp = TestTempDir::new("mp-run-copyout-renewal-failure");
+    let mut config = MockRunConfig::success(output_archive(&temp));
+    config.stall_copy_out = true;
+    config.renewal_error = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (copy_out_observed_tx, copy_out_observed_rx) = oneshot::channel();
+    let (release_copy_out_tx, release_copy_out_rx) = oneshot::channel();
+    let (renewal_tx, renewal_rx) = oneshot::channel();
+    {
+        let mut st = state.lock().expect("mock state lock");
+        st.copy_out_observed = Some(copy_out_observed_tx);
+        st.release_copy_out = Some(release_copy_out_rx);
+        st.renewed = Some(renewal_tx);
+    }
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let destination = temp.path().join("renewal-failed-copy-out");
+    let mut args = run_args(&daemon.endpoint);
+    args.extend([
+        "--ttl-secs".into(),
+        "1".into(),
+        "--output".into(),
+        "/work/result".into(),
+        destination.display().to_string(),
+        "--".into(),
+        "/bin/true".into(),
+    ]);
+    let child = spawn_interruptible_cli(&args);
+
+    tokio::time::timeout(Duration::from_secs(5), copy_out_observed_rx)
+        .await
+        .expect("run entered stalled CopyOutTar")
+        .expect("mock daemon signaled CopyOutTar");
+    tokio::time::timeout(Duration::from_secs(5), renewal_rx)
+        .await
+        .expect("short lease renewal was attempted during copy-out")
+        .expect("mock daemon recorded renewal attempt");
+    let output = wait_for_cli_output(child, Duration::from_secs(8)).await;
+    let _ = release_copy_out_tx.send(());
+
+    assert_eq!(output.status.code(), Some(1));
+    let result = json_output(&output);
+    assert_eq!(result["copy_out"]["status"], "failed");
+    assert!(result["copy_out"]["error"].as_str().unwrap().contains("test lease renewal failure"));
+    assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert!(!destination.exists(), "copy-out must not publish without a response");
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["spawn", "exec", "copy-out", "renew", "destroy"]
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_interrupt_during_stalled_spawn_reports_unknown_cleanup_without_id() {
+    let temp = TestTempDir::new("mp-run-spawn-interrupt");
+    let mut config = MockRunConfig::success(Vec::new());
+    config.stall_spawn = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (spawn_observed_tx, spawn_observed_rx) = oneshot::channel();
+    let (release_spawn_tx, release_spawn_rx) = oneshot::channel();
+    {
+        let mut st = state.lock().expect("mock state lock");
+        st.spawn_observed = Some(spawn_observed_tx);
+        st.release_spawn = Some(release_spawn_rx);
+    }
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let mut args = run_args(&daemon.endpoint);
+    args.extend(["--".into(), "/bin/true".into()]);
+    let mut child = spawn_interruptible_cli(&args);
+    let pid = child.id();
+
+    if tokio::time::timeout(Duration::from_secs(5), spawn_observed_rx)
+        .await
+        .is_err()
+    {
+        kill_isolated_cli(pid);
+        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+        panic!("mock daemon did not receive Spawn");
+    }
+    assert!(send_console_interrupt(pid), "send Ctrl+C to isolated CLI group");
+    let output = wait_for_cli_output(child, Duration::from_secs(8)).await;
+    let _ = release_spawn_tx.send(());
+
+    assert_eq!(output.status.code(), Some(130));
+    let result = json_output(&output);
+    assert_eq!(result["interrupted"], true);
+    assert!(result["id"].is_null());
+    assert_eq!(result["cleanup"]["status"], "unknown");
+    assert_ne!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert_eq!(state.lock().expect("mock state lock").requests, ["spawn"]);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_host_watchdog_times_out_stalled_exec_without_guest_exit() {
+    let temp = TestTempDir::new("mp-run-host-watchdog");
+    let mut config = MockRunConfig::success(Vec::new());
+    config.wait_for_cancel = true;
+    config.never_reply_after_cancel = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (exec_started_tx, exec_started_rx) = oneshot::channel();
+    let (cancel_observed_tx, cancel_observed_rx) = oneshot::channel();
+    let (release_cancel_tx, release_cancel_rx) = oneshot::channel();
+    {
+        let mut st = state.lock().expect("mock state lock");
+        st.exec_started = Some(exec_started_tx);
+        st.cancel_observed = Some(cancel_observed_tx);
+        st.release_cancel = Some(release_cancel_rx);
+    }
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let mut args = run_args(&daemon.endpoint);
+    args.extend([
+        "--deadline-secs".into(),
+        "1".into(),
+        "--".into(),
+        "/bin/sleep".into(),
+        "60".into(),
+    ]);
+    let child = spawn_interruptible_cli(&args);
+
+    tokio::time::timeout(Duration::from_secs(5), exec_started_rx)
+        .await
+        .expect("watchdog case reached active guest execution")
+        .expect("mock daemon signaled ExecStarted");
+    let output = wait_for_cli_output(child, Duration::from_secs(6)).await;
+    let cancel_seen = tokio::time::timeout(Duration::from_secs(2), cancel_observed_rx)
+        .await
+        .is_ok_and(|result| result.is_ok());
+    let _ = release_cancel_tx.send(());
+
+    assert!(cancel_seen, "host watchdog must send Cancel to the stalled guest");
+    assert_eq!(output.status.code(), Some(124));
+    let result = json_output(&output);
+    assert_eq!(result["workload"]["timed_out"], true);
+    assert_ne!(result["workload"]["exit_code"], 0);
+    assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    let state = state.lock().expect("mock state lock");
+    assert_eq!(state.requests, ["spawn", "exec", "cancel", "destroy"]);
+    assert_eq!(
+        state.exec_request.as_ref().expect("exec request").deadline,
+        Duration::from_secs(1)
+    );
+    drop(state);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_host_watchdog_bounds_pending_exec_start_without_stream_id() {
+    let temp = TestTempDir::new("mp-run-pending-exec-start-watchdog");
+    let config = MockRunConfig::success(Vec::new());
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (exec_observed_tx, exec_observed_rx) = oneshot::channel();
+    let (release_exec_tx, release_exec_rx) = oneshot::channel();
+    {
+        let mut st = state.lock().expect("mock state lock");
+        st.exec_observed = Some(exec_observed_tx);
+        st.release_exec = Some(release_exec_rx);
+    }
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let mut args = run_args(&daemon.endpoint);
+    args.extend([
+        "--deadline-secs".into(),
+        "1".into(),
+        "--".into(),
+        "/bin/sleep".into(),
+        "60".into(),
+    ]);
+    let child = spawn_interruptible_cli(&args);
+
+    tokio::time::timeout(Duration::from_secs(5), exec_observed_rx)
+        .await
+        .expect("run entered pending ExecStart")
+        .expect("mock daemon observed ExecStart request");
+    let output = wait_for_cli_output(child, Duration::from_secs(6)).await;
+    let _ = release_exec_tx.send(());
+
+    assert_eq!(output.status.code(), Some(124));
+    let result = json_output(&output);
+    assert_eq!(result["workload"]["timed_out"], true);
+    assert!(result["workload"]["exit_code"].is_null());
+    assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["spawn", "exec", "destroy"]
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_json_mode_flags_malicious_output_even_when_guest_claims_success() {
+    let temp = TestTempDir::new("mp-run-json-output-budget");
+    let mut config = MockRunConfig::success(Vec::new());
+    config.stdout = vec![b'J'; 256];
+    config.observe_cancel_after_output = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (cancel_observed_tx, cancel_observed_rx) = oneshot::channel();
+    state.lock().expect("mock state lock").cancel_observed = Some(cancel_observed_tx);
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let mut args = run_args(&daemon.endpoint);
+    args.extend([
+        "--stdout-budget-bytes".into(),
+        "8".into(),
+        "--".into(),
+        "/bin/true".into(),
+    ]);
+
+    let output = run_cli(args).await;
+    let cancel_seen = tokio::time::timeout(Duration::from_secs(2), cancel_observed_rx)
+        .await
+        .is_ok_and(|result| result.is_ok());
+    assert!(cancel_seen, "host output cap must cancel the over-budget guest");
+    assert_eq!(output.status.code(), Some(1));
+    let result = json_output(&output);
+    assert_eq!(result["workload"]["stdout"].as_str().unwrap().len(), 8);
+    assert_eq!(result["workload"]["stdout_truncated"], true);
+    assert!(
+        result["workload"]["exit_code"].is_null(),
+        "the host output cap must supersede the guest's later success status"
+    );
+    assert_eq!(result["copy_out"]["status"], "skipped");
+    assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["spawn", "exec", "cancel", "destroy"]
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_json_mode_flags_malicious_guest_stderr_even_when_guest_claims_success() {
+    let temp = TestTempDir::new("mp-run-json-stderr-budget");
+    let mut config = MockRunConfig::success(Vec::new());
+    config.stdout = b"ok".to_vec();
+    config.stderr = vec![b'E'; 256];
+    config.observe_cancel_after_output = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (cancel_observed_tx, cancel_observed_rx) = oneshot::channel();
+    state.lock().expect("mock state lock").cancel_observed = Some(cancel_observed_tx);
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let mut args = run_args(&daemon.endpoint);
+    args.extend([
+        "--stderr-budget-bytes".into(),
+        "8".into(),
+        "--".into(),
+        "/bin/true".into(),
+    ]);
+
+    let output = run_cli(args).await;
+    let cancel_seen = tokio::time::timeout(Duration::from_secs(2), cancel_observed_rx)
+        .await
+        .is_ok_and(|result| result.is_ok());
+    assert!(cancel_seen, "host stderr cap must cancel the over-budget guest");
+    assert_eq!(output.status.code(), Some(1));
+    let result = json_output(&output);
+    assert_eq!(result["workload"]["stdout"], "ok");
+    assert_eq!(result["workload"]["stdout_truncated"], false);
+    assert_eq!(result["workload"]["stderr"].as_str().unwrap().len(), 8);
+    assert_eq!(result["workload"]["stderr_truncated"], true);
+    assert!(result["workload"]["exit_code"].is_null());
+    assert_eq!(result["copy_out"]["status"], "skipped");
+    assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
+    assert_eq!(
+        state.lock().expect("mock state lock").requests,
+        ["spawn", "exec", "cancel", "destroy"]
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn run_plain_mode_caps_malicious_guest_stdout_before_writing() {
+    let temp = TestTempDir::new("mp-run-plain-output-budget");
+    let mut config = MockRunConfig::success(Vec::new());
+    config.stdout = vec![b'P'; 256];
+    config.observe_cancel_after_output = true;
+    let state = Arc::new(Mutex::new(MockRunState::new(config)));
+    let (cancel_observed_tx, cancel_observed_rx) = oneshot::channel();
+    state.lock().expect("mock state lock").cancel_observed = Some(cancel_observed_tx);
+    let daemon = MockDaemon::start(&temp, Arc::clone(&state));
+    let mut args = plain_run_args(&daemon.endpoint);
+    args.extend([
+        "--stdout-budget-bytes".into(),
+        "8".into(),
+        "--".into(),
+        "/bin/true".into(),
+    ]);
+
+    let output = run_cli(args).await;
+    let cancel_seen = tokio::time::timeout(Duration::from_secs(2), cancel_observed_rx)
+        .await
+        .is_ok_and(|result| result.is_ok());
+    assert!(cancel_seen, "plain output cap must cancel the over-budget guest");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, vec![b'P'; 8], "guest stdout must not exceed its budget");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stdout truncated at budget limit"));
     assert_eq!(
         state.lock().expect("mock state lock").requests,
         ["spawn", "exec", "cancel", "destroy"]

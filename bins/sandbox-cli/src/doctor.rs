@@ -104,12 +104,12 @@ pub async fn execute_doctor(
             if smoke[name].is_object() {
                 let section = &smoke[name];
                 let status = section["status"].as_str().unwrap_or("unknown");
+                let used = section["used"].as_str().unwrap_or("");
                 let detail = section["detail"]
                     .as_str()
                     .or_else(|| section["error"].as_str())
-                    .or_else(|| section["used"].as_str())
                     .unwrap_or("");
-                println!("smoke {name}: {status} {detail}");
+                println!("smoke {name}: {status} {used} {detail}");
                 if let Some(artifacts) = section["remaining_artifacts"].as_array() {
                     for artifact in artifacts.iter().filter_map(Value::as_str) {
                         eprintln!("remaining artifact: {artifact}");
