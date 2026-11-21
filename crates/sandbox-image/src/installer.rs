@@ -82,6 +82,7 @@ pub fn install_bundle_atomic(
 
     // Trust boundary: verify Ed25519 signature strictly before parsing or scanning files.
     let manifest = verifier.verify_and_parse_manifest(&manifest_bytes, &sig_bytes)?;
+    manifest.ensure_compatible_host_os(std::env::consts::OS)?;
 
     let declared: BTreeSet<&str> = manifest.entries.iter().map(|e| e.rel_path.as_str()).collect();
     validate_bundle_tree(source_bundle_dir, &declared)?;
@@ -101,7 +102,13 @@ pub fn install_bundle_atomic(
     write_new_synced_file(&staging_dir.join(SIGNATURE_FILENAME), &sig_bytes)?;
 
     let target_dir = install_parent_dir.join(&manifest.bundle_id);
-    atomic_swap_dir(&staging_dir, &target_dir, &manifest.bundle_id, &mut staging_guard)?;
+    atomic_swap_dir(
+        &staging_dir,
+        &target_dir,
+        &manifest.bundle_id,
+        verifier,
+        &mut staging_guard,
+    )?;
 
     Ok(InstalledBundle {
         root_dir: target_dir,
@@ -133,7 +140,7 @@ pub(crate) fn with_verified_installed_bundle_read_locked<T, F>(
 where
     F: FnOnce(InstalledBundle, Option<File>) -> Result<T, SandboxError>,
 {
-    let read_guard = acquire_bundle_read_guard(bundle_dir)?;
+    let read_guard = acquire_bundle_read_guard(bundle_dir, verifier)?;
     let installed = verify_installed_bundle_once(bundle_dir, verifier)?;
     op(installed, read_guard)
 }
@@ -598,6 +605,7 @@ fn atomic_swap_dir(
     staging_dir: &Path,
     target_dir: &Path,
     bundle_id: &str,
+    verifier: &BundleVerifier,
     staging_guard: &mut TempDirGuard,
 ) -> Result<(), SandboxError> {
     let parent = target_dir.parent().ok_or_else(|| {
@@ -607,9 +615,10 @@ fn atomic_swap_dir(
     let _swap_lock = open_bundle_lock_exclusive(&lock_path)?;
 
     let intent_path = parent.join(format!(".promote-{bundle_id}.v1"));
-    if intent_path.exists() {
-        recover_promotion_under_exclusive_lock(target_dir, &intent_path)?;
+    if path_exists_no_follow(&intent_path)? {
+        recover_promotion_under_exclusive_lock(target_dir, &intent_path, verifier)?;
     }
+    sweep_stale_backup_dirs(parent, bundle_id);
 
     match fs::symlink_metadata(target_dir) {
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -663,10 +672,9 @@ fn atomic_swap_dir(
 
             staging_guard.disarm();
             let _ = fs::remove_file(&intent_path);
-
-            remove_dir_all_with_brief_retry(&backup_dir).map_err(|err| {
-                map_fs_error(&backup_dir, "remove backup bundle directory after swap", err)
-            })?;
+            // Promotion is already committed; best-effort cleanup avoids reporting a false
+            // install failure if an external scanner briefly holds a handle inside `backup_dir`.
+            let _ = remove_dir_all_with_brief_retry(&backup_dir);
             Ok(())
         }
         Err(err) => Err(map_fs_error(
@@ -674,6 +682,35 @@ fn atomic_swap_dir(
             "inspect target bundle directory",
             err,
         )),
+    }
+}
+
+fn path_exists_no_follow(path: &Path) -> Result<bool, SandboxError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(map_fs_error(path, "inspect bundle recovery path", err)),
+    }
+}
+
+fn sweep_stale_backup_dirs(parent: &Path, bundle_id: &str) {
+    let prefix = format!(".backup-{bundle_id}-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if validate_metadata_no_link(&path, &meta, true, false).is_ok() {
+                let _ = remove_dir_all_with_brief_retry(&path);
+            }
+        }
     }
 }
 
@@ -731,7 +768,10 @@ fn open_bundle_lock_exclusive(lock_path: &Path) -> Result<File, SandboxError> {
     Ok(file)
 }
 
-fn acquire_bundle_read_guard(target_dir: &Path) -> Result<Option<File>, SandboxError> {
+fn acquire_bundle_read_guard(
+    target_dir: &Path,
+    verifier: &BundleVerifier,
+) -> Result<Option<File>, SandboxError> {
     let Some((lock_path, intent_path)) = bundle_lock_and_intent_paths(target_dir) else {
         return Ok(None);
     };
@@ -753,7 +793,7 @@ fn acquire_bundle_read_guard(target_dir: &Path) -> Result<Option<File>, SandboxE
     match fs::symlink_metadata(target_dir) {
         Ok(meta) => validate_metadata_no_link(target_dir, &meta, true, false)?,
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            if !intent_path.exists() && !lock_path.exists() {
+            if !path_exists_no_follow(&intent_path)? && !path_exists_no_follow(&lock_path)? {
                 return Ok(None);
             }
         }
@@ -767,7 +807,7 @@ fn acquire_bundle_read_guard(target_dir: &Path) -> Result<Option<File>, SandboxE
         .lock_shared()
         .map_err(|err| map_fs_error(&lock_path, "acquire shared bundle read lock", err))?;
 
-    if !intent_path.exists() {
+    if !path_exists_no_follow(&intent_path)? {
         return Ok(Some(shared_file));
     }
 
@@ -776,8 +816,8 @@ fn acquire_bundle_read_guard(target_dir: &Path) -> Result<Option<File>, SandboxE
     drop(shared_file);
     {
         let _excl = open_bundle_lock_exclusive(&lock_path)?;
-        if intent_path.exists() {
-            recover_promotion_under_exclusive_lock(target_dir, &intent_path)?;
+        if path_exists_no_follow(&intent_path)? {
+            recover_promotion_under_exclusive_lock(target_dir, &intent_path, verifier)?;
         }
     }
 
@@ -812,9 +852,24 @@ fn write_synced_intent_file(intent_path: &Path, payload: &[u8]) -> Result<(), Sa
         .map_err(|err| map_fs_error(intent_path, "persist bundle promotion intent", err))
 }
 
+fn inspect_verified_bundle_dir(
+    path: &Path,
+    verifier: &BundleVerifier,
+) -> Result<Option<bool>, SandboxError> {
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(map_fs_error(path, "inspect bundle candidate directory", err)),
+        Ok(meta) => {
+            validate_metadata_no_link(path, &meta, true, false)?;
+            Ok(Some(verify_installed_bundle_once(path, verifier).is_ok()))
+        }
+    }
+}
+
 fn recover_promotion_under_exclusive_lock(
     target_dir: &Path,
     intent_path: &Path,
+    verifier: &BundleVerifier,
 ) -> Result<(), SandboxError> {
     let meta = match fs::symlink_metadata(intent_path) {
         Ok(m) => m,
@@ -839,49 +894,94 @@ fn recover_promotion_under_exclusive_lock(
         }
     }
 
-    if let Some(parent) = target_dir.parent() {
-        let staging_path = staging_name
-            .as_deref()
-            .filter(|n| is_safe_sibling_dir_name(n))
-            .map(|n| parent.join(n));
-        let backup_path = backup_name
-            .as_deref()
-            .filter(|n| is_safe_sibling_dir_name(n))
-            .map(|n| parent.join(n));
+    let Some(parent) = target_dir.parent() else {
+        return Err(SandboxError::Internal(
+            "target bundle directory has no parent during recovery".to_owned(),
+        ));
+    };
 
-        if !target_dir.exists() {
+    let staging_path = staging_name
+        .as_deref()
+        .filter(|n| is_safe_sibling_dir_name(n))
+        .map(|n| parent.join(n));
+    let backup_path = backup_name
+        .as_deref()
+        .filter(|n| is_safe_sibling_dir_name(n))
+        .map(|n| parent.join(n));
+
+    let target_state = inspect_verified_bundle_dir(target_dir, verifier)?;
+    let staging_state = match staging_path.as_deref() {
+        Some(sp) => inspect_verified_bundle_dir(sp, verifier)?,
+        None => None,
+    };
+    let backup_state = match backup_path.as_deref() {
+        Some(bp) => inspect_verified_bundle_dir(bp, verifier)?,
+        None => None,
+    };
+
+    if target_state == Some(true) {
+        if staging_state.is_some() {
             if let Some(ref sp) = staging_path {
-                if sp.is_dir() {
-                    let _ = rename_with_brief_retry(sp, target_dir);
-                }
+                let _ = remove_dir_all_with_brief_retry(sp);
             }
-            if !target_dir.exists() {
-                if let Some(ref bp) = backup_path {
-                    if bp.is_dir() {
-                        let _ = rename_with_brief_retry(bp, target_dir);
+        }
+        if backup_state.is_some() {
+            if let Some(ref bp) = backup_path {
+                let _ = remove_dir_all_with_brief_retry(bp);
+            }
+        }
+        let _ = fs::remove_file(intent_path);
+        return Ok(());
+    }
+
+    if target_state == Some(false) {
+        if staging_state != Some(true) && backup_state != Some(true) {
+            return Err(SandboxError::PolicyViolation(format!(
+                "interrupted bundle promotion at '{}' has unverified target and no verified backup or staging bundle",
+                target_dir.display()
+            )));
+        }
+        remove_dir_all_with_brief_retry(target_dir)
+            .map_err(|e| map_fs_error(target_dir, "remove unverified target bundle directory", e))?;
+    }
+
+    // `target_dir` is now absent: promote `staging_path` only if verified; otherwise roll back verified `backup_path`.
+    if staging_state == Some(true) {
+        if let Some(ref sp) = staging_path {
+            if rename_with_brief_retry(sp, target_dir).is_ok()
+                && inspect_verified_bundle_dir(target_dir, verifier)? == Some(true)
+            {
+                if backup_state.is_some() {
+                    if let Some(ref bp) = backup_path {
+                        let _ = remove_dir_all_with_brief_retry(bp);
                     }
                 }
-            }
-        }
-
-        if target_dir.exists() {
-            if let Some(sp) = staging_path {
-                if sp.exists() {
-                    let _ = remove_dir_all_with_brief_retry(&sp);
-                }
-            }
-            if let Some(bp) = backup_path {
-                if bp.exists() {
-                    let _ = remove_dir_all_with_brief_retry(&bp);
-                }
+                let _ = fs::remove_file(intent_path);
+                return Ok(());
             }
         }
     }
 
-    if target_dir.exists() {
-        let _ = fs::remove_file(intent_path);
+    if backup_state == Some(true) {
+        if let Some(ref bp) = backup_path {
+            rename_with_brief_retry(bp, target_dir)
+                .map_err(|e| map_fs_error(target_dir, "restore verified backup bundle", e))?;
+            if inspect_verified_bundle_dir(target_dir, verifier)? == Some(true) {
+                if staging_state.is_some() {
+                    if let Some(ref sp) = staging_path {
+                        let _ = remove_dir_all_with_brief_retry(sp);
+                    }
+                }
+                let _ = fs::remove_file(intent_path);
+                return Ok(());
+            }
+        }
     }
-    Ok(())
+
+    Err(SandboxError::PolicyViolation(format!(
+        "unable to recover a verified bundle at '{}' from interrupted promotion",
+        target_dir.display()
+    )))
 }
 
 fn is_safe_sibling_dir_name(name: &str) -> bool {
@@ -1556,5 +1656,122 @@ mod tests {
             fs::read(target_dir.join("guest/vmlinuz")).expect("read v2 kernel"),
             b"kernel-v2"
         );
+    }
+
+    #[test]
+    fn corrupt_staging_or_target_recovery_never_deletes_backup_before_verification() {
+        let tmp = TestTempDir::new("corrupt-staging-recovery");
+        let src_v1 = tmp.path().join("src-v1");
+        let install_root = tmp.path().join("installed");
+        fs::create_dir_all(&src_v1).unwrap();
+
+        let secret = [0x51u8; 32];
+        let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
+        let bundle_id = "minipod-safe-recover";
+        write_signed_bundle(
+            &src_v1,
+            bundle_id,
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v1-good"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v1-good"),
+                (
+                    "images/base.qcow2",
+                    ArtifactRole::BaseRootfsQcow2,
+                    b"qcow2-v1-good",
+                ),
+            ],
+        );
+        let installed = install_bundle_atomic(&src_v1, &install_root, &verifier).unwrap();
+        let target_dir = installed.root_dir().to_path_buf();
+
+        // Case 1: Crash after `target_dir -> backup_dir` when `staging_dir` is incomplete/tampered.
+        let backup_dir = install_root.join(".backup-minipod-safe-recover-1");
+        let staging_dir = install_root.join(".staging-minipod-safe-recover-1");
+        fs::rename(&target_dir, &backup_dir).unwrap();
+        write_signed_bundle(
+            &staging_dir,
+            bundle_id,
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v2"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v2"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v2"),
+            ],
+        );
+        // Corrupt staging kernel so SHA-256 verification fails.
+        fs::write(staging_dir.join("boot/vmlinuz"), b"corrupt-staging!").unwrap();
+        fs::write(
+            install_root.join(".promote-minipod-safe-recover.v1"),
+            "staging=.staging-minipod-safe-recover-1\nbackup=.backup-minipod-safe-recover-1\n",
+        )
+        .unwrap();
+
+        let recovered = verify_installed_bundle(&target_dir, &verifier)
+            .expect("recovery must roll back verified backup instead of promoting corrupt staging");
+        assert_eq!(
+            fs::read(recovered.kernel_path()).unwrap(),
+            b"kernel-v1-good"
+        );
+        assert!(!backup_dir.exists());
+        assert!(!staging_dir.exists());
+        assert!(!install_root.join(".promote-minipod-safe-recover.v1").exists());
+
+        // Case 2: Both staging and target are missing/corrupt AND backup is ALSO corrupt -> must fail
+        // without deleting backup so forensic state is preserved.
+        let bad_backup = install_root.join(".backup-minipod-safe-recover-2");
+        fs::rename(&target_dir, &bad_backup).unwrap();
+        fs::write(bad_backup.join("boot/vmlinuz"), b"also-corrupted").unwrap();
+        fs::write(
+            install_root.join(".promote-minipod-safe-recover.v1"),
+            "staging=.staging-missing\nbackup=.backup-minipod-safe-recover-2\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_installed_bundle(&target_dir, &verifier),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        assert!(
+            bad_backup.exists(),
+            "unrecoverable backup must not be deleted when no verified bundle exists"
+        );
+    }
+
+    #[test]
+    fn install_bundle_atomic_rejects_incompatible_host_os() {
+        let tmp = TestTempDir::new("incompatible-host-os");
+        let src = tmp.path().join("src");
+        let install_root = tmp.path().join("installed");
+        fs::create_dir_all(&src).unwrap();
+
+        let secret = [0x52u8; 32];
+        let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
+        write_signed_bundle(
+            &src,
+            "wrong-os-bundle",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"k"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"i"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"r"),
+            ],
+        );
+
+        let mismatched_os = if std::env::consts::OS == "linux" {
+            "windows"
+        } else {
+            "linux"
+        };
+        let manifest_text = fs::read_to_string(src.join(MANIFEST_FILENAME))
+            .unwrap()
+            .replace("host_os=any\n", &format!("host_os={mismatched_os}\n"));
+        let sig_hex = sign_manifest_hex(&secret, manifest_text.as_bytes());
+        fs::write(src.join(MANIFEST_FILENAME), manifest_text.as_bytes()).unwrap();
+        fs::write(src.join(SIGNATURE_FILENAME), format!("{sig_hex}\n").as_bytes()).unwrap();
+
+        assert!(matches!(
+            install_bundle_atomic(&src, &install_root, &verifier),
+            Err(SandboxError::InvalidSpec(_))
+        ));
     }
 }

@@ -27,8 +27,8 @@ use crate::journal::{
     ReconciliationScan,
 };
 use crate::ports::{
-    DiskOverlayPort, PreBootJournalHook, PreparedOverlay, SandboxTunnelPort, VmBootConfig,
-    VmRuntimePort, VmSessionPort,
+    BundleReadGuard, DiskOverlayPort, PreBootJournalHook, PreparedOverlay, SandboxTunnelPort,
+    VmBootConfig, VmRuntimePort, VmSessionPort,
 };
 use crate::safe_tar::{
     apply_open_no_follow, ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes,
@@ -220,7 +220,8 @@ struct ActiveSandbox {
     host_rss_budget_mb: Option<u32>,
     host_storage_budget_mb: u32,
     egress_proxy: Option<EgressProxyHandle>,
-    // Drop `permit` last so session/proxy tasks tear down before admission capacity re-opens.
+    // Drop `bundle_guard` after `session` and `permit` last so QEMU exits before bundle swap/admission re-opens.
+    bundle_guard: Option<BundleReadGuard>,
     permit: AdmissionPermit,
 }
 
@@ -1232,7 +1233,7 @@ impl LocalRuntimeManager {
             return Err(err);
         }
 
-        let mut prepared = match self
+        let prepared = match self
             .overlay
             .prepare_overlay(&sandbox_id, spec, &work_dir)
             .await
@@ -1302,12 +1303,10 @@ impl LocalRuntimeManager {
             work_dir: work_dir.clone(),
             on_boot_progress: Some(on_boot_progress),
         };
-        let boot_result = self.vm_runtime.boot_vm(boot_cfg).await;
-        // Release the shared bundle read lock once QEMU has launched and opened its bundle files.
-        prepared.bundle_guard = None;
-        let boot = match boot_result {
+        let boot = match self.vm_runtime.boot_vm(boot_cfg).await {
             Ok(outcome) => outcome,
             Err(err) => {
+                drop(prepared.bundle_guard);
                 let recorded = self.load_record_async(sandbox_id.clone()).await.ok().flatten();
                 let rollback_artifacts = match recorded {
                     Some(rec) => merge_artifact_paths(
@@ -1485,6 +1484,7 @@ impl LocalRuntimeManager {
                     host_rss_budget_mb: spec.budget.host_rss_budget_mb,
                     host_storage_budget_mb: spec.budget.host_storage_budget_mb,
                     egress_proxy,
+                    bundle_guard: booted.prepared.bundle_guard,
                     permit,
                 },
             );
@@ -1876,11 +1876,13 @@ impl RuntimeManager for LocalRuntimeManager {
 
     async fn destroy(&self, id: &SandboxId) -> Result<DestroyStatus, SandboxError> {
         struct DestroyPermitAndNotify<'a> {
+            bundle_guard: Option<BundleReadGuard>,
             permit: Option<AdmissionPermit>,
             warm_pool: &'a WarmPoolStore,
         }
         impl Drop for DestroyPermitAndNotify<'_> {
             fn drop(&mut self) {
+                drop(self.bundle_guard.take());
                 drop(self.permit.take());
                 self.warm_pool.notify_replenisher();
             }
@@ -1935,10 +1937,12 @@ impl RuntimeManager for LocalRuntimeManager {
                 host_rss_budget_mb: _,
                 host_storage_budget_mb: _,
                 egress_proxy,
+                bundle_guard,
                 permit,
             } = entry;
 
             let permit_guard = DestroyPermitAndNotify {
+                bundle_guard,
                 permit: Some(permit),
                 warm_pool: &self.warm_pool,
             };
@@ -2319,6 +2323,7 @@ mod tests {
                 initramfs_path: PathBuf::from("/bundle/initramfs.cpio.gz"),
                 rootfs_path: PathBuf::from("/bundle/rootfs.qcow2"),
                 kernel_cmdline: "quiet panic=-1 minipod.root=/dev/vda".to_owned(),
+                guest_arch: None,
                 virtual_disk_mb: spec.budget.virtual_disk_mb,
                 provisioned_host_bytes: 64,
                 bundle_guard: None,
@@ -4738,6 +4743,91 @@ mod tests {
         assert!(
             !saw_still_active.load(Ordering::Acquire),
             "destroy listener ran before sandbox was removed from active map"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_read_guard_stays_locked_across_warm_and_active_vm_lifetime_until_destroy() {
+        struct GuardedOverlayStore {
+            lock_path: PathBuf,
+        }
+
+        #[async_trait::async_trait]
+        impl DiskOverlayPort for GuardedOverlayStore {
+            async fn prepare_overlay(
+                &self,
+                _sandbox_id: &SandboxId,
+                spec: &SandboxSpec,
+                work_dir: &Path,
+            ) -> Result<PreparedOverlay, SandboxError> {
+                let overlay_path = work_dir.join("overlay.qcow2");
+                fs::write(&overlay_path, b"qcow2").unwrap();
+                let lock_file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.lock_path)
+                    .unwrap();
+                lock_file.lock_shared().unwrap();
+                Ok(PreparedOverlay {
+                    overlay_path,
+                    kernel_path: PathBuf::from("/bundle/vmlinuz"),
+                    initramfs_path: PathBuf::from("/bundle/initrd"),
+                    rootfs_path: PathBuf::from("/bundle/rootfs.qcow2"),
+                    kernel_cmdline: "quiet".to_owned(),
+                    guest_arch: None,
+                    virtual_disk_mb: spec.budget.virtual_disk_mb,
+                    provisioned_host_bytes: 5,
+                    bundle_guard: Some(BundleReadGuard::new(lock_file)),
+                })
+            }
+
+            async fn remove_overlay(&self, overlay_path: &Path) -> Result<(), SandboxError> {
+                if overlay_path.exists() {
+                    let _ = fs::remove_file(overlay_path);
+                }
+                Ok(())
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-bundle-read-guard");
+        let lock_path = tmp.path().join(".lock-bundle");
+        let overlay = Arc::new(GuardedOverlayStore {
+            lock_path: lock_path.clone(),
+        });
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().join("state"));
+        cfg.warm_pool.target_size = 1;
+        cfg.warm_pool.template_spec = Some(valid_spec(Duration::from_secs(60)));
+
+        let mgr = LocalRuntimeManager::new(cfg, overlay, vm).unwrap();
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+
+        let probe_exclusive = || -> bool {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            f.try_lock().is_ok()
+        };
+
+        assert!(
+            !probe_exclusive(),
+            "shared bundle lock must stay held while VM sits in Warm Pool"
+        );
+
+        let lease = mgr.spawn(valid_spec(Duration::from_secs(60))).await.unwrap();
+        assert!(
+            !probe_exclusive(),
+            "shared bundle lock must stay held while checked-out VM is active"
+        );
+
+        mgr.destroy(&lease.id).await.unwrap();
+        assert!(
+            probe_exclusive(),
+            "shared bundle lock must be released once the VM is destroyed"
         );
     }
 }

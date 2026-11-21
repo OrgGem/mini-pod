@@ -117,7 +117,7 @@ impl QemuVmDriver {
 #[async_trait::async_trait]
 impl VmRuntimePort for QemuVmDriver {
     async fn boot_vm(&self, config: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
-        validate_boot_config(&config)?;
+        validate_boot_config(&self.config, &config)?;
 
         let driver_cfg = self.config.clone();
         tokio::task::spawn_blocking(move || boot_vm_blocking(&driver_cfg, &config))
@@ -138,8 +138,19 @@ impl VmRuntimePort for QemuVmDriver {
     }
 }
 
-fn validate_boot_config(config: &VmBootConfig) -> Result<(), SandboxError> {
+fn validate_boot_config(
+    driver_cfg: &QemuDriverConfig,
+    config: &VmBootConfig,
+) -> Result<(), SandboxError> {
     config.spec.validate_for_host_os(std::env::consts::OS)?;
+    if let Some(bundle_arch) = config.overlay.guest_arch {
+        if bundle_arch != driver_cfg.arch {
+            return Err(SandboxError::InvalidSpec(format!(
+                "bundle guest_arch '{}' does not match configured QEMU driver arch '{}'",
+                bundle_arch, driver_cfg.arch
+            )));
+        }
+    }
 
     for (label, path) in [
         ("guest kernel", &config.overlay.kernel_path),
@@ -4268,5 +4279,69 @@ mod tests {
 
         session.force_kill().await.unwrap();
         guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_vm_rejects_bundle_guest_arch_mismatch_before_spawning_qemu() {
+        use sandbox_core::{
+            AccelerationPolicy, IsolationMode, ResourceBudget, SandboxId, SandboxSpec,
+        };
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "minipod-driver-arch-mismatch-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let kernel = dir.join("vmlinuz");
+        let initrd = dir.join("initrd");
+        let overlay = dir.join("overlay.qcow2");
+        fs::write(&kernel, b"k").unwrap();
+        fs::write(&initrd, b"i").unwrap();
+        fs::write(&overlay, b"o").unwrap();
+
+        let driver = QemuVmDriver::new(QemuDriverConfig {
+            arch: GuestArch::X86_64,
+            ..QemuDriverConfig::default()
+        })
+        .unwrap();
+
+        let res = driver
+            .boot_vm(VmBootConfig {
+                sandbox_id: SandboxId::new("sb-arch"),
+                spec: SandboxSpec {
+                    isolation: IsolationMode::VmRequired,
+                    acceleration: AccelerationPolicy::Preferred,
+                    network: NetworkPolicy::Isolated,
+                    budget: ResourceBudget {
+                        guest_vcpus: 1,
+                        host_cpu_quota_Millicores: None,
+                        guest_ram_mb: 256,
+                        host_rss_budget_mb: Some(512),
+                        virtual_disk_mb: 512,
+                        host_storage_budget_mb: 1024,
+                    },
+                    lease_ttl: Duration::from_secs(30),
+                },
+                overlay: sandbox_runtime::PreparedOverlay {
+                    overlay_path: overlay,
+                    kernel_path: kernel,
+                    initramfs_path: initrd,
+                    rootfs_path: dir.join("base.qcow2"),
+                    kernel_cmdline: "quiet".to_owned(),
+                    guest_arch: Some(GuestArch::Aarch64),
+                    virtual_disk_mb: 512,
+                    provisioned_host_bytes: 1,
+                    bundle_guard: None,
+                },
+                work_dir: dir.clone(),
+                on_boot_progress: None,
+            })
+            .await;
+        let _ = fs::remove_dir_all(&dir);
+        let err = res
+            .err()
+            .expect("guest_arch mismatch must fail before launching QEMU");
+        assert!(matches!(err, SandboxError::InvalidSpec(_)));
     }
 }

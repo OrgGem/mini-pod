@@ -206,6 +206,7 @@ impl DiskOverlayPort for StubOverlay {
             initramfs_path: PathBuf::from("/initrd"),
             rootfs_path: PathBuf::from("/rootfs.qcow2"),
             kernel_cmdline: "quiet".to_owned(),
+            guest_arch: None,
             virtual_disk_mb: spec.budget.virtual_disk_mb,
             provisioned_host_bytes: 5,
             bundle_guard: None,

@@ -7,15 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sandbox_core::{CapabilityReport, ExecRequest, SandboxError, SandboxId, SandboxSpec};
+use sandbox_core::{
+    CapabilityReport, ExecRequest, GuestArch, SandboxError, SandboxId, SandboxSpec,
+};
 use sandbox_protocol::StreamTargetWire;
 
 use crate::exec_stream::ExecStream;
 use crate::tunnel::TunnelStream;
 use crate::RuntimeManager;
 
-/// Opaque shared OS file lock guard keeping an installed Portable Runtime Bundle pinned from
-/// overlay preparation until the VMM has launched and opened its boot artifacts.
+/// Opaque shared OS file lock guard keeping an installed Portable Runtime Bundle pinned across
+/// overlay preparation and live VM execution until the sandbox terminates.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct BundleReadGuard(Arc<File>);
@@ -48,6 +50,7 @@ pub struct PreparedOverlay {
     pub initramfs_path: PathBuf,
     pub rootfs_path: PathBuf,
     pub kernel_cmdline: String,
+    pub guest_arch: Option<GuestArch>,
     pub virtual_disk_mb: u32,
     pub provisioned_host_bytes: u64,
     pub bundle_guard: Option<BundleReadGuard>,

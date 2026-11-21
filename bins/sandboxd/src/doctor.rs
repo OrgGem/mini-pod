@@ -38,6 +38,13 @@ impl DoctorInputs {
             }
         };
         let bundle = match verify_installed_bundle(&self.bundle_dir, &self.verifier) {
+            Ok(installed) if !installed.manifest().matches_host_os(std::env::consts::OS) => {
+                json!({
+                    "status": "error",
+                    "path": self.bundle_dir.display().to_string(),
+                    "detail": format!("Bundle host_os '{}' is incompatible with current host OS '{}'.", installed.manifest().host_os, std::env::consts::OS),
+                })
+            }
             Ok(installed) if installed.manifest().guest_arch != self.arch => {
                 json!({
                     "status": "error",

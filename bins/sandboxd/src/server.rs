@@ -377,11 +377,21 @@ async fn build_runtime_with_doctor(
     let verifier = cfg.pub_key.load_verifier()?;
     let bundle_dir = cfg.bundle_dir.clone();
     let verifier_for_check = verifier.clone();
-    let _installed = tokio::task::spawn_blocking(move || {
+    let installed = tokio::task::spawn_blocking(move || {
         verify_installed_bundle(&bundle_dir, &verifier_for_check)
     })
     .await
     .map_err(|err| SandboxError::Internal(format!("bundle verification task failed: {err}")))??;
+    installed
+        .manifest()
+        .ensure_compatible_host_os(std::env::consts::OS)?;
+    if installed.manifest().guest_arch != cfg.arch {
+        return Err(SandboxError::InvalidSpec(format!(
+            "installed bundle guest_arch '{}' differs from configured daemon arch '{}'",
+            installed.manifest().guest_arch,
+            cfg.arch
+        )));
+    }
 
     let qemu_img_bin = discover_qemu_img_binary(cfg.qemu_img_bin.as_deref())?;
     let qemu_bin = discover_qemu_binary_for_arch(cfg.arch, cfg.qemu_bin.as_deref())?;
@@ -1155,6 +1165,7 @@ mod tests {
                 initramfs_path: PathBuf::from("/initrd"),
                 rootfs_path: PathBuf::from("/rootfs.qcow2"),
                 kernel_cmdline: "quiet".to_owned(),
+                guest_arch: None,
                 virtual_disk_mb: spec.budget.virtual_disk_mb,
                 provisioned_host_bytes: 5,
                 bundle_guard: None,

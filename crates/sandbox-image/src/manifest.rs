@@ -150,6 +150,23 @@ impl BundleManifest {
         Ok(())
     }
 
+    /// Returns `true` if `self.host_os` permits execution on `current_os` (`"any"` or exact match).
+    pub fn matches_host_os(&self, current_os: &str) -> bool {
+        self.host_os == "any" || self.host_os == current_os
+    }
+
+    /// Rejects manifests whose `host_os` targets a different host operating system than `current_os`.
+    pub fn ensure_compatible_host_os(&self, current_os: &str) -> Result<(), SandboxError> {
+        if self.matches_host_os(current_os) {
+            Ok(())
+        } else {
+            Err(SandboxError::InvalidSpec(format!(
+                "bundle manifest host_os '{}' is incompatible with current host OS '{current_os}'",
+                self.host_os
+            )))
+        }
+    }
+
     /// Validates all invariants and encodes this manifest in canonical deterministic LF text format.
     pub fn encode_canonical(&self) -> Result<String, SandboxError> {
         self.validate()?;

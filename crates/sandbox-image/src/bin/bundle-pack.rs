@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![deny(unsafe_op_in_unsafe_fn)]
 //! CLI tool to generate Ed25519 signing keypairs and pack/sign Portable Runtime Bundles.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -392,19 +393,7 @@ fn write_atomic_synced(
     ));
     let mut tmp_guard = TempFileGuard(Some(tmp_path.clone()));
 
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(if restrict_owner_only { 0o600 } else { 0o644 });
-    }
-    #[cfg(not(unix))]
-    let _ = restrict_owner_only;
-
-    let mut file = opts
-        .open(&tmp_path)
-        .map_err(|err| map_io_error(&tmp_path, "create temporary output file", err))?;
+    let mut file = create_new_temp_output_file(&tmp_path, restrict_owner_only)?;
     file.write_all(bytes)
         .map_err(|err| map_io_error(&tmp_path, "write temporary output file", err))?;
     file.sync_all()
@@ -415,6 +404,305 @@ fn write_atomic_synced(
         .map_err(|err| map_io_error(target_path, "rename temporary output file", err))?;
     tmp_guard.0 = None;
     Ok(())
+}
+
+fn create_new_temp_output_file(
+    tmp_path: &Path,
+    restrict_owner_only: bool,
+) -> Result<std::fs::File, SandboxError> {
+    #[cfg(windows)]
+    if restrict_owner_only {
+        return win_owner_file::create_owner_only_new_file(tmp_path);
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(if restrict_owner_only { 0o600 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    let _ = restrict_owner_only;
+
+    opts.open(tmp_path)
+        .map_err(|err| map_io_error(tmp_path, "create temporary output file", err))
+}
+
+#[cfg(windows)]
+mod win_owner_file {
+    use std::ffi::{c_void, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::path::Path;
+    use std::ptr;
+
+    use sandbox_core::SandboxError;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use super::map_io_error;
+
+    struct OwnedWinHandle(HANDLE);
+
+    impl Drop for OwnedWinHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: `self.0` is an owned, open Win32 handle.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalMemGuard(*mut c_void);
+
+    impl Drop for LocalMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by Win32 via `LocalAlloc`.
+                unsafe {
+                    LocalFree(self.0 as HLOCAL);
+                }
+            }
+        }
+    }
+
+    fn to_wide_null(s: &OsStr) -> Result<Vec<u16>, SandboxError> {
+        let mut wide: Vec<u16> = s.encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(SandboxError::InvalidSpec(
+                "Windows path contains interior NUL character".to_owned(),
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn wide_ptr_to_string(ptr: *const u16) -> Result<String, SandboxError> {
+        if ptr.is_null() {
+            return Err(SandboxError::Internal("null wide string pointer".to_owned()));
+        }
+        let mut len = 0usize;
+        // SAFETY: Win32 SDDL/SID conversion functions return NUL-terminated UTF-16 buffers.
+        while unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `ptr..ptr + len` is initialized UTF-16 allocated by Win32.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        Ok(String::from_utf16_lossy(slice))
+    }
+
+    fn sid_to_string(sid: PSID) -> Result<String, SandboxError> {
+        if sid.is_null() {
+            return Err(SandboxError::Internal("null SID pointer".to_owned()));
+        }
+        let mut wide_sid: *mut u16 = ptr::null_mut();
+        // SAFETY: `sid` is a valid non-null SID; `ConvertSidToStringSidW` allocates `wide_sid` via `LocalAlloc`.
+        let ok = unsafe { ConvertSidToStringSidW(sid, &mut wide_sid) };
+        if ok == 0 {
+            return Err(SandboxError::Internal(format!(
+                "ConvertSidToStringSidW failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let _guard = LocalMemGuard(wide_sid.cast());
+        wide_ptr_to_string(wide_sid)
+    }
+
+    pub(super) fn current_user_sid_string() -> Result<String, SandboxError> {
+        let mut raw_token: HANDLE = ptr::null_mut();
+        // SAFETY: `GetCurrentProcess()` is a pseudo-handle; `raw_token` receives an owned token handle.
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+        if ok == 0 {
+            return Err(SandboxError::Internal(format!(
+                "OpenProcessToken failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let token = OwnedWinHandle(raw_token);
+
+        let mut needed: u32 = 0;
+        // SAFETY: Probing `TokenUser` required byte length with null buffer and zero size.
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
+        }
+        // SAFETY: Reading thread-local Win32 error right after size probe.
+        let probe_err = unsafe { GetLastError() };
+        if probe_err != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+            return Err(SandboxError::Internal(format!(
+                "GetTokenInformation(TokenUser) probe failed: {}",
+                io::Error::from_raw_os_error(probe_err as i32)
+            )));
+        }
+
+        let words = (needed as usize).div_ceil(size_of::<usize>());
+        let mut buf = vec![0usize; words];
+        let mut returned: u32 = 0;
+        // SAFETY: `buf` has `>= needed` bytes and pointer alignment for `TOKEN_USER`.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut returned,
+            )
+        };
+        if ok == 0 || (returned as usize) < size_of::<TOKEN_USER>() {
+            return Err(SandboxError::Internal(format!(
+                "GetTokenInformation(TokenUser) failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `buf` holds a valid `TOKEN_USER` structure.
+        let token_user = unsafe { &*(buf.as_ptr().cast::<TOKEN_USER>()) };
+        sid_to_string(token_user.User.Sid)
+    }
+
+    pub(super) fn create_owner_only_new_file(path: &Path) -> Result<File, SandboxError> {
+        let user_sid = current_user_sid_string()?;
+        let sddl = format!("D:P(A;;GA;;;{user_sid})");
+        let wide_sddl = to_wide_null(OsStr::new(&sddl))?;
+
+        let mut raw_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `wide_sddl` is NUL-terminated UTF-16; `raw_sd` is allocated via `LocalAlloc`.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut raw_sd,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || raw_sd.is_null() {
+            return Err(SandboxError::Internal(format!(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW('{sddl}') failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let sd_guard = LocalMemGuard(raw_sd);
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd_guard.0,
+            bInheritHandle: 0,
+        };
+        let wide_path = to_wide_null(path.as_os_str())?;
+
+        // SAFETY: `wide_path` is NUL-terminated and `sa` references a valid security descriptor kept alive across the call.
+        let raw_handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                &sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if raw_handle.is_null() || raw_handle == INVALID_HANDLE_VALUE {
+            return Err(map_io_error(
+                path,
+                "create owner-only secret key file",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw_handle` is a uniquely owned open file handle created above.
+        Ok(unsafe { File::from_raw_handle(raw_handle as RawHandle) })
+    }
+
+    #[cfg(test)]
+    pub(super) fn inspect_file_dacl_sddl(path: &Path) -> Result<String, SandboxError> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+        };
+
+        let wide_path = to_wide_null(path.as_os_str())?;
+        // SAFETY: `wide_path` is NUL-terminated; handle is wrapped in `OwnedWinHandle`.
+        let raw = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(map_io_error(
+                path,
+                "open secret key file for DACL inspection",
+                io::Error::last_os_error(),
+            ));
+        }
+        let handle = OwnedWinHandle(raw);
+        let mut raw_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `handle.0` is valid; `GetSecurityInfo` allocates `raw_sd` via `LocalAlloc`.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut raw_sd,
+            )
+        };
+        if status != 0 {
+            return Err(SandboxError::Internal(format!(
+                "GetSecurityInfo failed: {}",
+                io::Error::from_raw_os_error(status as i32)
+            )));
+        }
+        let _sd_guard = LocalMemGuard(raw_sd);
+        let mut wide_sddl: *mut u16 = ptr::null_mut();
+        // SAFETY: `raw_sd` is valid; `ConvertSecurityDescriptorToStringSecurityDescriptorW` allocates `wide_sddl` via `LocalAlloc`.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                raw_sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut wide_sddl,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(SandboxError::Internal(format!(
+                "ConvertSecurityDescriptorToStringSecurityDescriptorW failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let _sddl_guard = LocalMemGuard(wide_sddl.cast());
+        wide_ptr_to_string(wide_sddl)
+    }
 }
 
 fn rel_path_to_host(root: &Path, rel_path: &str) -> PathBuf {
@@ -498,6 +786,19 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+        #[cfg(windows)]
+        {
+            let user_sid = win_owner_file::current_user_sid_string().unwrap();
+            let dacl = win_owner_file::inspect_file_dacl_sddl(&secret_path).unwrap();
+            assert!(
+                dacl.starts_with("D:P("),
+                "Windows secret key file must have protected DACL (D:P), got: {dacl}"
+            );
+            assert!(
+                dacl.contains(&format!(";;;{user_sid})")) && dacl.matches('(').count() == 1,
+                "Windows secret key DACL must grant access strictly to current user SID '{user_sid}', got: {dacl}"
+            );
         }
 
         let bundle_dir = tmp.path().join("bundle");

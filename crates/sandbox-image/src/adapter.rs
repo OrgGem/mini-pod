@@ -128,6 +128,10 @@ impl DiskOverlayPort for BundleOverlayStore {
                 &bundle_dir,
                 &verifier,
                 |installed, read_guard| {
+                    installed
+                        .manifest()
+                        .ensure_compatible_host_os(std::env::consts::OS)?;
+                    let guest_arch = installed.manifest().guest_arch;
                     let base_rootfs = installed.base_rootfs_qcow2_path();
 
                 create_qcow2_overlay_atomic_with_runner(
@@ -149,13 +153,14 @@ impl DiskOverlayPort for BundleOverlayStore {
                     )));
                 }
 
-                let kernel_cmdline = default_kernel_cmdline(installed.manifest().guest_arch);
+                let kernel_cmdline = default_kernel_cmdline(guest_arch);
                 Ok(PreparedOverlay {
                     overlay_path,
                     kernel_path: installed.kernel_path(),
                     initramfs_path: installed.initrd_path(),
                     rootfs_path: base_rootfs,
                     kernel_cmdline,
+                    guest_arch: Some(guest_arch),
                     virtual_disk_mb,
                     provisioned_host_bytes,
                     bundle_guard: read_guard.map(BundleReadGuard::new),
