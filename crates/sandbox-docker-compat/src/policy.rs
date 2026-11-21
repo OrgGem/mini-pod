@@ -448,12 +448,10 @@ pub fn validate_image_build_query(
                     )));
                 }
             }
-            "securityopt" | "cgroupparent" | "cgroup-parent" => {
-                if !val.trim().is_empty() {
-                    return Err(PolicyRejection::new(format!(
-                        "POST /build query parameter '{raw_key}' is forbidden"
-                    )));
-                }
+            "securityopt" | "cgroupparent" | "cgroup-parent" if !val.trim().is_empty() => {
+                return Err(PolicyRejection::new(format!(
+                    "POST /build query parameter '{raw_key}' is forbidden"
+                )));
             }
             _ => {}
         }

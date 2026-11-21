@@ -39,6 +39,7 @@ use crate::doctor::{self, DoctorInputs};
 
 const CONTAINER_EGRESS_PROXY_URL: &str = "http://10.88.0.1:3128";
 const EXEC_CLIENT_MSG_QUEUE_DEPTH: usize = 32;
+// shortcut: fixed 256 concurrent control connections and 30s unary frame I/O timeout, expose ServeConfig knobs if multi-agent daemon load exceeds 256 concurrent streams
 const MAX_CONCURRENT_CONTROL_CONNECTIONS: usize = 256;
 const CONTROL_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(25);

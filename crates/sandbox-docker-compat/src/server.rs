@@ -442,21 +442,13 @@ impl DockerCompatServer {
                                 let _permit = permit;
                                 let _ = srv.serve_stream(connected).await;
                             });
-                            let mut delay = DOCKER_ACCEPT_RETRY_BACKOFF;
-                            let recovered = loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = shutdown_rx.wait_for(|done| *done) => break None,
-                                    _ = tokio::time::sleep(delay) => {}
-                                }
-                                if let Ok(next) = create_pipe(&name_owned, false)
-                                    .or_else(|_| create_pipe(&name_owned, true))
-                                {
-                                    break Some(next);
-                                }
-                                delay = (delay * 2).min(Duration::from_millis(250));
-                            };
-                            let Some(next_pipe) = recovered else {
+                            let Some(next_pipe) = reopen_docker_pipe_with_backoff(
+                                &name_owned,
+                                &mut create_pipe,
+                                &mut shutdown_rx,
+                            )
+                            .await
+                            else {
                                 break;
                             };
                             server_pipe = next_pipe;
@@ -470,21 +462,13 @@ impl DockerCompatServer {
                             }
                             Err(_) => {
                                 drop(server_pipe);
-                                let mut delay = DOCKER_ACCEPT_RETRY_BACKOFF;
-                                let recovered = loop {
-                                    tokio::select! {
-                                        biased;
-                                        _ = shutdown_rx.wait_for(|done| *done) => break None,
-                                        _ = tokio::time::sleep(delay) => {}
-                                    }
-                                    if let Ok(next) = create_pipe(&name_owned, false)
-                                        .or_else(|_| create_pipe(&name_owned, true))
-                                    {
-                                        break Some(next);
-                                    }
-                                    delay = (delay * 2).min(Duration::from_millis(250));
-                                };
-                                let Some(next_pipe) = recovered else {
+                                let Some(next_pipe) = reopen_docker_pipe_with_backoff(
+                                    &name_owned,
+                                    &mut create_pipe,
+                                    &mut shutdown_rx,
+                                )
+                                .await
+                                else {
                                     break;
                                 };
                                 server_pipe = next_pipe;
@@ -612,30 +596,46 @@ impl DockerCompatServer {
             }
             DockerRoute::VolumeCreate => {
                 return self
-                    .handle_sanitized_json_post(client, req, "volume create", |raw, _| {
-                        sanitize_volume_create(raw)
-                    })
+                    .handle_sanitized_json_post(
+                        client,
+                        req,
+                        "volume create",
+                        |raw, _| sanitize_volume_create(raw).map(|b| (b, ())),
+                        |_, _, _, ()| {},
+                    )
                     .await;
             }
             DockerRoute::ContainerExecCreate => {
                 return self
-                    .handle_sanitized_json_post(client, req, "exec create", |raw, policy| {
-                        sanitize_exec_create(raw, policy)
-                    })
+                    .handle_sanitized_json_post(
+                        client,
+                        req,
+                        "exec create",
+                        |raw, policy| sanitize_exec_create(raw, policy).map(|b| (b, ())),
+                        |_, _, _, ()| {},
+                    )
                     .await;
             }
             DockerRoute::NetworkCreate => {
                 return self
-                    .handle_sanitized_json_post(client, req, "network create", |raw, _| {
-                        sanitize_network_create(raw)
-                    })
+                    .handle_sanitized_json_post(
+                        client,
+                        req,
+                        "network create",
+                        |raw, _| sanitize_network_create(raw).map(|b| (b, ())),
+                        |_, _, _, ()| {},
+                    )
                     .await;
             }
             DockerRoute::NetworkConnect { id } => {
                 return self
-                    .handle_sanitized_json_post(client, req, "network connect", move |raw, _| {
-                        sanitize_network_connect(&id, raw)
-                    })
+                    .handle_sanitized_json_post(
+                        client,
+                        req,
+                        "network connect",
+                        move |raw, _| sanitize_network_connect(&id, raw).map(|b| (b, ())),
+                        |_, _, _, ()| {},
+                    )
                     .await;
             }
             DockerRoute::ImageBuild => {
@@ -746,136 +746,46 @@ impl DockerCompatServer {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        if expects_100_continue(&req) && !matches!(req.body_mode(), BodyMode::Empty) {
-            client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-            client.flush().await?;
-        }
-
-        let raw_body = match read_body_bytes(client, req.body_mode(), MAX_BUFFERED_BODY_BYTES).await
-        {
-            Ok(body) => body,
-            Err(HttpError::BodyTooLarge { limit }) => {
-                let _ = write_json_error(
-                    client,
-                    413,
-                    "Payload Too Large",
-                    &format!("container create body exceeds {limit} bytes"),
-                    true,
-                )
-                .await;
-                return Ok(StreamNext::Close);
-            }
-            Err(HttpError::Io(err)) => return Err(err),
-            Err(err) => {
-                let _ = write_json_error(client, 400, "Bad Request", &err.to_string(), true).await;
-                return Ok(StreamNext::Close);
-            }
-        };
-
-        let plan = match sanitize_container_create(&raw_body, &self.policy) {
-            Ok(plan) => plan,
-            Err(rejection) => {
-                let close = req.wants_close();
-                write_json_error(client, 400, "Bad Request", rejection.reason(), close)
-                    .await
-                    .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
-            }
-        };
-
-        let mut up_req = req.clone();
-        up_req.version = "HTTP/1.1".to_owned();
-        strip_headers(&mut up_req.headers, &["expect"]);
-        set_buffered_body_headers(&mut up_req.headers, plan.rewritten_body.len(), true);
-
-        let mut upstream = match self
-            .tunnel_port
-            .open_podman_unix_stream(&self.sandbox_id)
-            .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
-                let close = req.wants_close();
-                write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
-                    .await
-                    .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
-            }
-        };
-
-        if let Err(err) = write_request_and_bytes(&mut upstream, &up_req, &plan.rewritten_body).await
-        {
-            let close = req.wants_close();
-            write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
-                .await
-                .map_err(http_to_io)?;
-            return Ok(if close {
-                StreamNext::Close
-            } else {
-                StreamNext::Continue
-            });
-        }
-
-        let mut up_reader = PrefixedReader::new(upstream);
-        let (mut resp_head, resp_body) = match read_buffered_upstream_response(
-            &mut up_reader,
-            &req.method,
+        let registry = Arc::clone(&self.registry);
+        self.handle_sanitized_json_post(
+            client,
+            req,
+            "container create",
+            |raw, policy| {
+                let plan = sanitize_container_create(raw, policy)?;
+                Ok((plan.rewritten_body, plan.requested_ports))
+            },
+            move |req_head, resp_head, resp_body, requested_ports| {
+                if (200..300).contains(&resp_head.status) {
+                    if let Ok(parsed) = serde_json::from_slice::<Value>(resp_body) {
+                        if let Some(container_id) = parsed
+                            .get("Id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let name = extract_query_param(req_head.query.as_deref(), "name");
+                            registry.record_create(container_id, name.as_deref(), requested_ports);
+                        }
+                    }
+                }
+            },
         )
         .await
-        {
-            Ok(res) => res,
-            Err(err) => {
-                let close = req.wants_close();
-                write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
-                    .await
-                    .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
-            }
-        };
-
-        if (200..300).contains(&resp_head.status) {
-            if let Ok(parsed) = serde_json::from_slice::<Value>(&resp_body) {
-                if let Some(container_id) = parsed
-                    .get("Id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    let name = extract_query_param(req.query.as_deref(), "name");
-                    self.registry.record_create(
-                        container_id,
-                        name.as_deref(),
-                        plan.requested_ports,
-                    );
-                }
-            }
-        }
-
-        write_buffered_response(client, &req, &mut resp_head, &resp_body).await
     }
 
-    async fn handle_sanitized_json_post<S, F>(
+    async fn handle_sanitized_json_post<S, M, F, C>(
         &self,
         client: &mut PrefixedReader<S>,
         req: HttpRequestHead,
         label: &str,
         sanitize: F,
+        on_response: C,
     ) -> io::Result<StreamNext>
     where
         S: AsyncRead + AsyncWrite + Unpin,
-        F: FnOnce(&[u8], &DockerCompatPolicy) -> Result<Vec<u8>, PolicyRejection>,
+        F: FnOnce(&[u8], &DockerCompatPolicy) -> Result<(Vec<u8>, M), PolicyRejection>,
+        C: FnOnce(&HttpRequestHead, &HttpResponseHead, &[u8], M),
     {
         if expects_100_continue(&req) && !matches!(req.body_mode(), BodyMode::Empty) {
             client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
@@ -903,8 +813,8 @@ impl DockerCompatServer {
             }
         };
 
-        let rewritten = match sanitize(&raw_body, &self.policy) {
-            Ok(bytes) => bytes,
+        let (rewritten, meta) = match sanitize(&raw_body, &self.policy) {
+            Ok(pair) => pair,
             Err(rejection) => {
                 let close = req.wants_close();
                 write_json_error(client, 400, "Bad Request", rejection.reason(), close)
@@ -971,6 +881,7 @@ impl DockerCompatServer {
                 }
             };
 
+        on_response(&req, &resp_head, &resp_body, meta);
         write_buffered_response(client, &req, &mut resp_head, &resp_body).await
     }
 
@@ -1785,6 +1696,32 @@ fn decode_safe_container_id(raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_owned())
+}
+
+#[cfg(windows)]
+async fn reopen_docker_pipe_with_backoff<F>(
+    pipe_name: &str,
+    create_pipe: &mut F,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<tokio::net::windows::named_pipe::NamedPipeServer>
+where
+    F: FnMut(
+        &str,
+        bool,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, SandboxError>,
+{
+    let mut delay = DOCKER_ACCEPT_RETRY_BACKOFF;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.wait_for(|done| *done) => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        if let Ok(next) = create_pipe(pipe_name, false).or_else(|_| create_pipe(pipe_name, true)) {
+            return Some(next);
+        }
+        delay = (delay * 2).min(Duration::from_millis(250));
+    }
 }
 
 fn decode_all_query_params(query: Option<&str>) -> Vec<(String, String)> {

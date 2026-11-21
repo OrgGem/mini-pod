@@ -3097,8 +3097,15 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(mgr.journal.load_record(&lease.id).unwrap().is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while mgr.journal.load_record(&lease.id).unwrap().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "sweeper did not reap expired sandbox '{}' within 2s",
+                lease.id
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         drop(mgr);
         let join_res = tokio::time::timeout(Duration::from_millis(200), sweeper_handle)

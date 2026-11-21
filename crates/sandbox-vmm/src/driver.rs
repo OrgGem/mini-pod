@@ -42,6 +42,7 @@ use crate::spike::{
 };
 
 const MAX_HOST_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+// shortcut: fixed 4096-frame / 4 MiB host->guest control lane cap closes session on overflow, add async caller backpressure on control enqueue if legit burst exceeds 4096 queued control frames
 const MAX_OUTBOUND_CONTROL_FRAMES: usize = 4096;
 const MAX_OUTBOUND_CONTROL_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTBOUND_DATA_QUEUE_BYTES: usize = 4 * 1024 * 1024;
@@ -4339,9 +4340,7 @@ mod tests {
             })
             .await;
         let _ = fs::remove_dir_all(&dir);
-        let err = res
-            .err()
-            .expect("guest_arch mismatch must fail before launching QEMU");
+        let err = res.expect_err("guest_arch mismatch must fail before launching QEMU");
         assert!(matches!(err, SandboxError::InvalidSpec(_)));
     }
 }
