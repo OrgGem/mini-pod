@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sandbox_core::SandboxError;
-use sandbox_vmm::os::windows::{create_new_owner_only_dir, create_owner_only_dir};
+use sandbox_vmm::os::windows::{
+    create_new_owner_only_dir, create_owner_only_dir, current_user_sid_string,
+    validate_owner_only_dacl,
+};
 
 struct OwnerOnlyTempDir(PathBuf);
 
@@ -63,4 +66,45 @@ fn exclusive_create_rejects_existing_owner_only_directory_without_mutation() {
         fs::read(&sentinel).expect("idempotent validation must preserve sentinel"),
         b"preserve this file"
     );
+}
+
+#[test]
+fn validator_accepts_local_admin_alias_only_when_it_is_the_owner() {
+    let owner_sid = current_user_sid_string().expect("current user SID");
+    let local_account_domain = match (
+        std::env::var("USERDOMAIN"),
+        std::env::var("COMPUTERNAME"),
+    ) {
+        (Ok(user_domain), Ok(computer_name)) => {
+            user_domain.eq_ignore_ascii_case(&computer_name)
+        }
+        _ => false,
+    };
+    let owner_is_local_admin = owner_sid.ends_with("-500");
+
+    let local_admin_result = validate_owner_only_dacl(
+        "D:P(A;OICI;FA;;;LA)",
+        &owner_sid,
+        true,
+        "local-admin-alias-test",
+    );
+    if owner_is_local_admin && !local_account_domain {
+        // A domain RID 500 is ambiguous here: LA can resolve to the machine account or to a domain alias.
+    } else {
+        assert_eq!(
+            local_admin_result.is_ok(),
+            owner_is_local_admin,
+            "LA should be accepted only when it resolves to current owner SID {owner_sid}: {local_admin_result:?}"
+        );
+    }
+
+    assert!(matches!(
+        validate_owner_only_dacl(
+            "D:P(A;OICI;FA;;;BA)",
+            &owner_sid,
+            true,
+            "wrong-alias-test"
+        ),
+        Err(SandboxError::PolicyViolation(_))
+    ));
 }

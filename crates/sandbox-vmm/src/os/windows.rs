@@ -33,10 +33,11 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DuplicateTokenEx, GetTokenInformation, ImpersonateLoggedOnUser,
-    RevertToSelf, SecurityImpersonation, TokenImpersonation, TokenUser, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER,
+    CreateRestrictedToken, DuplicateTokenEx, GetAce, GetSecurityDescriptorDacl,
+    GetTokenInformation, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation,
+    TokenImpersonation, TokenUser, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+    TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FindClose, FindFirstFileW, FlushFileBuffers,
@@ -1039,7 +1040,7 @@ pub fn validate_owner_only_dacl(
                 "unexpected inherited ACE '({ace})' in protected SDDL '{dacl_sddl}' for '{target}'"
             )));
         }
-        if trustee != owner_sid {
+        if trustee != owner_sid && sddl_trustee_sid(trustee)? != owner_sid {
             return Err(SandboxError::PolicyViolation(format!(
                 "unexpected trustee '{trustee}' in SDDL '{dacl_sddl}' for '{target}' (expected '{owner_sid}')"
             )));
@@ -1054,6 +1055,29 @@ pub fn validate_owner_only_dacl(
         )));
     }
     Ok(())
+}
+
+fn sddl_trustee_sid(trustee: &str) -> Result<String, SandboxError> {
+    let descriptor = sddl_to_security_descriptor(&format!("D:(A;;FA;;;{trustee})"))?;
+    let mut present: BOOL = 0;
+    let mut defaulted: BOOL = 0;
+    let mut dacl = ptr::null_mut();
+    // SAFETY: `descriptor` is a valid security descriptor and all output pointers are writable.
+    let ok = unsafe {
+        GetSecurityDescriptorDacl(descriptor.as_ptr(), &mut present, &mut dacl, &mut defaulted)
+    };
+    if ok == 0 || present == 0 || dacl.is_null() {
+        return Err(win32_error("GetSecurityDescriptorDacl(trustee)"));
+    }
+    let mut ace = ptr::null_mut();
+    // SAFETY: the descriptor owns `dacl` and its first allow ACE until this function returns.
+    let ok = unsafe { GetAce(dacl, 0, &mut ace) };
+    if ok == 0 || ace.is_null() {
+        return Err(win32_error("GetAce(trustee)"));
+    }
+    // SAFETY: the SDDL above creates one access-allowed ACE whose SID starts at `SidStart`.
+    let sid = unsafe { ptr::addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast_mut().cast() };
+    sid_to_string(sid)
 }
 
 fn inspect_path_owner_and_dacl(path: &Path) -> Result<(String, String), SandboxError> {
