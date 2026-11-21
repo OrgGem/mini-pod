@@ -696,10 +696,24 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
         )));
     }
 
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload).await.map_err(|err| {
-        SandboxError::Transport(format!("failed reading control frame payload: {err}"))
-    })?;
+    const INITIAL_FRAME_ALLOC_CAP: usize = 64 * 1024;
+    const READ_CHUNK_BYTES: usize = 16 * 1024;
+
+    let mut payload = Vec::with_capacity(payload_len.min(INITIAL_FRAME_ALLOC_CAP));
+    let mut scratch = [0u8; READ_CHUNK_BYTES];
+    while payload.len() < payload_len {
+        let remaining = payload_len - payload.len();
+        let slice = &mut scratch[..remaining.min(READ_CHUNK_BYTES)];
+        let n = reader.read(slice).await.map_err(|err| {
+            SandboxError::Transport(format!("failed reading control frame payload: {err}"))
+        })?;
+        if n == 0 {
+            return Err(SandboxError::Transport(
+                "failed reading control frame payload: unexpected EOF".to_owned(),
+            ));
+        }
+        payload.extend_from_slice(&scratch[..n]);
+    }
     Ok(Some(payload))
 }
 
@@ -1740,5 +1754,29 @@ mod tests {
 
         let decoded = ControlRequest::from_json_bytes(&received).unwrap();
         assert_eq!(decoded, req);
+    }
+
+    #[tokio::test]
+    async fn read_control_frame_streams_incrementally_and_rejects_short_24mib_claim() {
+        let (mut w, mut r) = duplex(64);
+        let claimed = MAX_CONTROL_FRAME_BYTES as u32;
+        w.write_all(&claimed.to_be_bytes()).await.unwrap();
+        w.write_all(b"tiny").await.unwrap();
+        drop(w);
+        assert!(matches!(
+            read_control_frame(&mut r).await,
+            Err(SandboxError::Transport(_))
+        ));
+
+        // Multi-chunk 200 KiB payload across a small duplex pipe must reassemble byte-for-byte.
+        let large: Vec<u8> = (0..(200 * 1024)).map(|i| (i % 251) as u8).collect();
+        let (mut cw, mut sr) = duplex(1024);
+        let expected = large.clone();
+        let writer = tokio::spawn(async move {
+            write_control_frame(&mut cw, &large).await.unwrap();
+        });
+        let got = read_control_frame(&mut sr).await.unwrap().unwrap();
+        writer.await.unwrap();
+        assert_eq!(got, expected);
     }
 }

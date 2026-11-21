@@ -31,7 +31,7 @@ use sandbox_vmm::{
 };
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::config::ServeConfig;
@@ -39,6 +39,9 @@ use crate::doctor::{self, DoctorInputs};
 
 const CONTAINER_EGRESS_PROXY_URL: &str = "http://10.88.0.1:3128";
 const EXEC_CLIENT_MSG_QUEUE_DEPTH: usize = 32;
+const MAX_CONCURRENT_CONTROL_CONNECTIONS: usize = 256;
+const CONTROL_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 static NEXT_DOCKER_COMPAT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -527,12 +530,35 @@ async fn run_windows_named_pipe_server(
     pipe_path: &str,
     ready_file: Option<&Path>,
     state: Arc<DaemonState>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), SandboxError> {
-    use sandbox_vmm::create_owner_only_async_named_pipe;
+    run_windows_named_pipe_server_with_factory(
+        pipe_path,
+        ready_file,
+        state,
+        shutdown_rx,
+        sandbox_vmm::create_owner_only_async_named_pipe,
+    )
+    .await
+}
 
+#[cfg(windows)]
+async fn run_windows_named_pipe_server_with_factory<F>(
+    pipe_path: &str,
+    ready_file: Option<&Path>,
+    state: Arc<DaemonState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut create_pipe: F,
+) -> Result<(), SandboxError>
+where
+    F: FnMut(
+        &str,
+        bool,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, SandboxError>,
+{
     let pipe_name = strip_named_pipe_prefix(pipe_path)?;
-    let mut server = create_owner_only_async_named_pipe(pipe_name, true)?;
+    let mut server = create_pipe(pipe_name, true)?;
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_CONNECTIONS));
 
     if let Some(path) = ready_file {
         write_ready_file_atomic(path, pipe_path)?;
@@ -540,6 +566,15 @@ async fn run_windows_named_pipe_server(
     eprintln!("[sandboxd] listening on owner-only Named Pipe {pipe_path}");
 
     loop {
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown_rx.wait_for(|done| *done) => break,
+            res = Arc::clone(&conn_sem).acquire_owned() => match res {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+        };
+
         let accepted = tokio::select! {
             biased;
             _ = shutdown_rx.wait_for(|done| *done) => break,
@@ -550,37 +585,94 @@ async fn run_windows_named_pipe_server(
             Ok(()) => {
                 // Create the NEXT server pipe instance BEFORE spawning the connection task
                 // so clients never observe a gap with zero listening pipe instances.
-                let next_server = match create_owner_only_async_named_pipe(pipe_name, false) {
-                    Ok(next) => next,
-                    Err(err) => {
-                        eprintln!(
-                            "[sandboxd] failed creating next Named Pipe instance '{pipe_path}': {err}"
-                        );
+                match create_pipe(pipe_name, false) {
+                    Ok(next_server) => {
+                        let connected = std::mem::replace(&mut server, next_server);
                         let conn_state = Arc::clone(&state);
                         tokio::spawn(async move {
-                            if let Err(conn_err) = serve_connection(server, conn_state).await {
+                            let _permit = permit;
+                            if let Err(err) = serve_connection(connected, conn_state).await {
+                                eprintln!("[sandboxd] control connection error: {err}");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[sandboxd] transient failure creating next Named Pipe instance '{pipe_path}' (preserving active VMs): {err}"
+                        );
+                        let connected = server;
+                        let conn_state = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(conn_err) = serve_connection(connected, conn_state).await {
                                 eprintln!("[sandboxd] control connection error: {conn_err}");
                             }
                         });
-                        break;
+                        let Some(recovered) =
+                            reopen_named_pipe_with_backoff(pipe_name, pipe_path, &mut create_pipe, &mut shutdown_rx).await
+                        else {
+                            break;
+                        };
+                        server = recovered;
                     }
-                };
-                let connected = std::mem::replace(&mut server, next_server);
-                let conn_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(err) = serve_connection(connected, conn_state).await {
-                        eprintln!("[sandboxd] control connection error: {err}");
-                    }
-                });
+                }
             }
             Err(err) => {
-                eprintln!("[sandboxd] Named Pipe accept error on '{pipe_path}': {err}");
-                break;
+                drop(permit);
+                eprintln!(
+                    "[sandboxd] transient Named Pipe accept error on '{pipe_path}' (preserving active VMs): {err}"
+                );
+                // Create replacement while holding `server` open so instance count never hits 0.
+                match create_pipe(pipe_name, false) {
+                    Ok(next_server) => {
+                        server = next_server;
+                    }
+                    Err(open_err) => {
+                        eprintln!(
+                            "[sandboxd] transient failure replacing Named Pipe instance '{pipe_path}': {open_err}"
+                        );
+                        drop(server);
+                        let Some(recovered) =
+                            reopen_named_pipe_with_backoff(pipe_name, pipe_path, &mut create_pipe, &mut shutdown_rx).await
+                        else {
+                            break;
+                        };
+                        server = recovered;
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+async fn reopen_named_pipe_with_backoff<F>(
+    pipe_name: &str,
+    pipe_path: &str,
+    create_pipe: &mut F,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<tokio::net::windows::named_pipe::NamedPipeServer>
+where
+    F: FnMut(
+        &str,
+        bool,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, SandboxError>,
+{
+    let mut delay = ACCEPT_RETRY_BACKOFF;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.wait_for(|done| *done) => return None,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        if let Ok(next) = create_pipe(pipe_name, false).or_else(|_| create_pipe(pipe_name, true)) {
+            return Some(next);
+        }
+        eprintln!("[sandboxd] retrying Named Pipe listener creation for '{pipe_path}'...");
+        delay = (delay * 2).min(Duration::from_millis(250));
+    }
 }
 
 #[cfg(windows)]
@@ -655,7 +747,18 @@ async fn run_unix_socket_server(
         socket_path.display()
     );
 
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_CONNECTIONS));
+
     loop {
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown_rx.wait_for(|done| *done) => break,
+            res = Arc::clone(&conn_sem).acquire_owned() => match res {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+        };
+
         let accepted = tokio::select! {
             biased;
             _ = shutdown_rx.wait_for(|done| *done) => break,
@@ -666,12 +769,14 @@ async fn run_unix_socket_server(
             Ok((stream, _)) => {
                 let conn_state = Arc::clone(&state);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = serve_connection(stream, conn_state).await {
                         eprintln!("[sandboxd] control connection error: {err}");
                     }
                 });
             }
             Err(err) => {
+                drop(permit);
                 if matches!(
                     err.kind(),
                     ErrorKind::ConnectionAborted
@@ -681,10 +786,14 @@ async fn run_unix_socket_server(
                     continue;
                 }
                 eprintln!(
-                    "[sandboxd] Unix socket accept error on '{}': {err}",
+                    "[sandboxd] transient Unix socket accept error on '{}' (preserving active VMs): {err}",
                     socket_path.display()
                 );
-                break;
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.wait_for(|done| *done) => break,
+                    _ = tokio::time::sleep(ACCEPT_RETRY_BACKOFF) => {}
+                }
             }
         }
     }
@@ -822,19 +931,41 @@ fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), Sandbo
 }
 
 /// Serves a single control transport stream (unary RPC or upgraded `ExecStart` stream).
-pub async fn serve_connection<S>(mut stream: S, state: Arc<DaemonState>) -> Result<(), SandboxError>
+pub async fn serve_connection<S>(stream: S, state: Arc<DaemonState>) -> Result<(), SandboxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let raw = match read_control_frame(&mut stream).await {
+    serve_connection_with_timeout(stream, state, CONTROL_REQUEST_IO_TIMEOUT).await
+}
+
+async fn serve_connection_with_timeout<S>(
+    mut stream: S,
+    state: Arc<DaemonState>,
+    io_timeout: Duration,
+) -> Result<(), SandboxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let frame_res = match tokio::time::timeout(io_timeout, read_control_frame(&mut stream)).await {
+        Ok(res) => res,
+        Err(_) => Err(SandboxError::Transport(format!(
+            "timed out after {} ms waiting for initial control frame",
+            io_timeout.as_millis()
+        ))),
+    };
+    let raw = match frame_res {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(()),
         Err(err) => {
             let resp = ControlResponse::Error(WireError::from(err));
             if let Ok(bytes) = resp.to_json_bytes() {
-                let _ = write_control_frame(&mut stream, &bytes).await;
+                let _ = tokio::time::timeout(
+                    io_timeout,
+                    write_control_frame(&mut stream, &bytes),
+                )
+                .await;
             }
-            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(io_timeout, stream.shutdown()).await;
             return Ok(());
         }
     };
@@ -844,8 +975,12 @@ where
         Err(err) => {
             let resp = ControlResponse::Error(WireError::from(err));
             let bytes = resp.to_json_bytes()?;
-            let _ = write_control_frame(&mut stream, &bytes).await;
-            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(
+                io_timeout,
+                write_control_frame(&mut stream, &bytes),
+            )
+            .await;
+            let _ = tokio::time::timeout(io_timeout, stream.shutdown()).await;
             return Ok(());
         }
     };
@@ -857,8 +992,15 @@ where
     let is_shutdown = matches!(req, ControlRequest::Shutdown);
     let resp = dispatch_unary_request(&state, req).await;
     let bytes = resp.to_json_bytes()?;
-    write_control_frame(&mut stream, &bytes).await?;
-    let _ = stream.shutdown().await;
+    tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &bytes))
+        .await
+        .map_err(|_| {
+            SandboxError::Transport(format!(
+                "timed out after {} ms writing control response",
+                io_timeout.as_millis()
+            ))
+        })??;
+    let _ = tokio::time::timeout(io_timeout, stream.shutdown()).await;
     if is_shutdown {
         state.request_shutdown();
     }
@@ -1628,6 +1770,109 @@ mod tests {
         assert_eq!(s1.unwrap().active_sandboxes, 0);
         assert_eq!(s2.unwrap().active_sandboxes, 0);
         assert_eq!(s3.unwrap().active_sandboxes, 0);
+
+        let _ = shutdown_tx.send(true);
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_connection_times_out_stalled_slowloris_frame_and_returns_error() {
+        let tmp = TestTempDir::new("slowloris-frame");
+        let (state, _) = build_test_state(&tmp);
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let state_conn = Arc::clone(&state);
+        let conn_task = tokio::spawn(async move {
+            serve_connection_with_timeout(server, state_conn, Duration::from_millis(60)).await
+        });
+
+        // Claim a 1 MiB frame and stall after 3 bytes of payload.
+        client
+            .write_all(&(1024u32 * 1024).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(b"{\"a").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), conn_task)
+            .await
+            .expect("stalled control connection must time out promptly")
+            .unwrap()
+            .unwrap();
+
+        let err_raw = read_control_frame(&mut client).await.unwrap().unwrap();
+        let resp = ControlResponse::from_json_bytes(&err_raw).unwrap();
+        assert!(matches!(resp, ControlResponse::Error(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_server_survives_transient_next_instance_and_connect_errors() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TestTempDir::new("pipe-resilience");
+        let (state, _) = build_test_state(&tmp);
+        let lease = state
+            .runtime
+            .spawn(sample_spec(NetworkPolicy::Isolated))
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let pipe_path = format!(
+            r"\\.\pipe\minipod-resilient-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let ready_file = tmp.path().join("ready-resilient.json");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_factory = Arc::clone(&calls);
+
+        let srv_pipe = pipe_path.clone();
+        let srv_ready = ready_file.clone();
+        let srv_state = Arc::clone(&state);
+        let server_task = tokio::spawn(async move {
+            run_windows_named_pipe_server_with_factory(
+                &srv_pipe,
+                Some(&srv_ready),
+                srv_state,
+                shutdown_rx,
+                move |name, first| {
+                    let n = calls_factory.fetch_add(1, Ordering::AcqRel);
+                    // Fail the very first replacement pipe creation (`n == 1`) to simulate transient OS pool pressure.
+                    if n == 1 {
+                        return Err(SandboxError::Transport(
+                            "simulated transient CreateNamedPipeW failure".to_owned(),
+                        ));
+                    }
+                    sandbox_vmm::create_owner_only_async_named_pipe(name, first)
+                },
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if ready_file.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready_file.is_file());
+
+        let ep = ControlEndpoint::NamedPipe(pipe_path.clone());
+        let client = SandboxClient::new(ep);
+
+        // Request 1 triggers `n == 1` transient failure, yet must succeed AND keep the listener & VM alive.
+        let s1 = client.status().await.unwrap();
+        assert_eq!(s1.active_sandboxes, 1);
+
+        // Give the listener's 25ms backoff tick to reopen the next pipe instance, then send more RPCs.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let s2 = client.status().await.unwrap();
+        assert_eq!(s2.active_sandboxes, 1);
+        assert!(
+            state.runtime.active_sandbox_network(&lease.id).is_ok(),
+            "active VM must survive transient Named Pipe listener errors"
+        );
 
         let _ = shutdown_tx.send(true);
         server_task.await.unwrap().unwrap();

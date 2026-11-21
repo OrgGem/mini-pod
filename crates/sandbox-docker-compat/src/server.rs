@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use sandbox_core::{SandboxError, SandboxId};
 use sandbox_runtime::{SandboxTunnelPort, TunnelStream};
 use serde_json::Value;
@@ -15,6 +17,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(windows)]
 use tokio::sync::watch;
+#[cfg(any(unix, windows))]
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::hijack::relay_upgraded;
@@ -26,6 +30,11 @@ use crate::http1::{
 use crate::policy::{sanitize_container_create, DockerCompatPolicy};
 use crate::ports::PortForwardRegistry;
 use crate::rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json};
+
+#[cfg(any(unix, windows))]
+const MAX_CONCURRENT_DOCKER_CONNECTIONS: usize = 128;
+#[cfg(any(unix, windows))]
+const DOCKER_ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 /// Docker Engine API compatibility proxy forwarding over [`SandboxTunnelPort`].
 pub struct DockerCompatServer {
@@ -317,16 +326,22 @@ impl DockerCompatServer {
         }
 
         let server = Arc::clone(self);
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DOCKER_CONNECTIONS));
         let task = tokio::spawn(async move {
             loop {
+                let Ok(permit) = Arc::clone(&conn_sem).acquire_owned().await else {
+                    break;
+                };
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let srv = Arc::clone(&server);
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let _ = srv.serve_stream(stream).await;
                         });
                     }
                     Err(err) => {
+                        drop(permit);
                         if matches!(
                             err.kind(),
                             io::ErrorKind::ConnectionAborted
@@ -335,7 +350,7 @@ impl DockerCompatServer {
                         ) {
                             continue;
                         }
-                        break;
+                        tokio::time::sleep(DOCKER_ACCEPT_RETRY_BACKOFF).await;
                     }
                 }
             }
@@ -382,33 +397,89 @@ impl DockerCompatServer {
         let name_owned = pipe_name.to_owned();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let compat = Arc::clone(self);
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DOCKER_CONNECTIONS));
 
         let task = tokio::spawn(async move {
             loop {
+                let permit = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.wait_for(|done| *done) => break,
+                    res = Arc::clone(&conn_sem).acquire_owned() => match res {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    },
+                };
                 let accepted = tokio::select! {
                     biased;
                     _ = shutdown_rx.wait_for(|done| *done) => break,
                     res = server_pipe.connect() => res,
                 };
                 match accepted {
-                    Ok(()) => {
-                        let next_pipe = match create_pipe(&name_owned, false) {
-                            Ok(next) => next,
-                            Err(_) => {
-                                let srv = Arc::clone(&compat);
-                                tokio::spawn(async move {
-                                    let _ = srv.serve_stream(server_pipe).await;
-                                });
+                    Ok(()) => match create_pipe(&name_owned, false) {
+                        Ok(next_pipe) => {
+                            let connected = std::mem::replace(&mut server_pipe, next_pipe);
+                            let srv = Arc::clone(&compat);
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let _ = srv.serve_stream(connected).await;
+                            });
+                        }
+                        Err(_) => {
+                            let connected = server_pipe;
+                            let srv = Arc::clone(&compat);
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let _ = srv.serve_stream(connected).await;
+                            });
+                            let mut delay = DOCKER_ACCEPT_RETRY_BACKOFF;
+                            let recovered = loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown_rx.wait_for(|done| *done) => break None,
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                                if let Ok(next) = create_pipe(&name_owned, false)
+                                    .or_else(|_| create_pipe(&name_owned, true))
+                                {
+                                    break Some(next);
+                                }
+                                delay = (delay * 2).min(Duration::from_millis(250));
+                            };
+                            let Some(next_pipe) = recovered else {
                                 break;
+                            };
+                            server_pipe = next_pipe;
+                        }
+                    },
+                    Err(_) => {
+                        drop(permit);
+                        match create_pipe(&name_owned, false) {
+                            Ok(next_pipe) => {
+                                server_pipe = next_pipe;
                             }
-                        };
-                        let connected = std::mem::replace(&mut server_pipe, next_pipe);
-                        let srv = Arc::clone(&compat);
-                        tokio::spawn(async move {
-                            let _ = srv.serve_stream(connected).await;
-                        });
+                            Err(_) => {
+                                drop(server_pipe);
+                                let mut delay = DOCKER_ACCEPT_RETRY_BACKOFF;
+                                let recovered = loop {
+                                    tokio::select! {
+                                        biased;
+                                        _ = shutdown_rx.wait_for(|done| *done) => break None,
+                                        _ = tokio::time::sleep(delay) => {}
+                                    }
+                                    if let Ok(next) = create_pipe(&name_owned, false)
+                                        .or_else(|_| create_pipe(&name_owned, true))
+                                    {
+                                        break Some(next);
+                                    }
+                                    delay = (delay * 2).min(Duration::from_millis(250));
+                                };
+                                let Some(next_pipe) = recovered else {
+                                    break;
+                                };
+                                server_pipe = next_pipe;
+                            }
+                        }
                     }
-                    Err(_) => break,
                 }
             }
         });
