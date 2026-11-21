@@ -1,12 +1,17 @@
 //! Async streaming I/O channels and cancellation control for guest/container execution.
 
+use std::time::Duration;
+
 use sandbox_core::{ExecExitStatus, SandboxError};
 use sandbox_protocol::StreamId;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 const STDIN_CHANNEL_CAPACITY: usize = 64;
 const OUTPUT_CHANNEL_CAPACITY: usize = 256;
 const CANCEL_CHANNEL_CAPACITY: usize = 1;
+const MIN_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const MAX_EXIT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Identifies whether an execution output chunk originated on guest `stdout` or `stderr`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +35,14 @@ pub struct CollectedExecOutput {
     pub exit: ExecExitStatus,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HostExecLimits {
+    deadline_duration: Duration,
+    deadline_at: Option<Instant>,
+    stdout_budget_bytes: u64,
+    stderr_budget_bytes: u64,
+}
+
 /// Caller-side bidirectional handle to an active guest or container execution stream.
 #[derive(Debug)]
 pub struct ExecStream {
@@ -39,6 +52,13 @@ pub struct ExecStream {
     cancel_tx: mpsc::Sender<()>,
     exit_rx: Option<oneshot::Receiver<Result<ExecExitStatus, SandboxError>>>,
     cached_exit: Option<Result<ExecExitStatus, SandboxError>>,
+    limits: Option<HostExecLimits>,
+    stdout_seen: u64,
+    stderr_seen: u64,
+    host_timed_out: bool,
+    host_stdout_truncated: bool,
+    host_stderr_truncated: bool,
+    output_stopped: bool,
 }
 
 /// Driver-side handle used by `VmSessionPort` implementations to pump stdin, output, cancel,
@@ -67,6 +87,13 @@ impl ExecStream {
             cancel_tx,
             exit_rx: Some(exit_rx),
             cached_exit: None,
+            limits: None,
+            stdout_seen: 0,
+            stderr_seen: 0,
+            host_timed_out: false,
+            host_stdout_truncated: false,
+            host_stderr_truncated: false,
+            output_stopped: false,
         };
         let handle = ExecStreamHandle {
             stream_id,
@@ -76,6 +103,25 @@ impl ExecStream {
             exit_tx: Some(exit_tx),
         };
         (stream, handle)
+    }
+
+    /// Attaches host-enforced `deadline`, `stdout_budget_bytes`, and `stderr_budget_bytes` ceilings
+    /// so untrusted or hung guest supervisors cannot exceed host memory or stall callers indefinitely.
+    pub fn with_limits(
+        mut self,
+        deadline: Duration,
+        stdout_budget_bytes: u64,
+        stderr_budget_bytes: u64,
+    ) -> Self {
+        if self.limits.is_none() {
+            self.limits = Some(HostExecLimits {
+                deadline_duration: deadline,
+                deadline_at: Instant::now().checked_add(deadline),
+                stdout_budget_bytes,
+                stderr_budget_bytes,
+            });
+        }
+        self
     }
 
     /// Sends a chunk of bytes to the execution's `stdin` stream.
@@ -95,9 +141,62 @@ impl ExecStream {
         self.stdin_tx = None;
     }
 
-    /// Receives the next incremental `stdout` or `stderr` chunk, or `None` once output closes.
+    /// Receives the next incremental `stdout` or `stderr` chunk, or `None` once output closes
+    /// or host `deadline` / output budget limits are reached.
     pub async fn next_output(&mut self) -> Option<ExecOutputChunk> {
-        self.output_rx.recv().await
+        if self.output_stopped {
+            return None;
+        }
+
+        let maybe_deadline = self.limits.and_then(|l| l.deadline_at);
+        let recv_chunk = match maybe_deadline {
+            Some(deadline_at) => {
+                if Instant::now() >= deadline_at {
+                    self.trip_host_timeout();
+                    return None;
+                }
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline_at) => {
+                        self.trip_host_timeout();
+                        return None;
+                    }
+                    chunk = self.output_rx.recv() => chunk,
+                }
+            }
+            None => self.output_rx.recv().await,
+        };
+
+        let mut chunk = recv_chunk?;
+        let Some(limits) = self.limits else {
+            return Some(chunk);
+        };
+
+        let (seen, budget, is_stdout) = match chunk.stream {
+            OutputStreamKind::Stdout => (&mut self.stdout_seen, limits.stdout_budget_bytes, true),
+            OutputStreamKind::Stderr => (&mut self.stderr_seen, limits.stderr_budget_bytes, false),
+        };
+
+        let remaining = budget.saturating_sub(*seen);
+        if (chunk.data.len() as u64) <= remaining {
+            *seen = seen.saturating_add(chunk.data.len() as u64);
+            return Some(chunk);
+        }
+
+        let allowed = usize::try_from(remaining).unwrap_or(usize::MAX);
+        chunk.data.truncate(allowed);
+        *seen = budget;
+        if is_stdout {
+            self.host_stdout_truncated = true;
+        } else {
+            self.host_stderr_truncated = true;
+        }
+        self.stop_and_cancel_from_host();
+        if chunk.data.is_empty() {
+            None
+        } else {
+            Some(chunk)
+        }
     }
 
     /// Signals cancellation so the host VM driver transmits `Message::ExecCancel`.
@@ -126,39 +225,18 @@ impl ExecStream {
         };
 
         let res = match rx.try_recv() {
-            Ok(status) => status,
+            Ok(status) => self.merge_host_exit(status),
             Err(oneshot::error::TryRecvError::Closed) => Err(SandboxError::Transport(
                 "execution stream terminated before reporting exit status".to_owned(),
             )),
-            Err(oneshot::error::TryRecvError::Empty) => loop {
-                tokio::select! {
-                    biased;
-                    exit_res = &mut rx => {
-                        break match exit_res {
-                            Ok(status) => status,
-                            Err(_) => Err(SandboxError::Transport(
-                                "execution stream terminated before reporting exit status".to_owned(),
-                            )),
-                        };
-                    }
-                    chunk = self.output_rx.recv() => {
-                        if chunk.is_none() {
-                            break match rx.await {
-                                Ok(status) => status,
-                                Err(_) => Err(SandboxError::Transport(
-                                    "execution stream terminated before reporting exit status".to_owned(),
-                                )),
-                            };
-                        }
-                    }
-                }
-            },
+            Err(oneshot::error::TryRecvError::Empty) => self.await_exit_receiver(&mut rx).await,
         };
         self.cached_exit = Some(res.clone());
         res
     }
 
-    /// Closes `stdin`, drains all remaining `stdout`/`stderr` chunks, and awaits exit status.
+    /// Closes `stdin`, drains all remaining `stdout`/`stderr` chunks within configured budgets,
+    /// and awaits exit status.
     pub async fn collect(mut self) -> Result<CollectedExecOutput, SandboxError> {
         self.close_stdin();
         let mut stdout = Vec::new();
@@ -177,6 +255,141 @@ impl ExecStream {
             stderr,
             exit,
         })
+    }
+
+    fn host_tripped(&self) -> bool {
+        self.host_timed_out || self.host_stdout_truncated || self.host_stderr_truncated
+    }
+
+    fn exit_drain_grace(&self) -> Duration {
+        match self.limits {
+            Some(limits) => limits
+                .deadline_duration
+                .min(MAX_EXIT_DRAIN_GRACE)
+                .max(MIN_EXIT_DRAIN_GRACE),
+            None => MAX_EXIT_DRAIN_GRACE,
+        }
+    }
+
+    fn stop_and_cancel_from_host(&mut self) {
+        self.output_stopped = true;
+        self.stdin_tx = None;
+        self.output_rx.close();
+        let _ = self.cancel();
+    }
+
+    fn trip_host_timeout(&mut self) {
+        self.host_timed_out = true;
+        self.stop_and_cancel_from_host();
+    }
+
+    fn merge_host_exit(
+        &self,
+        result: Result<ExecExitStatus, SandboxError>,
+    ) -> Result<ExecExitStatus, SandboxError> {
+        match result {
+            Ok(mut status) => {
+                if self.host_tripped() && status.code == Some(0) {
+                    status.code = None;
+                }
+                status.timed_out |= self.host_timed_out;
+                status.stdout_truncated |= self.host_stdout_truncated;
+                status.stderr_truncated |= self.host_stderr_truncated;
+                Ok(status)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn synthesized_host_exit(&self) -> ExecExitStatus {
+        ExecExitStatus {
+            code: None,
+            timed_out: self.host_timed_out,
+            stdout_truncated: self.host_stdout_truncated,
+            stderr_truncated: self.host_stderr_truncated,
+        }
+    }
+
+    fn account_discarded_chunk(&mut self, chunk: &ExecOutputChunk) {
+        let Some(limits) = self.limits else {
+            return;
+        };
+        let (seen, budget, is_stdout) = match chunk.stream {
+            OutputStreamKind::Stdout => (&mut self.stdout_seen, limits.stdout_budget_bytes, true),
+            OutputStreamKind::Stderr => (&mut self.stderr_seen, limits.stderr_budget_bytes, false),
+        };
+        let next = seen.saturating_add(chunk.data.len() as u64);
+        if next > budget {
+            *seen = budget;
+            if is_stdout {
+                self.host_stdout_truncated = true;
+            } else {
+                self.host_stderr_truncated = true;
+            }
+            self.stop_and_cancel_from_host();
+        } else {
+            *seen = next;
+        }
+    }
+
+    async fn await_exit_receiver(
+        &mut self,
+        rx: &mut oneshot::Receiver<Result<ExecExitStatus, SandboxError>>,
+    ) -> Result<ExecExitStatus, SandboxError> {
+        if !self.host_tripped() {
+            let maybe_deadline = self.limits.and_then(|l| l.deadline_at);
+            let mut output_open = !self.output_stopped;
+            loop {
+                tokio::select! {
+                    biased;
+                    exit_res = &mut *rx => {
+                        return match exit_res {
+                            Ok(status) => self.merge_host_exit(status),
+                            Err(_) => Err(SandboxError::Transport(
+                                "execution stream terminated before reporting exit status".to_owned(),
+                            )),
+                        };
+                    }
+                    _ = async {
+                        match maybe_deadline {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if maybe_deadline.is_some() => {
+                        self.trip_host_timeout();
+                        break;
+                    }
+                    chunk = self.output_rx.recv(), if output_open => {
+                        match chunk {
+                            Some(c) => {
+                                self.account_discarded_chunk(&c);
+                                if self.host_tripped() {
+                                    break;
+                                }
+                            }
+                            None => {
+                                output_open = false;
+                                if maybe_deadline.is_none() {
+                                    return match rx.await {
+                                        Ok(status) => self.merge_host_exit(status),
+                                        Err(_) => Err(SandboxError::Transport(
+                                            "execution stream terminated before reporting exit status".to_owned(),
+                                        )),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let grace = self.exit_drain_grace();
+        match tokio::time::timeout(grace, rx).await {
+            Ok(Ok(status)) => self.merge_host_exit(status),
+            Ok(Err(_)) => Ok(self.synthesized_host_exit()),
+            Err(_) => Ok(self.synthesized_host_exit()),
+        }
     }
 }
 
@@ -354,5 +567,61 @@ mod tests {
             .unwrap();
         assert_eq!(exit.code, Some(0));
         producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_stream_with_limits_caps_rogue_output_and_deadlines_without_guest_exit() {
+        // 1. Rogue guest floods stdout past budget and never sends ExecExit.
+        let (stream, mut handle) = ExecStream::channel(StreamId(31));
+        let stream = stream.with_limits(Duration::from_millis(200), 10, 8);
+
+        let rogue_flood = tokio::spawn(async move {
+            let _ = handle
+                .send_output(ExecOutputChunk {
+                    stream: OutputStreamKind::Stdout,
+                    data: b"0123456789ABCDEF".to_vec(),
+                })
+                .await;
+            assert_eq!(
+                handle.recv_cancel().await,
+                Some(()),
+                "host budget breach must emit cancel signal"
+            );
+            // Intentionally keep `handle` alive without calling `finish` for 5s.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let collected = tokio::time::timeout(Duration::from_secs(2), stream.collect())
+            .await
+            .expect("host budget cap must not hang when guest ignores ExecCancel")
+            .unwrap();
+        assert_eq!(collected.stdout, b"0123456789");
+        assert!(collected.exit.stdout_truncated);
+        assert!(!collected.exit.stderr_truncated);
+        assert!(!collected.exit.timed_out);
+        assert_eq!(collected.exit.code, None);
+        rogue_flood.abort();
+
+        // 2. Rogue guest stalls silently forever past deadline without sending ExecExit.
+        let (silent_stream, mut silent_handle) = ExecStream::channel(StreamId(33));
+        let silent_stream = silent_stream.with_limits(Duration::from_millis(60), 1024, 1024);
+
+        let silent_task = tokio::spawn(async move {
+            assert_eq!(
+                silent_handle.recv_cancel().await,
+                Some(()),
+                "host deadline must emit cancel signal"
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let timed_out = tokio::time::timeout(Duration::from_secs(2), silent_stream.collect())
+            .await
+            .expect("host deadline must resolve even when guest never sends ExecExit")
+            .unwrap();
+        assert!(timed_out.stdout.is_empty());
+        assert!(timed_out.exit.timed_out);
+        assert_eq!(timed_out.exit.code, None);
+        silent_task.abort();
     }
 }

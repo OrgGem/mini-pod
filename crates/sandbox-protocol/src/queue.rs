@@ -15,6 +15,7 @@ use crate::{Frame, Lane, FRAME_HEADER_LEN};
 pub struct PriorityFrameQueue {
     control: VecDeque<Frame>,
     data: VecDeque<Frame>,
+    control_bytes: usize,
     data_bytes: usize,
 }
 
@@ -26,12 +27,14 @@ impl PriorityFrameQueue {
 
     /// Enqueues `frame` at the back of its declared priority lane.
     pub fn push(&mut self, frame: Frame) {
+        let wire_bytes = FRAME_HEADER_LEN.saturating_add(frame.payload.len());
         match frame.header.lane {
-            Lane::Control => self.control.push_back(frame),
+            Lane::Control => {
+                self.control_bytes = self.control_bytes.saturating_add(wire_bytes);
+                self.control.push_back(frame);
+            }
             Lane::Data => {
-                self.data_bytes = self
-                    .data_bytes
-                    .saturating_add(FRAME_HEADER_LEN.saturating_add(frame.payload.len()));
+                self.data_bytes = self.data_bytes.saturating_add(wire_bytes);
                 self.data.push_back(frame);
             }
         }
@@ -40,6 +43,9 @@ impl PriorityFrameQueue {
     /// Dequeues the oldest `Control` frame if present, otherwise the oldest `Data` frame.
     pub fn pop(&mut self) -> Option<Frame> {
         if let Some(frame) = self.control.pop_front() {
+            self.control_bytes = self
+                .control_bytes
+                .saturating_sub(FRAME_HEADER_LEN.saturating_add(frame.payload.len()));
             return Some(frame);
         }
         let frame = self.data.pop_front()?;
@@ -62,6 +68,11 @@ impl PriorityFrameQueue {
     /// Returns queued frames waiting in `Lane::Control`.
     pub fn control_len(&self) -> usize {
         self.control.len()
+    }
+
+    /// Returns total wire bytes (`header + payload`) currently queued in `Lane::Control`.
+    pub fn control_bytes(&self) -> usize {
+        self.control_bytes
     }
 
     /// Returns queued frames waiting in `Lane::Data`.
@@ -117,13 +128,18 @@ mod tests {
         assert_eq!(queue.len(), 4);
         assert_eq!(queue.control_len(), 2);
         assert_eq!(queue.data_len(), 2);
+        let expected_c1_bytes = FRAME_HEADER_LEN + c1.payload.len();
+        let expected_c2_bytes = FRAME_HEADER_LEN + c2.payload.len();
         let expected_d1_bytes = FRAME_HEADER_LEN + d1.payload.len();
         let expected_d2_bytes = FRAME_HEADER_LEN + d2.payload.len();
+        assert_eq!(queue.control_bytes(), expected_c1_bytes + expected_c2_bytes);
         assert_eq!(queue.data_bytes(), expected_d1_bytes + expected_d2_bytes);
 
         assert_eq!(queue.pop(), Some(c1));
+        assert_eq!(queue.control_bytes(), expected_c2_bytes);
         assert_eq!(queue.pop(), Some(c2));
         assert_eq!(queue.control_len(), 0);
+        assert_eq!(queue.control_bytes(), 0);
         assert_eq!(queue.data_len(), 2);
         assert_eq!(queue.data_bytes(), expected_d1_bytes + expected_d2_bytes);
 

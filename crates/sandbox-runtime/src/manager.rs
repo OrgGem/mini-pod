@@ -1736,8 +1736,12 @@ impl RuntimeManager for LocalRuntimeManager {
         req: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
         validate_exec_request(&req)?;
+        let deadline = req.deadline;
+        let stdout_budget_bytes = req.stdout_budget_bytes;
+        let stderr_budget_bytes = req.stderr_budget_bytes;
         let session = self.get_active_session_for_op(id)?;
-        session.exec_stream(req).await
+        let stream = session.exec_stream(req).await?;
+        Ok(stream.with_limits(deadline, stdout_budget_bytes, stderr_budget_bytes))
     }
 
     async fn copy_in(
