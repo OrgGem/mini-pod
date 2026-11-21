@@ -11,7 +11,14 @@ const GUEST_PODMAN_SOCKET_PATH: &str = "/run/podman/podman.sock";
 const DEFAULT_CONTAINER_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.88.0.1";
 const MAX_JSON_NESTING_DEPTH: usize = 128;
 
-const KNOWN_ROOT_FIELDS: &[&str] = &["Volumes", "ExposedPorts", "HostConfig", "Env"];
+const KNOWN_ROOT_FIELDS: &[&str] = &[
+    "Volumes",
+    "ExposedPorts",
+    "HostConfig",
+    "NetworkingConfig",
+    "Env",
+];
+const KNOWN_NETWORKING_CONFIG_FIELDS: &[&str] = &["EndpointsConfig"];
 const KNOWN_HOST_CONFIG_FIELDS: &[&str] = &[
     "Privileged",
     "PidMode",
@@ -22,12 +29,22 @@ const KNOWN_HOST_CONFIG_FIELDS: &[&str] = &[
     "CgroupnsMode",
     "Binds",
     "Mounts",
+    "VolumesFrom",
     "PortBindings",
     "PublishAllPorts",
     "CapAdd",
     "Devices",
     "DeviceCgroupRules",
+    "DeviceRequests",
     "SecurityOpt",
+    "MaskedPaths",
+    "ReadonlyPaths",
+    "Annotations",
+    "VolumeDriver",
+    "CgroupParent",
+    "Cgroup",
+    "Runtime",
+    "Sysctls",
 ];
 const KNOWN_MOUNT_FIELDS: &[&str] = &[
     "Type",
@@ -42,6 +59,42 @@ const KNOWN_MOUNT_FIELDS: &[&str] = &[
 const KNOWN_VOLUME_OPTIONS_FIELDS: &[&str] = &["NoCopy", "Labels", "DriverConfig", "Subpath"];
 const KNOWN_DRIVER_CONFIG_FIELDS: &[&str] = &["Name", "Options"];
 const KNOWN_PORT_BINDING_FIELDS: &[&str] = &["HostIp", "HostPort"];
+const KNOWN_VOLUME_CREATE_FIELDS: &[&str] = &[
+    "Name",
+    "Driver",
+    "DriverOpts",
+    "Labels",
+    "ClusterVolumeSpec",
+];
+const KNOWN_EXEC_CREATE_FIELDS: &[&str] = &[
+    "AttachStdin",
+    "AttachStdout",
+    "AttachStderr",
+    "DetachKeys",
+    "Tty",
+    "Env",
+    "Cmd",
+    "Privileged",
+    "User",
+    "WorkingDir",
+    "ConsoleSize",
+];
+const KNOWN_NETWORK_CREATE_FIELDS: &[&str] = &[
+    "Name",
+    "CheckDuplicate",
+    "Driver",
+    "Scope",
+    "Internal",
+    "Attachable",
+    "Ingress",
+    "IPAM",
+    "EnableIPv6",
+    "Options",
+    "Labels",
+    "ConfigOnly",
+    "ConfigFrom",
+];
+const KNOWN_NETWORK_CONNECT_FIELDS: &[&str] = &["Container", "EndpointConfig"];
 
 /// Controls whether a container's request to mount `/var/run/docker.sock` (e.g., Testcontainers
 /// Ryuk reaper) is rejected or rewritten to the guest VM's internal Podman Unix socket.
@@ -123,6 +176,10 @@ pub fn sanitize_container_create(
         validate_top_level_volumes(volumes)?;
     }
 
+    if let Some(net_cfg) = root_obj.get_mut("NetworkingConfig") {
+        validate_networking_config(net_cfg)?;
+    }
+
     let exposed_tcp_ports = match root_obj.get("ExposedPorts") {
         Some(exposed) => collect_exposed_tcp_ports(exposed)?,
         None => Vec::new(),
@@ -152,6 +209,256 @@ pub fn sanitize_container_create(
         rewritten_body,
         requested_ports,
     })
+}
+
+/// Validates and rewrites a Docker `POST /volumes/create` JSON body, blocking host bind options
+/// (`DriverOpts` `device`/`o`/`type` or host paths) and non-`local` volume drivers.
+pub fn sanitize_volume_create(body: &[u8]) -> Result<Vec<u8>, PolicyRejection> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(b"{}".to_vec());
+    }
+    let mut root: Value = serde_json::from_slice(body)
+        .map_err(|err| PolicyRejection::new(format!("invalid volume create JSON: {err}")))?;
+    reject_duplicate_json_keys(body)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| PolicyRejection::new("volume create body must be a JSON object"))?;
+    canonicalize_struct_keys(obj, KNOWN_VOLUME_CREATE_FIELDS, "CreateVolume")?;
+
+    if let Some(cluster) = obj.get("ClusterVolumeSpec") {
+        if !cluster.is_null() {
+            return Err(PolicyRejection::new(
+                "CreateVolume.ClusterVolumeSpec is forbidden inside sandbox isolation",
+            ));
+        }
+    }
+
+    if let Some(name_val) = obj.get("Name") {
+        if !name_val.is_null() {
+            let name = name_val
+                .as_str()
+                .ok_or_else(|| PolicyRejection::new("CreateVolume.Name must be a string"))?;
+            if !name.is_empty() && !is_safe_volume_name(name) {
+                return Err(PolicyRejection::new(format!(
+                    "unsafe volume Name '{name}' is forbidden"
+                )));
+            }
+        }
+    }
+
+    if let Some(driver_val) = obj.get("Driver") {
+        if !driver_val.is_null() {
+            let driver = driver_val
+                .as_str()
+                .ok_or_else(|| PolicyRejection::new("CreateVolume.Driver must be a string"))?
+                .trim();
+            if !driver.is_empty() && !driver.eq_ignore_ascii_case("local") {
+                return Err(PolicyRejection::new(format!(
+                    "CreateVolume.Driver '{driver}' is forbidden; only 'local' is permitted"
+                )));
+            }
+        }
+    }
+
+    if let Some(opts_val) = obj.get("DriverOpts") {
+        validate_volume_driver_options(opts_val, "CreateVolume.DriverOpts")?;
+    }
+
+    serde_json::to_vec(&root)
+        .map_err(|err| PolicyRejection::new(format!("failed to serialize volume JSON: {err}")))
+}
+
+/// Validates and rewrites a Docker `POST /containers/{id}/exec` JSON body, rejecting
+/// `Privileged: true` and injecting default container proxy environment variables when configured.
+pub fn sanitize_exec_create(
+    body: &[u8],
+    policy: &DockerCompatPolicy,
+) -> Result<Vec<u8>, PolicyRejection> {
+    let mut root: Value = serde_json::from_slice(body)
+        .map_err(|err| PolicyRejection::new(format!("invalid exec create JSON: {err}")))?;
+    reject_duplicate_json_keys(body)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| PolicyRejection::new("exec create body must be a JSON object"))?;
+    canonicalize_struct_keys(obj, KNOWN_EXEC_CREATE_FIELDS, "ExecCreate")?;
+
+    if let Some(priv_val) = obj.get("Privileged") {
+        if !priv_val.is_null() {
+            let is_priv = priv_val
+                .as_bool()
+                .ok_or_else(|| PolicyRejection::new("ExecCreate.Privileged must be a boolean"))?;
+            if is_priv {
+                return Err(PolicyRejection::new(
+                    "ExecCreate.Privileged=true is forbidden inside sandbox isolation",
+                ));
+            }
+        }
+    }
+
+    if let Some(proxy_url) = policy.container_proxy_http_url.as_deref() {
+        inject_container_proxy_env(obj, proxy_url)?;
+    }
+
+    serde_json::to_vec(&root)
+        .map_err(|err| PolicyRejection::new(format!("failed to serialize exec JSON: {err}")))
+}
+
+/// Validates and rewrites a Docker `POST /networks/create` JSON body, blocking `"host"`,
+/// `"macvlan"`, and `"ipvlan"` network drivers/names and unsafe driver options.
+pub fn sanitize_network_create(body: &[u8]) -> Result<Vec<u8>, PolicyRejection> {
+    let mut root: Value = serde_json::from_slice(body)
+        .map_err(|err| PolicyRejection::new(format!("invalid network create JSON: {err}")))?;
+    reject_duplicate_json_keys(body)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| PolicyRejection::new("network create body must be a JSON object"))?;
+    canonicalize_struct_keys(obj, KNOWN_NETWORK_CREATE_FIELDS, "NetworkCreate")?;
+
+    let name = obj
+        .get("Name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PolicyRejection::new("NetworkCreate.Name must be a non-empty string"))?
+        .trim();
+    if !is_safe_custom_network_name(name) {
+        return Err(PolicyRejection::new(format!(
+            "NetworkCreate.Name '{name}' is forbidden"
+        )));
+    }
+
+    if let Some(driver_val) = obj.get("Driver") {
+        if !driver_val.is_null() {
+            let driver = driver_val
+                .as_str()
+                .ok_or_else(|| PolicyRejection::new("NetworkCreate.Driver must be a string"))?
+                .trim();
+            if !driver.is_empty()
+                && !driver.eq_ignore_ascii_case("bridge")
+                && !driver.eq_ignore_ascii_case("null")
+            {
+                return Err(PolicyRejection::new(format!(
+                    "NetworkCreate.Driver '{driver}' is forbidden"
+                )));
+            }
+        }
+    }
+
+    if let Some(cfg_from) = obj.get("ConfigFrom") {
+        if !cfg_from.is_null() {
+            let is_empty = cfg_from.as_object().is_some_and(|m| {
+                m.is_empty()
+                    || m.get("Network")
+                        .and_then(Value::as_str)
+                        .is_some_and(str::is_empty)
+            });
+            if !is_empty {
+                return Err(PolicyRejection::new(
+                    "NetworkCreate.ConfigFrom is forbidden inside sandbox isolation",
+                ));
+            }
+        }
+    }
+
+    if let Some(opts_val) = obj.get("Options") {
+        if !opts_val.is_null() {
+            let map = opts_val
+                .as_object()
+                .ok_or_else(|| PolicyRejection::new("NetworkCreate.Options must be a JSON object"))?;
+            for (k, v) in map {
+                if !k.is_ascii() {
+                    return Err(PolicyRejection::new(format!(
+                        "non-ASCII NetworkCreate.Options key '{k}' is forbidden"
+                    )));
+                }
+                let kl = k.to_ascii_lowercase();
+                let vs = v.as_str().unwrap_or("");
+                if matches!(
+                    kl.as_str(),
+                    "parent"
+                        | "host_interface"
+                        | "mode"
+                        | "com.docker.network.bridge.name"
+                        | "com.docker.network.driver.mtu"
+                ) || vs.contains('/')
+                    || vs.contains('\\')
+                {
+                    return Err(PolicyRejection::new(format!(
+                        "unsafe NetworkCreate.Options entry '{k}' is forbidden"
+                    )));
+                }
+            }
+        }
+    }
+
+    serde_json::to_vec(&root)
+        .map_err(|err| PolicyRejection::new(format!("failed to serialize network JSON: {err}")))
+}
+
+/// Validates and rewrites a Docker `POST /networks/{id}/connect` JSON body, blocking attachment
+/// to the `"host"` network.
+pub fn sanitize_network_connect(
+    network_id_or_name: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, PolicyRejection> {
+    let trimmed = network_id_or_name.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("host")
+        || trimmed.eq_ignore_ascii_case("macvlan")
+        || trimmed.eq_ignore_ascii_case("ipvlan")
+    {
+        return Err(PolicyRejection::new(format!(
+            "connecting container to network '{trimmed}' is forbidden"
+        )));
+    }
+
+    let mut root: Value = serde_json::from_slice(body)
+        .map_err(|err| PolicyRejection::new(format!("invalid network connect JSON: {err}")))?;
+    reject_duplicate_json_keys(body)?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| PolicyRejection::new("network connect body must be a JSON object"))?;
+    canonicalize_struct_keys(obj, KNOWN_NETWORK_CONNECT_FIELDS, "NetworkConnect")?;
+
+    serde_json::to_vec(&root).map_err(|err| {
+        PolicyRejection::new(format!("failed to serialize network connect JSON: {err}"))
+    })
+}
+
+/// Validates query parameters on `POST /build` before streaming the build-context tar archive.
+pub fn validate_image_build_query(
+    decoded_params: &[(String, String)],
+) -> Result<(), PolicyRejection> {
+    for (raw_key, val) in decoded_params {
+        if !raw_key.is_ascii() {
+            return Err(PolicyRejection::new(
+                "non-ASCII query parameter in POST /build is forbidden",
+            ));
+        }
+        let key = raw_key.to_ascii_lowercase();
+        match key.as_str() {
+            "networkmode" => {
+                let mode = val.trim();
+                if !mode.is_empty()
+                    && !matches!(
+                        mode.to_ascii_lowercase().as_str(),
+                        "default" | "bridge" | "none" | "private"
+                    )
+                {
+                    return Err(PolicyRejection::new(format!(
+                        "POST /build networkmode='{mode}' is forbidden"
+                    )));
+                }
+            }
+            "securityopt" | "cgroupparent" | "cgroup-parent" => {
+                if !val.trim().is_empty() {
+                    return Err(PolicyRejection::new(format!(
+                        "POST /build query parameter '{raw_key}' is forbidden"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn reject_duplicate_json_keys(body: &[u8]) -> Result<(), PolicyRejection> {
@@ -277,6 +584,11 @@ fn canonicalize_struct_keys(
     let mut seen_ci = BTreeSet::new();
     let entries: Vec<(String, Value)> = std::mem::take(obj).into_iter().collect();
     for (raw_key, val) in entries {
+        if !raw_key.is_ascii() {
+            return Err(PolicyRejection::new(format!(
+                "non-ASCII field '{raw_key}' in {context} is forbidden"
+            )));
+        }
         let lower = raw_key.to_ascii_lowercase();
         if !seen_ci.insert(lower) {
             return Err(PolicyRejection::new(format!(
@@ -349,6 +661,31 @@ fn inject_container_proxy_env(
     Ok(())
 }
 
+fn validate_networking_config(net_cfg: &mut Value) -> Result<(), PolicyRejection> {
+    if net_cfg.is_null() {
+        return Ok(());
+    }
+    let obj = net_cfg
+        .as_object_mut()
+        .ok_or_else(|| PolicyRejection::new("NetworkingConfig must be a JSON object"))?;
+    canonicalize_struct_keys(obj, KNOWN_NETWORKING_CONFIG_FIELDS, "NetworkingConfig")?;
+    if let Some(endpoints) = obj.get("EndpointsConfig") {
+        if !endpoints.is_null() {
+            let ep_map = endpoints.as_object().ok_or_else(|| {
+                PolicyRejection::new("NetworkingConfig.EndpointsConfig must be a JSON object")
+            })?;
+            for net_name in ep_map.keys() {
+                if !is_allowed_endpoint_network_name(net_name) {
+                    return Err(PolicyRejection::new(format!(
+                        "NetworkingConfig.EndpointsConfig network '{net_name}' is forbidden"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_top_level_volumes(volumes: &Value) -> Result<(), PolicyRejection> {
     if volumes.is_null() {
         return Ok(());
@@ -414,12 +751,13 @@ fn validate_host_config_security(
             if val.is_null() {
                 continue;
             }
-            let mode = val.as_str().ok_or_else(|| {
-                PolicyRejection::new(format!("HostConfig.{field} must be a string"))
-            })?;
-            if mode.trim().eq_ignore_ascii_case("host") {
+            let mode = val
+                .as_str()
+                .ok_or_else(|| PolicyRejection::new(format!("HostConfig.{field} must be a string")))?
+                .trim();
+            if !is_allowed_namespace_mode(field, mode) {
                 return Err(PolicyRejection::new(format!(
-                    "HostConfig.{field}='host' is forbidden inside sandbox isolation"
+                    "HostConfig.{field}='{mode}' is forbidden inside sandbox isolation"
                 )));
             }
         }
@@ -433,7 +771,13 @@ fn validate_host_config_security(
         sanitize_mounts(mounts, policy.reaper_socket)?;
     }
 
-    for list_field in ["Devices", "DeviceCgroupRules", "CapAdd"] {
+    for list_field in [
+        "Devices",
+        "DeviceCgroupRules",
+        "DeviceRequests",
+        "CapAdd",
+        "VolumesFrom",
+    ] {
         if let Some(val) = hc.get(list_field) {
             if !val.is_null() {
                 let arr = val.as_array().ok_or_else(|| {
@@ -448,17 +792,62 @@ fn validate_host_config_security(
         }
     }
 
+    for mask_field in ["MaskedPaths", "ReadonlyPaths"] {
+        if let Some(val) = hc.get(mask_field) {
+            if !val.is_null() {
+                return Err(PolicyRejection::new(format!(
+                    "HostConfig.{mask_field} customization is forbidden inside sandbox isolation"
+                )));
+            }
+        }
+    }
+
+    for map_field in ["Annotations", "Sysctls"] {
+        if let Some(val) = hc.get(map_field) {
+            if !val.is_null() {
+                let obj = val.as_object().ok_or_else(|| {
+                    PolicyRejection::new(format!("HostConfig.{map_field} must be a JSON object"))
+                })?;
+                if !obj.is_empty() {
+                    return Err(PolicyRejection::new(format!(
+                        "HostConfig.{map_field} is forbidden inside sandbox isolation"
+                    )));
+                }
+            }
+        }
+    }
+
+    for str_field in ["VolumeDriver", "CgroupParent", "Cgroup", "Runtime"] {
+        if let Some(val) = hc.get(str_field) {
+            if !val.is_null() {
+                let s = val.as_str().ok_or_else(|| {
+                    PolicyRejection::new(format!("HostConfig.{str_field} must be a string"))
+                })?;
+                if !s.trim().is_empty() {
+                    return Err(PolicyRejection::new(format!(
+                        "HostConfig.{str_field}='{s}' is forbidden inside sandbox isolation"
+                    )));
+                }
+            }
+        }
+    }
+
     if let Some(sec_opt) = hc.get("SecurityOpt") {
         if !sec_opt.is_null() {
             let arr = sec_opt.as_array().ok_or_else(|| {
                 PolicyRejection::new("HostConfig.SecurityOpt must be a JSON array")
             })?;
             for entry in arr {
-                let opt = entry.as_str().ok_or_else(|| {
-                    PolicyRejection::new("HostConfig.SecurityOpt entries must be strings")
-                })?;
-                let lower = opt.to_ascii_lowercase();
-                if lower.contains("unconfined") || lower.contains("disable") {
+                let opt = entry
+                    .as_str()
+                    .ok_or_else(|| {
+                        PolicyRejection::new("HostConfig.SecurityOpt entries must be strings")
+                    })?
+                    .trim();
+                if !matches!(
+                    opt.to_ascii_lowercase().as_str(),
+                    "no-new-privileges" | "no-new-privileges=true" | "no-new-privileges:true"
+                ) {
                     return Err(PolicyRejection::new(format!(
                         "HostConfig.SecurityOpt '{opt}' is forbidden inside sandbox isolation"
                     )));
@@ -676,25 +1065,10 @@ fn sanitize_volume_mount(obj: &mut Map<String, Value>) -> Result<(), PolicyRejec
                         "VolumeOptions.DriverConfig",
                     )?;
                     if let Some(driver_opts) = dc_obj.get("Options") {
-                        if !driver_opts.is_null() {
-                            let d_map = driver_opts.as_object().ok_or_else(|| {
-                                PolicyRejection::new(
-                                    "VolumeOptions.DriverConfig.Options must be a JSON object",
-                                )
-                            })?;
-                            for (k, v) in d_map {
-                                let key_lower = k.to_ascii_lowercase();
-                                let val_str = v.as_str().unwrap_or("");
-                                if matches!(key_lower.as_str(), "device" | "o" | "type")
-                                    || val_str.contains('/')
-                                    || val_str.contains('\\')
-                                {
-                                    return Err(PolicyRejection::new(format!(
-                                        "unsafe VolumeOptions.DriverConfig option '{k}' is forbidden"
-                                    )));
-                                }
-                            }
-                        }
+                        validate_volume_driver_options(
+                            driver_opts,
+                            "VolumeOptions.DriverConfig.Options",
+                        )?;
                     }
                 }
             }
@@ -891,6 +1265,94 @@ fn is_safe_container_path(path: &str) -> bool {
         return false;
     }
     !path.split('/').any(|seg| seg == "..")
+}
+
+fn validate_volume_driver_options(opts: &Value, context: &str) -> Result<(), PolicyRejection> {
+    if opts.is_null() {
+        return Ok(());
+    }
+    let d_map = opts
+        .as_object()
+        .ok_or_else(|| PolicyRejection::new(format!("{context} must be a JSON object")))?;
+    for (k, v) in d_map {
+        if !k.is_ascii() {
+            return Err(PolicyRejection::new(format!(
+                "non-ASCII {context} option '{k}' is forbidden"
+            )));
+        }
+        let key_lower = k.to_ascii_lowercase();
+        let val_str = v.as_str().unwrap_or("");
+        if matches!(key_lower.as_str(), "device" | "o" | "type")
+            || val_str.contains('/')
+            || val_str.contains('\\')
+        {
+            return Err(PolicyRejection::new(format!(
+                "unsafe {context} option '{k}' is forbidden"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_container_ref(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn is_safe_custom_network_name(name: &str) -> bool {
+    if !is_safe_volume_name(name) || name.len() > 128 {
+        return false;
+    }
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host" | "macvlan" | "ipvlan"
+    )
+}
+
+fn is_allowed_endpoint_network_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "bridge" | "none" | "default") {
+        return true;
+    }
+    is_safe_custom_network_name(name.trim())
+}
+
+fn is_allowed_namespace_mode(field: &str, mode: &str) -> bool {
+    if mode.is_empty() {
+        return true;
+    }
+    let lower = mode.to_ascii_lowercase();
+    match field {
+        "PidMode" | "UTSMode" => {
+            lower == "private"
+                || mode
+                    .strip_prefix("container:")
+                    .is_some_and(is_safe_container_ref)
+        }
+        "IpcMode" => {
+            matches!(lower.as_str(), "none" | "private" | "shareable")
+                || mode
+                    .strip_prefix("container:")
+                    .is_some_and(is_safe_container_ref)
+        }
+        "UsernsMode" | "CgroupnsMode" => lower == "private",
+        "NetworkMode" => {
+            if matches!(
+                lower.as_str(),
+                "default" | "bridge" | "none" | "private" | "slirp4netns" | "pasta"
+            ) {
+                return true;
+            }
+            if let Some(target) = mode.strip_prefix("container:") {
+                return is_safe_container_ref(target);
+            }
+            is_safe_custom_network_name(mode)
+        }
+        _ => false,
+    }
 }
 
 fn is_safe_volume_name(name: &str) -> bool {
@@ -1285,5 +1747,89 @@ mod tests {
                 String::from_utf8_lossy(raw)
             );
         }
+    }
+
+    #[test]
+    fn rejects_unicode_equalfold_keys_ns_modes_masked_paths_and_mutating_route_escapes() {
+        let policy = DockerCompatPolicy {
+            reaper_socket: ReaperSocketPolicy::Deny,
+            container_proxy_http_url: Some("http://10.88.0.1:3128".to_owned()),
+        };
+
+        // Go `encoding/json` EqualFold Unicode folding (`\u017f` == 's', `\u212a` == 'k') and
+        // Podman-specific namespace/mask/volume/security escapes must all be rejected.
+        let forbidden_creates: &[&[u8]] = &[
+            br#"{"Image":"alpine","Ho\u017ftConfig":{"Privileged":true}}"#,
+            br#"{"Image":"alpine","HostConfig":{"Bind\u017f":["/:/mnt"]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"Networ\u212aMode":"host"}}"#,
+            br#"{"Image":"alpine","HostConfig":{"PidMode":"ns:/proc/1/ns/pid"}}"#,
+            br#"{"Image":"alpine","HostConfig":{"NetworkMode":"slirp4netns:allow_host_loopback=true"}}"#,
+            br#"{"Image":"alpine","HostConfig":{"VolumesFrom":["other-ctr"]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"MaskedPaths":[]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"ReadonlyPaths":[]}}"#,
+            br#"{"Image":"alpine","HostConfig":{"Annotations":{"run.oci.keep_original_groups":"1"}}}"#,
+            br#"{"Image":"alpine","HostConfig":{"SecurityOpt":["label=type:spc_t"]}}"#,
+            br#"{"Image":"alpine","NetworkingConfig":{"EndpointsConfig":{"host":{}}}}"#,
+        ];
+        for raw in forbidden_creates {
+            assert!(
+                sanitize_container_create(raw, &policy).is_err(),
+                "must reject escape payload: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+
+        // Benign `no-new-privileges` and Compose custom networks remain permitted.
+        let allowed_create = serde_json::to_vec(&json!({
+            "Image": "alpine",
+            "HostConfig": {
+                "NetworkMode": "my-demo_stack_default",
+                "SecurityOpt": ["no-new-privileges:true"]
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    "my-demo_stack_default": { "Aliases": ["api"] }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(sanitize_container_create(&allowed_create, &policy).is_ok());
+
+        // `POST /volumes/create`: block bind DriverOpts, non-local driver, and Unicode keys.
+        assert!(sanitize_volume_create(br#"{"Name":"app_data"}"#).is_ok());
+        assert!(sanitize_volume_create(
+            br#"{"Name":"evil","DriverOpts":{"type":"none","o":"bind","device":"/"}}"#
+        )
+        .is_err());
+        assert!(sanitize_volume_create(
+            br#"{"Name":"evil","DriverOpt\u017f":{"device":"/etc"}}"#
+        )
+        .is_err());
+
+        // `POST /containers/{id}/exec`: block Privileged=true + Unicode keys, inject proxy env.
+        assert!(sanitize_exec_create(br#"{"Cmd":["sh"],"Privileged":true}"#, &policy).is_err());
+        assert!(
+            sanitize_exec_create(br#"{"Cmd":["sh"],"Privilege\u0064":true}"#, &policy).is_err()
+        );
+        let exec_ok = sanitize_exec_create(br#"{"Cmd":["id"]}"#, &policy).unwrap();
+        let exec_val: Value = serde_json::from_slice(&exec_ok).unwrap();
+        assert!(exec_val["Env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("HTTP_PROXY=http://10.88.0.1:3128")));
+
+        // `POST /networks/create`, `POST /networks/{id}/connect`, and `POST /build` query.
+        assert!(sanitize_network_create(br#"{"Name":"app_net","Driver":"bridge"}"#).is_ok());
+        assert!(sanitize_network_create(br#"{"Name":"host","Driver":"bridge"}"#).is_err());
+        assert!(sanitize_network_create(br#"{"Name":"net1","Driver":"macvlan"}"#).is_err());
+        assert!(sanitize_network_connect("host", br#"{"Container":"abc"}"#).is_err());
+        assert!(sanitize_network_connect("app_net", br#"{"Container":"abc"}"#).is_ok());
+        assert!(validate_image_build_query(&[("t".into(), "demo:1".into())]).is_ok());
+        assert!(validate_image_build_query(&[("networkmode".into(), "host".into())]).is_err());
+        assert!(
+            validate_image_build_query(&[("networkmode".into(), "ns:/proc/1/ns/net".into())])
+                .is_err()
+        );
     }
 }

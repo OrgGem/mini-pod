@@ -16,8 +16,10 @@ pub use http1::{
     HttpResponseHead, PrefixedReader, MAX_BUFFERED_BODY_BYTES, MAX_HEADER_BYTES,
 };
 pub use policy::{
-    sanitize_container_create, DockerCompatPolicy, PolicyRejection, ReaperSocketPolicy,
-    RequestedPortBinding, SanitizedCreatePlan,
+    sanitize_container_create, sanitize_exec_create, sanitize_network_connect,
+    sanitize_network_create, sanitize_volume_create, validate_image_build_query,
+    DockerCompatPolicy, PolicyRejection, ReaperSocketPolicy, RequestedPortBinding,
+    SanitizedCreatePlan,
 };
 pub use ports::{ActivePortForward, PortForwardRegistry};
 pub use rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json, RewriteError};

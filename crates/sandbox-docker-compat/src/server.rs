@@ -27,7 +27,11 @@ use crate::http1::{
     write_request_head, write_response_head, BodyMode, HttpError, HttpRequestHead,
     HttpResponseHead, PrefixedReader, MAX_BUFFERED_BODY_BYTES,
 };
-use crate::policy::{sanitize_container_create, DockerCompatPolicy};
+use crate::policy::{
+    sanitize_container_create, sanitize_exec_create, sanitize_network_connect,
+    sanitize_network_create, sanitize_volume_create, validate_image_build_query,
+    DockerCompatPolicy, PolicyRejection,
+};
 use crate::ports::PortForwardRegistry;
 use crate::rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json};
 
@@ -162,6 +166,13 @@ enum StreamNext {
 enum DockerRoute<'a> {
     ForbiddenLibpod,
     ContainerCreate,
+    VolumeCreate,
+    ContainerExecCreate,
+    NetworkCreate,
+    NetworkConnect {
+        id: String,
+    },
+    ImageBuild,
     ContainerStart {
         version_prefix: Option<&'a str>,
         raw_id: &'a str,
@@ -570,7 +581,8 @@ impl DockerCompatServer {
 
         let route = match parse_docker_route(&req.method, &req.path) {
             DockerRoute::ForbiddenLibpod => {
-                let close = req.wants_close();
+                // Close if `req` carries an unread body so keep-alive framing never desyncs.
+                let close = req.wants_close() || !matches!(req.body_mode(), BodyMode::Empty);
                 write_json_error(
                     client,
                     403,
@@ -597,6 +609,49 @@ impl DockerCompatServer {
                     None => req.path.clone(),
                 };
                 return self.handle_container_create(client, req).await;
+            }
+            DockerRoute::VolumeCreate => {
+                return self
+                    .handle_sanitized_json_post(client, req, "volume create", |raw, _| {
+                        sanitize_volume_create(raw)
+                    })
+                    .await;
+            }
+            DockerRoute::ContainerExecCreate => {
+                return self
+                    .handle_sanitized_json_post(client, req, "exec create", |raw, policy| {
+                        sanitize_exec_create(raw, policy)
+                    })
+                    .await;
+            }
+            DockerRoute::NetworkCreate => {
+                return self
+                    .handle_sanitized_json_post(client, req, "network create", |raw, _| {
+                        sanitize_network_create(raw)
+                    })
+                    .await;
+            }
+            DockerRoute::NetworkConnect { id } => {
+                return self
+                    .handle_sanitized_json_post(client, req, "network connect", move |raw, _| {
+                        sanitize_network_connect(&id, raw)
+                    })
+                    .await;
+            }
+            DockerRoute::ImageBuild => {
+                let params = decode_all_query_params(req.query.as_deref());
+                if let Err(rejection) = validate_image_build_query(&params) {
+                    let close = req.wants_close() || !matches!(req.body_mode(), BodyMode::Empty);
+                    write_json_error(client, 400, "Bad Request", rejection.reason(), close)
+                        .await
+                        .map_err(http_to_io)?;
+                    return Ok(if close {
+                        StreamNext::Close
+                    } else {
+                        StreamNext::Continue
+                    });
+                }
+                RouteDispatch::Pass
             }
             DockerRoute::ContainerStart {
                 version_prefix,
@@ -807,6 +862,114 @@ impl DockerCompatServer {
                 }
             }
         }
+
+        write_buffered_response(client, &req, &mut resp_head, &resp_body).await
+    }
+
+    async fn handle_sanitized_json_post<S, F>(
+        &self,
+        client: &mut PrefixedReader<S>,
+        req: HttpRequestHead,
+        label: &str,
+        sanitize: F,
+    ) -> io::Result<StreamNext>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        F: FnOnce(&[u8], &DockerCompatPolicy) -> Result<Vec<u8>, PolicyRejection>,
+    {
+        if expects_100_continue(&req) && !matches!(req.body_mode(), BodyMode::Empty) {
+            client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            client.flush().await?;
+        }
+
+        let raw_body = match read_body_bytes(client, req.body_mode(), MAX_BUFFERED_BODY_BYTES).await
+        {
+            Ok(body) => body,
+            Err(HttpError::BodyTooLarge { limit }) => {
+                let _ = write_json_error(
+                    client,
+                    413,
+                    "Payload Too Large",
+                    &format!("{label} body exceeds {limit} bytes"),
+                    true,
+                )
+                .await;
+                return Ok(StreamNext::Close);
+            }
+            Err(HttpError::Io(err)) => return Err(err),
+            Err(err) => {
+                let _ = write_json_error(client, 400, "Bad Request", &err.to_string(), true).await;
+                return Ok(StreamNext::Close);
+            }
+        };
+
+        let rewritten = match sanitize(&raw_body, &self.policy) {
+            Ok(bytes) => bytes,
+            Err(rejection) => {
+                let close = req.wants_close();
+                write_json_error(client, 400, "Bad Request", rejection.reason(), close)
+                    .await
+                    .map_err(http_to_io)?;
+                return Ok(if close {
+                    StreamNext::Close
+                } else {
+                    StreamNext::Continue
+                });
+            }
+        };
+
+        let mut up_req = req.clone();
+        up_req.version = "HTTP/1.1".to_owned();
+        strip_headers(&mut up_req.headers, &["expect"]);
+        set_buffered_body_headers(&mut up_req.headers, rewritten.len(), true);
+
+        let mut upstream = match self
+            .tunnel_port
+            .open_podman_unix_stream(&self.sandbox_id)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                let close = req.wants_close();
+                write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
+                    .await
+                    .map_err(http_to_io)?;
+                return Ok(if close {
+                    StreamNext::Close
+                } else {
+                    StreamNext::Continue
+                });
+            }
+        };
+
+        if let Err(err) = write_request_and_bytes(&mut upstream, &up_req, &rewritten).await {
+            let close = req.wants_close();
+            write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
+                .await
+                .map_err(http_to_io)?;
+            return Ok(if close {
+                StreamNext::Close
+            } else {
+                StreamNext::Continue
+            });
+        }
+
+        let mut up_reader = PrefixedReader::new(upstream);
+        let (mut resp_head, resp_body) =
+            match read_buffered_upstream_response(&mut up_reader, &req.method).await {
+                Ok(res) => res,
+                Err(err) => {
+                    let close = req.wants_close();
+                    write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
+                        .await
+                        .map_err(http_to_io)?;
+                    return Ok(if close {
+                        StreamNext::Close
+                    } else {
+                        StreamNext::Continue
+                    });
+                }
+            };
 
         write_buffered_response(client, &req, &mut resp_head, &resp_body).await
     }
@@ -1394,11 +1557,13 @@ fn canonicalize_docker_path(raw_path: &str) -> Result<String, &'static str> {
         segments.push(norm);
     }
 
-    if segments
-        .first()
-        .is_some_and(|first| is_api_version_segment(first))
-    {
-        segments[0].make_ascii_lowercase();
+    if let Some(first) = segments.first() {
+        if looks_like_version_prefix_attempt(first) {
+            if !is_api_version_segment(first) {
+                return Err("malformed Docker API version prefix");
+            }
+            segments[0].make_ascii_lowercase();
+        }
     }
 
     let tail_start = usize::from(
@@ -1436,11 +1601,11 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
         return DockerRoute::PassThrough;
     }
     let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts
-        .first()
-        .is_some_and(|first| first.eq_ignore_ascii_case("libpod"))
-    {
-        return DockerRoute::ForbiddenLibpod;
+    for (idx, seg) in parts.iter().enumerate() {
+        let is_image_ref = idx == 1 && parts[0].eq_ignore_ascii_case("images");
+        if !is_image_ref && seg.eq_ignore_ascii_case("libpod") {
+            return DockerRoute::ForbiddenLibpod;
+        }
     }
 
     if method.eq_ignore_ascii_case("POST") {
@@ -1450,6 +1615,37 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
                     && action.eq_ignore_ascii_case("create") =>
             {
                 return DockerRoute::ContainerCreate;
+            }
+            [v, action]
+                if v.eq_ignore_ascii_case("volumes")
+                    && action.eq_ignore_ascii_case("create") =>
+            {
+                return DockerRoute::VolumeCreate;
+            }
+            [n, action]
+                if n.eq_ignore_ascii_case("networks")
+                    && action.eq_ignore_ascii_case("create") =>
+            {
+                return DockerRoute::NetworkCreate;
+            }
+            [n, raw_id, action]
+                if n.eq_ignore_ascii_case("networks")
+                    && action.eq_ignore_ascii_case("connect") =>
+            {
+                if let Some(id) = decode_safe_container_id(raw_id) {
+                    return DockerRoute::NetworkConnect { id };
+                }
+            }
+            [c, raw_id, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("exec") =>
+            {
+                if decode_safe_container_id(raw_id).is_some() {
+                    return DockerRoute::ContainerExecCreate;
+                }
+            }
+            [b] if b.eq_ignore_ascii_case("build") => {
+                return DockerRoute::ImageBuild;
             }
             [c, raw_id, action]
                 if c.eq_ignore_ascii_case("containers")
@@ -1552,12 +1748,20 @@ fn strip_api_version(path: &str) -> (Option<&str>, &str) {
     }
 }
 
+fn looks_like_version_prefix_attempt(seg: &str) -> bool {
+    let bytes = seg.as_bytes();
+    bytes.len() >= 2
+        && matches!(bytes[0], b'v' | b'V')
+        && bytes[1].is_ascii_digit()
+}
+
 fn is_api_version_segment(seg: &str) -> bool {
     let Some(ver) = seg.strip_prefix('v').or_else(|| seg.strip_prefix('V')) else {
         return false;
     };
     let bytes = ver.as_bytes();
     if bytes.is_empty()
+        || !ver.contains('.')
         || !bytes.first().is_some_and(u8::is_ascii_digit)
         || !bytes.last().is_some_and(u8::is_ascii_digit)
     {
@@ -1581,6 +1785,19 @@ fn decode_safe_container_id(raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_owned())
+}
+
+fn decode_all_query_params(query: Option<&str>) -> Vec<(String, String)> {
+    let Some(q) = query else {
+        return Vec::new();
+    };
+    q.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
 }
 
 fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
@@ -2619,5 +2836,104 @@ mod tests {
                 "must reject encoded slash route '{bad_encoded_slash}'"
             );
         }
+
+        // Malformed gorilla/mux version prefixes (`/v1.45-0/...`, `/v1/...`) must fail closed.
+        for bad_ver in [
+            "/v1.45-0/containers/create",
+            "/v1/containers/create",
+            "/V1.45_rc1/containers/create",
+            "/v1..45/containers/create",
+        ] {
+            assert!(
+                canonicalize_docker_path(bad_ver).is_err(),
+                "must reject malformed version prefix '{bad_ver}'"
+            );
+        }
+
+        // Non-leading `/libpod` segments must be blocked, while `/images/libpod/json` remains valid.
+        assert!(matches!(
+            parse_docker_route("GET", "/v1.45/containers/libpod/json"),
+            DockerRoute::ForbiddenLibpod
+        ));
+        assert!(!matches!(
+            parse_docker_route("GET", "/v1.45/images/libpod/json"),
+            DockerRoute::ForbiddenLibpod
+        ));
+    }
+
+    #[tokio::test]
+    async fn router_closes_on_rejected_unconsumed_body_and_enforces_mutating_route_policies() {
+        let tunnel_port: Arc<dyn SandboxTunnelPort> = Arc::new(MockPodmanTunnelPort::new());
+        let server = Arc::new(DockerCompatServer::new(
+            tunnel_port,
+            SandboxId::new("sb-route-gates"),
+            DockerCompatPolicy::default(),
+        ));
+        let handle = server
+            .bind_loopback_http("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = handle.local_addr();
+
+        // 1. `POST /v5.0.0/libpod/containers/create` with a body must return 403 AND close the
+        // connection so unconsumed body bytes cannot smuggle a second request on keep-alive.
+        {
+            let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let smuggled = concat!(
+                "POST /v5.0.0/libpod/containers/create HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Content-Length: 37\r\n\r\n",
+                "GET /_ping HTTP/1.1\r\nHost: localhost\r\n"
+            );
+            conn.write_all(smuggled.as_bytes()).await.unwrap();
+            let mut reader = PrefixedReader::new(conn);
+            let head = read_response_head(&mut reader).await.unwrap();
+            assert_eq!(head.status, 403);
+            assert!(
+                head.wants_close(),
+                "ForbiddenLibpod response with unread body must signal Connection: close"
+            );
+            let _ = read_body_bytes(&mut reader, head.body_mode("POST"), 4096)
+                .await
+                .unwrap();
+            assert!(
+                read_response_head(&mut reader).await.is_err(),
+                "connection must be closed rather than parsing unread body as pipelined GET /_ping"
+            );
+        }
+
+        // 2. Malformed version prefix, volume bind opts, privileged exec, host network connect, and
+        // `POST /build?networkmode=host` must all fail closed with 400 over HTTP.
+        for (path, body) in [
+            (
+                "/v1.45-0/containers/create",
+                r#"{"Image":"alpine","HostConfig":{"Privileged":true}}"#,
+            ),
+            (
+                "/v1.45/volumes/create",
+                r#"{"Name":"v1","DriverOpts":{"type":"none","o":"bind","device":"/"}}"#,
+            ),
+            (
+                "/v1.45/containers/ctr123/exec",
+                r#"{"Cmd":["/bin/sh"],"Privileged":true}"#,
+            ),
+            (
+                "/v1.45/networks/create",
+                r#"{"Name":"host","Driver":"bridge"}"#,
+            ),
+            ("/v1.45/networks/host/connect", r#"{"Container":"ctr123"}"#),
+            ("/v1.45/build?networkmode=host", "tar-stream-bytes"),
+        ] {
+            let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut reader = PrefixedReader::new(conn);
+            let (head, _) = send_http(&mut reader, "POST", path, Some(body.as_bytes())).await;
+            assert_eq!(
+                head.status, 400,
+                "expected 400 Bad Request on '{path}', got {}",
+                head.status
+            );
+        }
+
+        handle.shutdown().await;
     }
 }
