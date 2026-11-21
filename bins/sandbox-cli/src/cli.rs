@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::compose::{execute_compose, ComposeAction};
 use crate::image_build::{build_image_in_sandbox, ImageBuildSpec};
+use crate::run::{execute_run, RunSpec};
 
 pub const USAGE_TEXT: &str = "\
 mini-pod sandbox command-line interface (routed via SandboxClient)
@@ -44,6 +45,9 @@ SUBCOMMANDS:
         --disk-mb <N>
         --storage-mb <N>
         --ttl-secs <N>
+    run [SPAWN_OPTIONS] [EXEC_OPTIONS] [--input <SRC_HOST> <DST_GUEST>] [--output <SRC_GUEST> <DST_HOST>] -- <ARGV...>
+        SPAWN_OPTIONS are the options listed for spawn above.
+        EXEC_OPTIONS are --cwd, --user, --env, --deadline-secs, --stdout-budget-bytes, and --stderr-budget-bytes.
     exec <SANDBOX_ID> [OPTIONS] -- <ARGV...>
         --container <NAME>
         --cwd <DIR>
@@ -98,6 +102,7 @@ pub enum CliCommand {
         refresh_interval: Duration,
     },
     Spawn(SandboxSpec),
+    Run(Box<RunSpec>),
     Exec {
         id: SandboxId,
         req: ExecRequest,
@@ -222,6 +227,16 @@ where
                 return Ok(CliOutcome::Help(USAGE_TEXT));
             }
             CliCommand::Spawn(parse_spawn(rest, &mut endpoint_raw, &mut json_output)?)
+        }
+        "run" => {
+            if check_help_before_double_dash(rest) {
+                return Ok(CliOutcome::Help(USAGE_TEXT));
+            }
+            CliCommand::Run(Box::new(parse_run(
+                rest,
+                &mut endpoint_raw,
+                &mut json_output,
+            )?))
         }
         "exec" => {
             if check_help_before_double_dash(rest) {
@@ -676,6 +691,90 @@ fn parse_exec(
             stderr_budget_bytes,
         },
     ))
+}
+
+fn parse_run(
+    rest: &[String],
+    endpoint_raw: &mut Option<String>,
+    json_output: &mut bool,
+) -> Result<RunSpec, SandboxError> {
+    let mut spawn_args = Vec::new();
+    let mut exec_args = vec!["run-sandbox".to_owned()];
+    let mut input = None;
+    let mut output = None;
+    let mut i = 0;
+
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--" {
+            exec_args.extend(rest[i..].iter().cloned());
+            break;
+        }
+        if try_consume_global_flag(rest, &mut i, endpoint_raw, json_output)? {
+            i += 1;
+            continue;
+        }
+        let (flag, inline) = split_flag(arg);
+        match flag {
+            "--input" | "--output" => {
+                let first = take_flag_value(rest, &mut i, flag, inline)?;
+                i += 1;
+                let second = rest
+                    .get(i)
+                    .filter(|value| !value.is_empty() && *value != "--")
+                    .ok_or_else(|| SandboxError::InvalidSpec(format!("{flag} requires two paths")))?
+                    .clone();
+                if first.is_empty() {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "{flag} paths must not be empty"
+                    )));
+                }
+                let target = if flag == "--input" {
+                    &mut input
+                } else {
+                    &mut output
+                };
+                if target.replace((first, second)).is_some() {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "{flag} may only be specified once"
+                    )));
+                }
+            }
+            "--isolation" | "--accel" | "--network" | "--vcpus" | "--ram-mb" | "--rss-mb"
+            | "--cpu-millicores" | "--disk-mb" | "--storage-mb" | "--ttl-secs" => {
+                let value = take_flag_value(rest, &mut i, flag, inline)?;
+                spawn_args.extend([flag.to_owned(), value]);
+            }
+            "--cwd"
+            | "--user"
+            | "--env"
+            | "--deadline-secs"
+            | "--stdout-budget-bytes"
+            | "--stderr-budget-bytes" => {
+                let value = take_flag_value(rest, &mut i, flag, inline)?;
+                exec_args.extend([flag.to_owned(), value]);
+            }
+            _ => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "unknown option '{arg}' for 'run'"
+                )))
+            }
+        }
+        i += 1;
+    }
+    if i == rest.len() {
+        return Err(SandboxError::InvalidSpec(
+            "run requires '--' followed by command arguments".to_owned(),
+        ));
+    }
+    let spec = parse_spawn(&spawn_args, endpoint_raw, json_output)?;
+    let (_, request) = parse_exec(&exec_args, endpoint_raw, json_output)?;
+    Ok(RunSpec {
+        spec,
+        request,
+        input: input.map(|(host, guest)| (PathBuf::from(host), guest)),
+        output: output.map(|(guest, host)| (guest, PathBuf::from(host))),
+    })
 }
 
 fn parse_renew(
@@ -1350,6 +1449,7 @@ pub async fn execute_with_client(
         CliCommand::Tui { refresh_interval } => {
             crate::tui::run_tui(client, refresh_interval).await
         }
+        CliCommand::Run(spec) => execute_run(client, json_mode, *spec).await,
         CliCommand::Spawn(spec) => {
             let lease = client.spawn(spec).await?;
             if json_mode {

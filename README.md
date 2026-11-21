@@ -269,6 +269,16 @@ cargo run --release -p sandbox-image --bin bundle-pack -- \
 
 `sandbox-cli` connects to `sandboxd` over the default owner-only endpoint (or `--endpoint <URI>` / `MINIPOD_ENDPOINT`). Add `--json` to any command for structured JSON output.
 
+### Run a one-shot workload
+
+```bash
+sandbox-cli run --input ./job /work --cwd /work --output /work/out ./result --deadline-secs 60 -- sh ./process.sh
+```
+
+`run` creates a VM with isolated networking, copies the explicitly selected input into it, executes the command, copies the selected output after a successful execution, and destroys the sandbox. The command and its tools must be available in the guest bundle. Omit either transfer flag when it is not needed. The output destination must not exist and its parent directory must already exist. Output is extracted into a private staging directory on the same filesystem and published with an atomic no-overwrite rename.
+
+`run` accepts the resource, accelerator, network, and TTL options of `spawn`, as well as the working directory, user, environment, deadline, and output budget options of `exec`. It renews the lease during the operation. An interrupt requests cancellation and cleanup. With `--json`, the result contains separate `workload`, `copy_out`, and `cleanup` objects and the sandbox ID when known. Cleanup that reports `ProcessExited` or an unknown outcome makes the command fail and includes the sandbox ID when available for investigation.
+
 ### 5.1 Check Daemon Status & List Active Sandboxes
 
 ```bash

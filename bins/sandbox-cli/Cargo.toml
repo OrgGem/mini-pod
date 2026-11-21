@@ -7,9 +7,14 @@ license.workspace = true
 
 [dependencies]
 crossterm = "0.28"
+getrandom = { workspace = true }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
-sandbox-core = { workspace = true }
+renamore = "0.3.2"
 sandbox-client = { workspace = true }
+sandbox-core = { workspace = true, features = ["safe-tar"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["io-std"] }
+tokio = { workspace = true, features = ["io-std", "signal"] }
 yaml-rust2 = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+sandbox-vmm = { workspace = true }

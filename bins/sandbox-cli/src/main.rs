@@ -4,6 +4,7 @@
 mod cli;
 mod compose;
 mod image_build;
+mod run;
 mod tui;
 
 use std::process::ExitCode;
