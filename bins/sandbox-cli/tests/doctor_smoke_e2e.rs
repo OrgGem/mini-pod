@@ -189,7 +189,7 @@ where
             let (exec_error, exit) = {
                 let mut state = state.lock().expect("mock state lock");
                 state.requests.push("exec");
-                (state.config.exec_error, state.config.exit.clone())
+                (state.config.exec_error, state.config.exit)
             };
             if exec_error {
                 send_response(
@@ -409,14 +409,15 @@ async fn doctor_smoke_runs_isolated_vm_and_reports_driver_accelerator() {
     assert_eq!(report["smoke"]["workload"]["stdout"], "doctor-smoke-ok\n");
     assert_eq!(report["smoke"]["cleanup"]["status"], "AllResourcesCleaned");
 
-    let state = state.lock().expect("mock state lock");
-    assert_eq!(state.requests, ["status", "doctor", "spawn", "accelerator", "exec", "destroy"]);
-    let spec = state.spawned_spec.as_ref().expect("smoke spawn spec");
-    assert_eq!(spec.isolation, IsolationMode::VmRequired);
-    assert_eq!(spec.acceleration, AccelerationPolicy::Preferred);
-    assert_eq!(spec.network, NetworkPolicy::Isolated);
-    assert_eq!(spec.budget.guest_vcpus, 1);
-    drop(state);
+    {
+        let state = state.lock().expect("mock state lock");
+        assert_eq!(state.requests, ["status", "doctor", "spawn", "accelerator", "exec", "destroy"]);
+        let spec = state.spawned_spec.as_ref().expect("smoke spawn spec");
+        assert_eq!(spec.isolation, IsolationMode::VmRequired);
+        assert_eq!(spec.acceleration, AccelerationPolicy::Preferred);
+        assert_eq!(spec.network, NetworkPolicy::Isolated);
+        assert_eq!(spec.budget.guest_vcpus, 1);
+    }
     daemon.stop().await;
 }
 
@@ -466,8 +467,10 @@ async fn doctor_smoke_exec_failure_still_destroys_sandbox() {
 #[tokio::test]
 async fn doctor_smoke_reports_unknown_accelerator_and_fails_readiness() {
     let temp = TestTempDir::new("unknown-accelerator");
-    let mut config = MockConfig::default();
-    config.accelerator = None;
+    let config = MockConfig {
+        accelerator: None,
+        ..MockConfig::default()
+    };
     let state = new_state(config);
     let daemon = MockDaemon::start(&temp, Arc::clone(&state));
 
@@ -489,9 +492,11 @@ async fn doctor_smoke_reports_unknown_accelerator_and_fails_readiness() {
 #[tokio::test]
 async fn doctor_smoke_marks_process_exited_cleanup_as_failure() {
     let temp = TestTempDir::new("process-exited");
-    let mut config = MockConfig::default();
-    config.destroy_status = DestroyStatus::ProcessExited {
-        remaining_artifacts: vec![PathBuf::from("test-overlay.qcow2")],
+    let config = MockConfig {
+        destroy_status: DestroyStatus::ProcessExited {
+            remaining_artifacts: vec![PathBuf::from("test-overlay.qcow2")],
+        },
+        ..MockConfig::default()
     };
     let state = new_state(config);
     let daemon = MockDaemon::start(&temp, Arc::clone(&state));
@@ -512,8 +517,10 @@ async fn doctor_smoke_marks_process_exited_cleanup_as_failure() {
 #[tokio::test]
 async fn doctor_smoke_spawn_failure_does_not_claim_boot_or_destroy() {
     let temp = TestTempDir::new("spawn-failure");
-    let mut config = MockConfig::default();
-    config.spawn_error = true;
+    let config = MockConfig {
+        spawn_error: true,
+        ..MockConfig::default()
+    };
     let state = new_state(config);
     let daemon = MockDaemon::start(&temp, Arc::clone(&state));
 
@@ -532,8 +539,10 @@ async fn doctor_smoke_spawn_failure_does_not_claim_boot_or_destroy() {
 #[tokio::test]
 async fn doctor_smoke_exec_start_failure_still_destroys_sandbox() {
     let temp = TestTempDir::new("exec-start-failure");
-    let mut config = MockConfig::default();
-    config.exec_error = true;
+    let config = MockConfig {
+        exec_error: true,
+        ..MockConfig::default()
+    };
     let state = new_state(config);
     let daemon = MockDaemon::start(&temp, Arc::clone(&state));
 
@@ -567,12 +576,13 @@ async fn doctor_smoke_rejects_actual_accelerator_that_violates_policy() {
     assert_eq!(report["smoke"]["accelerator"]["used"], "tcg");
     assert_eq!(report["smoke"]["workload"]["status"], "not_started");
     assert_eq!(report["smoke"]["cleanup"]["status"], "AllResourcesCleaned");
-    let state = state.lock().expect("mock state lock");
-    assert_eq!(state.requests, ["status", "doctor", "spawn", "accelerator", "destroy"]);
-    assert_eq!(
-        state.spawned_spec.as_ref().expect("smoke spawn spec").acceleration,
-        AccelerationPolicy::Required
-    );
-    drop(state);
+    {
+        let state = state.lock().expect("mock state lock");
+        assert_eq!(state.requests, ["status", "doctor", "spawn", "accelerator", "destroy"]);
+        assert_eq!(
+            state.spawned_spec.as_ref().expect("smoke spawn spec").acceleration,
+            AccelerationPolicy::Required
+        );
+    }
     daemon.stop().await;
 }

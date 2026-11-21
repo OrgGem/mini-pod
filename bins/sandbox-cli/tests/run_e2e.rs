@@ -173,7 +173,7 @@ where
             st.exec_request = Some(req);
             (
                 MockRunConfig {
-                    exit: st.config.exit.clone(),
+                    exit: st.config.exit,
                     stdout: st.config.stdout.clone(),
                     stderr: st.config.stderr.clone(),
                     output_tar: st.config.output_tar.clone(),
@@ -757,10 +757,11 @@ async fn run_propagates_nonzero_exit_skips_copy_out_and_still_destroys() {
     assert_eq!(result["copy_out"]["status"], "skipped");
     assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
     assert!(!destination.exists(), "failed workload must not publish output");
-    let st = state.lock().expect("mock state lock");
-    assert_eq!(st.requests, ["spawn", "exec", "destroy"]);
-    assert_eq!(st.destroyed_ids, ["sb-run-e2e-1"]);
-    drop(st);
+    {
+        let st = state.lock().expect("mock state lock");
+        assert_eq!(st.requests, ["spawn", "exec", "destroy"]);
+        assert_eq!(st.destroyed_ids, ["sb-run-e2e-1"]);
+    }
     daemon.stop().await;
 }
 
@@ -1215,13 +1216,14 @@ async fn run_host_watchdog_times_out_stalled_exec_without_guest_exit() {
     assert_eq!(result["workload"]["timed_out"], true);
     assert_ne!(result["workload"]["exit_code"], 0);
     assert_eq!(result["cleanup"]["status"], "AllResourcesCleaned");
-    let state = state.lock().expect("mock state lock");
-    assert_eq!(state.requests, ["spawn", "exec", "cancel", "destroy"]);
-    assert_eq!(
-        state.exec_request.as_ref().expect("exec request").deadline,
-        Duration::from_secs(1)
-    );
-    drop(state);
+    {
+        let state = state.lock().expect("mock state lock");
+        assert_eq!(state.requests, ["spawn", "exec", "cancel", "destroy"]);
+        assert_eq!(
+            state.exec_request.as_ref().expect("exec request").deadline,
+            Duration::from_secs(1)
+        );
+    }
     daemon.stop().await;
 }
 
@@ -1478,10 +1480,11 @@ async fn hard_killed_run_does_not_send_client_side_destroy() {
         .expect("wait for hard-killed sandbox-cli");
     let _ = release_tx.send(());
 
-    let st = state.lock().expect("mock state lock");
-    assert_eq!(st.requests, ["spawn", "exec"]);
-    assert!(st.destroyed_ids.is_empty());
-    assert_eq!(st.sandbox_spec.as_ref().unwrap().lease_ttl, Duration::from_secs(1));
-    drop(st);
+    {
+        let st = state.lock().expect("mock state lock");
+        assert_eq!(st.requests, ["spawn", "exec"]);
+        assert!(st.destroyed_ids.is_empty());
+        assert_eq!(st.sandbox_spec.as_ref().unwrap().lease_ttl, Duration::from_secs(1));
+    }
     daemon.stop().await;
 }

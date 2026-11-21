@@ -246,7 +246,7 @@ async fn run_once(
     }
 
     let (signal_task, mut interrupted) = watch_interrupts()?;
-    let spawn = client.spawn(run.spec);
+    let spawn = client.spawn(run.spec.clone());
     tokio::pin!(spawn);
     let spawn_result = tokio::select! {
         result = &mut spawn => Some(result),
@@ -333,9 +333,7 @@ async fn run_once(
         run_workload(
             client,
             &id,
-            &run.request,
-            run.input,
-            run.output,
+            &run,
             json_mode,
             &mut interrupted,
             &mut renewal,
@@ -381,9 +379,7 @@ fn accelerator_violates_policy(policy: AccelerationPolicy, name: &str) -> bool {
 async fn run_workload(
     client: &SandboxClient,
     id: &SandboxId,
-    request: &ExecRequest,
-    input: Option<(PathBuf, String)>,
-    output: Option<(String, PathBuf)>,
+    run: &RunSpec,
     json_mode: bool,
     interrupted: &mut watch::Receiver<bool>,
     renewal: &mut watch::Receiver<Option<String>>,
@@ -392,7 +388,7 @@ async fn run_workload(
     if !record_abort(interrupted, renewal, report) {
         return;
     }
-    if let Some((source, destination)) = input {
+    if let Some((source, destination)) = &run.input {
         let copy = tokio::select! {
             result = client.copy_in_path(id, source, destination) => result,
             _ = interrupted.changed() => {
@@ -416,7 +412,7 @@ async fn run_workload(
     if let Err(error) = execute_workload(
         client,
         id,
-        request.clone(),
+        run.request.clone(),
         json_mode,
         interrupted,
         renewal,
@@ -436,8 +432,8 @@ async fn run_workload(
         return;
     }
 
-    if let Some((source, destination)) = output {
-        match copy_output(client, id, &source, &destination, interrupted, renewal).await {
+    if let Some((source, destination)) = &run.output {
+        match copy_output(client, id, source, destination, interrupted, renewal).await {
             Ok(bytes) => {
                 report.copy_status = "copied";
                 report.copy_bytes = Some(bytes);
