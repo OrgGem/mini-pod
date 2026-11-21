@@ -971,6 +971,11 @@ impl LocalRuntimeManager {
             .map(|(session, _, _, _)| session)
     }
 
+    /// Returns the driver-reported accelerator for a live, leased sandbox.
+    pub fn sandbox_accelerator(&self, id: &SandboxId) -> Result<Option<&'static str>, SandboxError> {
+        Ok(self.get_active_session_for_op(id)?.accelerator_name())
+    }
+
     /// Validates pre-packed `tar_bytes` on the host (traversal, entry types, storage budget)
     /// and copies it directly to `dst_guest` without re-extracting or re-packing on disk.
     pub async fn copy_in_tar_bytes(

@@ -288,12 +288,17 @@ sandbox-cli --json status
 # Check the daemon's configured QEMU, qemu-img, bundle, and accelerator candidates
 sandbox-cli doctor
 sandbox-cli --json doctor
+# Start an isolated VM, verify guest execution, report its actual accelerator, and clean up
+sandbox-cli doctor --smoke
+sandbox-cli --json doctor --smoke --accel required
 
 sandbox-cli list
 sandbox-cli --json list
 ```
 
 `doctor` checks the daemon connection and reports whether its configured QEMU and `qemu-img` run, whether the configured bundle verifies against the key loaded by the daemon, and which accelerator candidates its host and guest architecture support. Accelerator candidates come from a QEMU probe and do not establish that a VM can boot. Checks that cannot be made are reported as `unknown`, and the command exits nonzero when any check fails or is unknown.
+
+`doctor --smoke` additionally requests an isolated sandbox, runs `/bin/sh -c 'exit 0'` in the guest, and reports the accelerator selected by the active VM driver and the cleanup result. It may check out a VM from the warm pool, so a passing smoke check does not measure cold boot. `--accel required` requires hardware acceleration; the default is `preferred`, which permits QEMU TCG when hardware acceleration is unavailable.
 
 ### 5.1b Interactive Container Sandbox Console (`sandbox-cli tui`)
 

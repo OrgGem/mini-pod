@@ -625,6 +625,17 @@ impl SandboxClient {
         }
     }
 
+    /// Returns the actual accelerator reported by an active sandbox's driver.
+    pub async fn sandbox_accelerator(&self, id: &SandboxId) -> Result<Option<String>, SandboxError> {
+        match self
+            .rpc(ControlRequest::GetAccelerator { id: id.clone() })
+            .await?
+        {
+            ControlResponse::Accelerator { name } => Ok(name),
+            other => Err(unexpected_response("GetAccelerator", &other)),
+        }
+    }
+
     /// Lists live metadata for all active sandboxes owned by `sandboxd`.
     pub async fn list_sandboxes(&self) -> Result<Vec<SandboxSummaryInfo>, SandboxError> {
         match self.rpc(ControlRequest::ListSandboxes).await? {

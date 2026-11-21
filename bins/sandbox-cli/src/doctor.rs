@@ -3,10 +3,16 @@
 use std::time::Duration;
 
 use sandbox_client::{ControlEndpoint, SandboxClient};
-use sandbox_core::SandboxError;
+use sandbox_core::{SandboxError, SandboxSpec};
 use serde_json::{json, Value};
 
-pub async fn execute_doctor(client: &SandboxClient, json_mode: bool) -> Result<u8, SandboxError> {
+use crate::run::execute_smoke;
+
+pub async fn execute_doctor(
+    client: &SandboxClient,
+    json_mode: bool,
+    smoke_spec: Option<SandboxSpec>,
+) -> Result<u8, SandboxError> {
     let endpoint = match client.endpoint() {
         ControlEndpoint::UnixSocket(path) => format!("unix://{}", path.display()),
         ControlEndpoint::NamedPipe(name) => format!("npipe://{name}"),
@@ -30,6 +36,21 @@ pub async fn execute_doctor(client: &SandboxClient, json_mode: bool) -> Result<u
         Err(_) => daemon["detail"] = json!("daemon status request timed out"),
     }
 
+    let (smoke, smoke_ok) = match smoke_spec {
+        Some(spec) if daemon["status"] == "ok" => match execute_smoke(client, spec).await {
+            Ok(result) => result,
+            Err(error) => (
+                json!({ "status": "error", "error": error.to_string() }),
+                false,
+            ),
+        },
+        Some(_) => (
+            json!({ "status": "not_run", "detail": "Daemon is unavailable." }),
+            false,
+        ),
+        None => (json!({ "status": "not_run" }), true),
+    };
+
     let report = json!({
         "daemon": daemon,
         "guest_arch": diagnostics.get("guest_arch").cloned().unwrap_or(Value::Null),
@@ -38,12 +59,13 @@ pub async fn execute_doctor(client: &SandboxClient, json_mode: bool) -> Result<u
         "bundle": diagnostics.get("bundle").cloned().unwrap_or_else(unknown_check),
         "accelerators": diagnostics.get("accelerators").cloned().unwrap_or_else(unknown_check),
         "diagnostic_error": diagnostic_error,
-        "smoke": { "status": "not_run" },
+        "smoke": smoke,
     });
     let all_ready = ["daemon", "qemu", "qemu_img", "bundle", "accelerators"]
         .iter()
         .all(|name| report[*name]["status"] == "ok")
-        && report["diagnostic_error"].is_null();
+        && report["diagnostic_error"].is_null()
+        && smoke_ok;
 
     if json_mode {
         println!(
@@ -73,7 +95,31 @@ pub async fn execute_doctor(client: &SandboxClient, json_mode: bool) -> Result<u
         if let Some(error) = report["diagnostic_error"].as_str() {
             eprintln!("daemon diagnostics unavailable: {error}");
         }
-        println!("smoke: not run");
+        let smoke = &report["smoke"];
+        println!("smoke: {}", smoke["status"].as_str().unwrap_or("unknown"));
+        if let Some(id) = smoke["id"].as_str() {
+            println!("smoke sandbox: {id}");
+        }
+        for name in ["boot_handshake", "accelerator", "workload", "cleanup"] {
+            if smoke[name].is_object() {
+                let section = &smoke[name];
+                let status = section["status"].as_str().unwrap_or("unknown");
+                let detail = section["detail"]
+                    .as_str()
+                    .or_else(|| section["error"].as_str())
+                    .or_else(|| section["used"].as_str())
+                    .unwrap_or("");
+                println!("smoke {name}: {status} {detail}");
+                if let Some(artifacts) = section["remaining_artifacts"].as_array() {
+                    for artifact in artifacts.iter().filter_map(Value::as_str) {
+                        eprintln!("remaining artifact: {artifact}");
+                    }
+                }
+            }
+        }
+        if let Some(error) = smoke["error"].as_str() {
+            eprintln!("smoke error: {error}");
+        }
     }
     Ok(if all_ready { 0 } else { 1 })
 }

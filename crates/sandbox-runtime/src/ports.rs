@@ -116,6 +116,10 @@ pub trait VmSessionPort: Send + Sync {
     fn artifact_paths(&self) -> &[PathBuf];
     fn is_alive(&self) -> bool;
     fn current_rss_bytes(&self) -> Option<u64>;
+    /// Returns the accelerator selected for this session when the driver exposes it.
+    fn accelerator_name(&self) -> Option<&'static str> {
+        None
+    }
     async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError>;
     async fn open_tunnel(&self, target: StreamTargetWire) -> Result<TunnelStream, SandboxError>;
     async fn enable_egress_proxy(

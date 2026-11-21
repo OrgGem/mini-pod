@@ -356,7 +356,7 @@ fn boot_single_attempt(
     };
 
     let proc_caps = process.resource_capabilities();
-    let session = QemuVmSession::start(
+    let mut session = QemuVmSession::start(
         Some(process),
         Some(endpoint),
         stream,
@@ -366,6 +366,7 @@ fn boot_single_attempt(
         identity.start_token,
         egress_tx,
     )?;
+    session.accelerator = Some(accel);
 
     Ok(VmBootOutcome {
         session: Box::new(session),
@@ -670,6 +671,7 @@ type NetworkAckSlot = Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>;
 /// Active multiplexed QEMU `virtio-serial` session implementing [`VmSessionPort`].
 pub struct QemuVmSession {
     pid: u32,
+    accelerator: Option<Accelerator>,
     start_token: u64,
     io_timeout: Duration,
     artifact_paths: Vec<PathBuf>,
@@ -782,6 +784,7 @@ impl QemuVmSession {
 
         Ok(Self {
             pid,
+            accelerator: None,
             start_token,
             io_timeout,
             artifact_paths,
@@ -898,6 +901,10 @@ impl QemuVmSession {
 impl VmSessionPort for QemuVmSession {
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn accelerator_name(&self) -> Option<&'static str> {
+        self.accelerator.map(|accelerator| accelerator.as_qemu_arg())
     }
 
     fn start_token(&self) -> u64 {

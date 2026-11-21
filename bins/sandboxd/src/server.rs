@@ -864,6 +864,12 @@ async fn dispatch_unary_request(state: &DaemonState, req: ControlRequest) -> Con
                 ))),
             }
         }
+        ControlRequest::GetAccelerator { id } => match state.runtime.sandbox_accelerator(&id) {
+            Ok(name) => ControlResponse::Accelerator {
+                name: name.map(str::to_owned),
+            },
+            Err(error) => ControlResponse::Error(WireError::from(error)),
+        },
         ControlRequest::ListSandboxes => ControlResponse::SandboxList {
             sandboxes: state.list_sandboxes(),
         },

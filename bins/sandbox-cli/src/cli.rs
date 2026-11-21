@@ -33,7 +33,7 @@ GLOBAL OPTIONS:
 
 SUBCOMMANDS:
     status
-    doctor
+    doctor [--smoke [--accel <required|preferred|software>]]
     list
     tui [--refresh-ms <N>]
     spawn [OPTIONS]
@@ -99,7 +99,7 @@ pub enum CliOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     Status,
-    Doctor,
+    Doctor { smoke: Option<SandboxSpec> },
     List,
     Tui {
         refresh_interval: Duration,
@@ -207,10 +207,11 @@ where
             }
         }
         "doctor" => {
-            parse_no_args_subcommand(rest, "doctor", &mut endpoint_raw, &mut json_output)?;
-            match check_help_in_rest(rest) {
-                true => return Ok(CliOutcome::Help(USAGE_TEXT)),
-                false => CliCommand::Doctor,
+            if check_help_in_rest(rest) {
+                return Ok(CliOutcome::Help(USAGE_TEXT));
+            }
+            CliCommand::Doctor {
+                smoke: parse_doctor(rest, &mut endpoint_raw, &mut json_output)?,
             }
         }
         "list" => {
@@ -411,6 +412,46 @@ fn parse_tui(
         i += 1;
     }
     Ok(Duration::from_millis(refresh_ms))
+}
+
+fn parse_doctor(
+    rest: &[String],
+    endpoint_raw: &mut Option<String>,
+    json_output: &mut bool,
+) -> Result<Option<SandboxSpec>, SandboxError> {
+    let mut smoke = false;
+    let mut spawn_args = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if try_consume_global_flag(rest, &mut i, endpoint_raw, json_output)? {
+            i += 1;
+            continue;
+        }
+        let (flag, inline) = split_flag(&rest[i]);
+        match flag {
+            "--smoke" if inline.is_none() => smoke = true,
+            "--accel" => {
+                let value = take_flag_value(rest, &mut i, flag, inline)?;
+                spawn_args.extend([flag.to_owned(), value]);
+            }
+            _ => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "unknown option '{}' for 'doctor'",
+                    rest[i]
+                )))
+            }
+        }
+        i += 1;
+    }
+    if !smoke {
+        if !spawn_args.is_empty() {
+            return Err(SandboxError::InvalidSpec(
+                "--accel requires --smoke".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(parse_spawn(&spawn_args, endpoint_raw, json_output)?))
 }
 
 fn parse_spawn(
@@ -1390,7 +1431,7 @@ pub async fn execute_with_client(
     command: CliCommand,
 ) -> Result<u8, SandboxError> {
     match command {
-        CliCommand::Doctor => execute_doctor(client, json_mode).await,
+        CliCommand::Doctor { smoke } => execute_doctor(client, json_mode, smoke).await,
         CliCommand::Status => {
             let info = client.status().await?;
             if json_mode {

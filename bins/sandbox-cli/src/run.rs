@@ -8,7 +8,8 @@ use std::time::Duration;
 use sandbox_client::{ClientOutputKind, SandboxClient};
 use sandbox_core::safe_tar::ensure_safe_dir_path;
 use sandbox_core::{
-    DestroyStatus, ExecExitStatus, ExecRequest, SandboxError, SandboxId, SandboxSpec,
+    AccelerationPolicy, DestroyStatus, ExecExitStatus, ExecRequest, SandboxError, SandboxId,
+    SandboxSpec,
 };
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -36,6 +37,7 @@ struct RunReport {
     cleanup_status: &'static str,
     remaining_artifacts: Vec<String>,
     cleanup_error: Option<String>,
+    accelerator: Option<Result<Option<String>, String>>,
 }
 
 impl RunReport {
@@ -54,6 +56,7 @@ impl RunReport {
             cleanup_status: "not_started",
             remaining_artifacts: Vec::new(),
             cleanup_error: None,
+            accelerator: None,
         }
     }
 
@@ -146,13 +149,99 @@ pub async fn execute_run(
     json_mode: bool,
     run: RunSpec,
 ) -> Result<u8, SandboxError> {
+    let report = run_once(client, json_mode, run, false).await?;
+    report.emit(json_mode);
+    Ok(report.code())
+}
+
+pub(crate) async fn execute_smoke(
+    client: &SandboxClient,
+    spec: SandboxSpec,
+) -> Result<(serde_json::Value, bool), SandboxError> {
+    let policy = spec.acceleration;
+    let run = RunSpec {
+        spec,
+        request: ExecRequest {
+            target: sandbox_core::ExecTarget::Guest,
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+            env: Default::default(),
+            cwd: None,
+            user: None,
+            deadline: Duration::from_secs(30),
+            stdout_budget_bytes: 16 * 1024,
+            stderr_budget_bytes: 16 * 1024,
+        },
+        input: None,
+        output: None,
+    };
+    let report = run_once(client, true, run, true).await?;
+    let accelerator = match &report.accelerator {
+        Some(Ok(Some(name))) if !matches!(name.as_str(), "kvm" | "hvf" | "whpx" | "tcg") => {
+            json!({ "status": "unknown", "used": name, "detail": "The driver reported an unrecognized accelerator." })
+        }
+        Some(Ok(Some(name))) if accelerator_violates_policy(policy, name) => {
+            json!({ "status": "error", "used": name, "detail": "The selected accelerator does not satisfy the requested policy." })
+        }
+        Some(Ok(Some(name))) => {
+            json!({ "status": "ok", "used": name, "detail": "Reported by the active VM driver." })
+        }
+        Some(Ok(None)) => {
+            json!({ "status": "unknown", "used": null, "detail": "The active VM driver did not report an accelerator." })
+        }
+        Some(Err(error)) => json!({ "status": "unknown", "used": null, "detail": error }),
+        None => {
+            json!({ "status": "not_run", "used": null, "detail": "No active sandbox was available." })
+        }
+    };
+    let succeeded = report.code() == 0 && accelerator["status"] == "ok";
+    let status = if succeeded {
+        "ok"
+    } else if report.code() == 0 && accelerator["status"] != "error" {
+        "unknown"
+    } else {
+        "error"
+    };
+    let result = json!({
+        "status": status,
+        "id": report.id,
+        "boot_handshake": {
+            "status": if report.id.is_some() { "ok" } else { "error" },
+            "detail": if report.id.is_some() { "Sandbox became ready; it may have been checked out from the warm pool." } else { "Sandbox did not become ready." },
+        },
+        "accelerator": accelerator,
+        "workload": {
+            "status": report.workload_status,
+            "exit_code": report.exit.and_then(|exit| exit.code),
+            "timed_out": report.exit.is_some_and(|exit| exit.timed_out),
+            "stdout_truncated": report.exit.is_some_and(|exit| exit.stdout_truncated),
+            "stderr_truncated": report.exit.is_some_and(|exit| exit.stderr_truncated),
+            "stdout": String::from_utf8_lossy(&report.stdout),
+            "stderr": String::from_utf8_lossy(&report.stderr),
+        },
+        "cleanup": {
+            "status": report.cleanup_status,
+            "remaining_artifacts": report.remaining_artifacts,
+            "error": report.cleanup_error,
+        },
+        "error": report.error,
+        "interrupted": report.interrupted,
+    });
+    Ok((result, succeeded))
+}
+
+async fn run_once(
+    client: &SandboxClient,
+    json_mode: bool,
+    run: RunSpec,
+    observe_accelerator: bool,
+) -> Result<RunReport, SandboxError> {
     let mut report = RunReport::new();
+    let acceleration_policy = run.spec.acceleration;
     if let Some((_, destination)) = &run.output {
         if let Err(error) = validate_output_destination(destination) {
             report.copy_status = "failed";
             report.copy_error = Some(error.to_string());
-            report.emit(json_mode);
-            return Ok(report.code());
+            return Ok(report);
         }
     }
 
@@ -173,8 +262,7 @@ pub async fn execute_run(
                 );
             }
             signal_task.abort();
-            report.emit(json_mode);
-            return Ok(report.code());
+            return Ok(report);
         }
     };
     let id = lease.id;
@@ -202,18 +290,41 @@ pub async fn execute_run(
         }
     });
 
-    run_workload(
-        client,
-        &id,
-        &run.request,
-        run.input,
-        run.output,
-        json_mode,
-        &mut interrupted,
-        &mut renewal,
-        &mut report,
-    )
-    .await;
+    if observe_accelerator {
+        let observation = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(5), client.sandbox_accelerator(&id)) => {
+                Some(match result {
+                    Ok(Ok(name)) => Ok(name),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => Err("accelerator query timed out".to_owned()),
+                })
+            },
+            _ = interrupted.changed() => None,
+            _ = renewal.changed() => None,
+        };
+        if let Some(Ok(Some(name))) = &observation {
+            if accelerator_violates_policy(acceleration_policy, name) {
+                report.error =
+                    Some("selected accelerator does not satisfy the requested policy".to_owned());
+            }
+        }
+        report.accelerator = observation;
+    }
+
+    if report.error.is_none() {
+        run_workload(
+            client,
+            &id,
+            &run.request,
+            run.input,
+            run.output,
+            json_mode,
+            &mut interrupted,
+            &mut renewal,
+            &mut report,
+        )
+        .await;
+    }
     renew_task.abort();
     let _ = renew_task.await;
     report.interrupted |= *interrupted.borrow();
@@ -241,8 +352,12 @@ pub async fn execute_run(
     }
     report.interrupted |= *interrupted.borrow();
     signal_task.abort();
-    report.emit(json_mode);
-    Ok(report.code())
+    Ok(report)
+}
+
+fn accelerator_violates_policy(policy: AccelerationPolicy, name: &str) -> bool {
+    (policy == AccelerationPolicy::Required && name == "tcg")
+        || (policy == AccelerationPolicy::SoftwareOnly && matches!(name, "kvm" | "hvf" | "whpx"))
 }
 
 async fn run_workload(

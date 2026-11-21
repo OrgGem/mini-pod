@@ -209,6 +209,9 @@ impl SandboxSummaryInfo {
 pub enum ControlRequest {
     Status,
     Doctor,
+    GetAccelerator {
+        id: SandboxId,
+    },
     ListSandboxes,
     Spawn {
         spec: SandboxSpec,
@@ -246,6 +249,7 @@ impl ControlRequest {
         match self {
             Self::Status => json!({ "type": "Status" }),
             Self::Doctor => json!({ "type": "Doctor" }),
+            Self::GetAccelerator { id } => json!({ "type": "GetAccelerator", "id": id.as_str() }),
             Self::ListSandboxes => json!({ "type": "ListSandboxes" }),
             Self::Spawn { spec } => json!({
                 "type": "Spawn",
@@ -299,6 +303,9 @@ impl ControlRequest {
         match kind.as_str() {
             "Status" => Ok(Self::Status),
             "Doctor" => Ok(Self::Doctor),
+            "GetAccelerator" => Ok(Self::GetAccelerator {
+                id: SandboxId::new(req_string(obj, "id", "ControlRequest::GetAccelerator")?),
+            }),
             "ListSandboxes" => Ok(Self::ListSandboxes),
             "Spawn" => Ok(Self::Spawn {
                 spec: decode_sandbox_spec(req_field(obj, "spec", "ControlRequest::Spawn")?)?,
@@ -355,6 +362,7 @@ impl ControlRequest {
 pub enum ControlResponse {
     Status(DaemonStatusInfo),
     Doctor { report: Value },
+    Accelerator { name: Option<String> },
     SandboxList { sandboxes: Vec<SandboxSummaryInfo> },
     Spawned(SandboxLease),
     Ack,
@@ -374,6 +382,7 @@ impl ControlResponse {
                 "status": info.to_json_value(),
             }),
             Self::Doctor { report } => json!({ "type": "Doctor", "report": report }),
+            Self::Accelerator { name } => json!({ "type": "Accelerator", "name": name }),
             Self::SandboxList { sandboxes } => json!({
                 "type": "SandboxList",
                 "sandboxes": sandboxes.iter().map(SandboxSummaryInfo::to_json_value).collect::<Vec<_>>(),
@@ -426,6 +435,17 @@ impl ControlResponse {
                 Ok(Self::Doctor {
                     report: report.clone(),
                 })
+            }
+            "Accelerator" => {
+                let value = req_field(obj, "name", "ControlResponse::Accelerator")?;
+                let name = match value {
+                    Value::Null => None,
+                    Value::String(name) => Some(name.clone()),
+                    _ => return Err(SandboxError::Transport(
+                        "ControlResponse::Accelerator.name must be a string or null".to_owned(),
+                    )),
+                };
+                Ok(Self::Accelerator { name })
             }
             "SandboxList" => {
                 let arr = req_field(obj, "sandboxes", "ControlResponse::SandboxList")?
