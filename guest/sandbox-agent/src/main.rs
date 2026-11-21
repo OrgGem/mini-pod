@@ -936,6 +936,8 @@ mod tests {
                 TEST_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&dir).expect("create test temp dir");
+            #[cfg(target_os = "macos")]
+            let dir = fs::canonicalize(dir).expect("canonicalize test temp dir");
             Self(dir)
         }
 

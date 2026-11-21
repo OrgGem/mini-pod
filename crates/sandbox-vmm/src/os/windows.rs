@@ -877,7 +877,8 @@ pub fn create_new_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
 
 fn create_owner_only_dir_inner(path: &Path, exclusive: bool) -> Result<(), SandboxError> {
     let user_sid = current_user_sid_string()?;
-    let sddl = owner_only_sddl(&user_sid, true);
+    // Elevated tokens may otherwise assign the Administrators group as the owner.
+    let sddl = format!("O:{user_sid}{}", owner_only_sddl(&user_sid, true));
     let sd = sddl_to_security_descriptor(&sddl)?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,

@@ -438,6 +438,12 @@ mod tests {
             .unwrap_or(0);
         let root = std::env::temp_dir().join(format!("podman-mgr-{}-{}", std::process::id(), nanos));
         fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let false_binary = PathBuf::from(if cfg!(target_os = "macos") {
+            "/usr/bin/false"
+        } else {
+            "/bin/false"
+        });
 
         let real_dir = root.join("real");
         fs::create_dir_all(&real_dir).unwrap();
@@ -445,7 +451,7 @@ mod tests {
         symlink(&real_dir, &sym_run).unwrap();
 
         let mgr_sym = PodmanServiceManager::with_paths(
-            PathBuf::from("/bin/false"),
+            false_binary.clone(),
             sym_run,
             root.join("podman.sock"),
             root.join("podman.log"),
@@ -458,7 +464,7 @@ mod tests {
         assert!(err.contains("unsafe"), "unexpected err: {err}");
 
         let mgr_early_exit = PodmanServiceManager::with_paths(
-            PathBuf::from("/bin/false"),
+            false_binary,
             root.join("run-podman"),
             root.join("run-podman/podman.sock"),
             root.join("podman-early.log"),

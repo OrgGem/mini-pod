@@ -37,12 +37,20 @@ impl Drop for OwnerOnlyTempDir {
 #[test]
 fn exclusive_create_rejects_existing_owner_only_directory_without_mutation() {
     let directory = OwnerOnlyTempDir::new();
-    let sentinel = directory.path().join("sentinel.txt");
+
+    let new_directory = directory.path().join("new-output");
+    create_new_owner_only_dir(&new_directory)
+        .expect("exclusive create should create a missing owner-only directory");
+    assert!(new_directory.is_dir());
+
+    let existing_directory = directory.path().join("existing-output");
+    create_owner_only_dir(&existing_directory).expect("create pre-existing owner-only directory");
+    let sentinel = existing_directory.join("sentinel.txt");
     fs::write(&sentinel, b"preserve this file")
         .expect("write sentinel in pre-existing owner-only directory");
 
     assert!(matches!(
-        create_new_owner_only_dir(directory.path()),
+        create_new_owner_only_dir(&existing_directory),
         Err(SandboxError::PolicyViolation(_))
     ));
     assert_eq!(
@@ -50,7 +58,7 @@ fn exclusive_create_rejects_existing_owner_only_directory_without_mutation() {
         b"preserve this file"
     );
 
-    create_owner_only_dir(directory.path()).expect("idempotent owner-only validation succeeds");
+    create_owner_only_dir(&existing_directory).expect("idempotent owner-only validation succeeds");
     assert_eq!(
         fs::read(&sentinel).expect("idempotent validation must preserve sentinel"),
         b"preserve this file"
