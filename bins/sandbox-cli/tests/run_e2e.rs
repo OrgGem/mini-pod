@@ -674,7 +674,8 @@ async fn run_copies_selected_input_executes_argv_and_publishes_output_before_des
     assert_eq!(
         output.status.code(),
         Some(0),
-        "run failed: {}",
+        "run failed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let result = json_output(&output);

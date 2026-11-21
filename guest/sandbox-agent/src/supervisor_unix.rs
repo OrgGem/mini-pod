@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::process::Command;
 #[cfg(target_os = "linux")]
@@ -46,6 +47,7 @@ pub(crate) struct UnixUser {
 /// Per-execution isolation scope backed by a dedicated Linux cgroup v2 leaf directory when
 /// writable (always true in the Alpine guest VM), with `/proc` tree + process-group fallback.
 pub(crate) struct ExecScope {
+    #[cfg(target_os = "linux")]
     cgroup_dir: Option<PathBuf>,
     spawn_procs_file: Mutex<Option<File>>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -70,6 +72,7 @@ impl ExecScope {
         let _ = stream_id;
 
         Self {
+            #[cfg(target_os = "linux")]
             cgroup_dir: None,
             spawn_procs_file: Mutex::new(None),
             is_container_exec,
@@ -666,6 +669,7 @@ mod tests {
         }
 
         let scope = ExecScope {
+            #[cfg(target_os = "linux")]
             cgroup_dir: None,
             spawn_procs_file: Mutex::new(None),
             is_container_exec: false,

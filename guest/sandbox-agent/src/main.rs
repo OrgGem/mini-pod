@@ -1732,6 +1732,8 @@ mod tests {
             assert!(Instant::now() < wait_deadline, "grandchild did not write pid file in time");
             thread::sleep(Duration::from_millis(20));
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = grandchild_pid;
 
         let start = Instant::now();
         send_message(&mut host_tx, StreamId(20), &Message::ExecCancel).unwrap();

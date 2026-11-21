@@ -867,6 +867,15 @@ pub fn connect_named_pipe(pipe_name: &str) -> Result<OwnedNamedPipe, SandboxErro
 /// Creates `path` with an owner-only inheritable DACL (`D:P(A;OICI;GA;;;{user_sid})`),
 /// or validates an existing directory (rejecting reparse points / symlinks / wrong owner / weak DACL).
 pub fn create_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
+    create_owner_only_dir_inner(path, false)
+}
+
+/// Creates a new owner-only directory and rejects any existing path.
+pub fn create_new_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
+    create_owner_only_dir_inner(path, true)
+}
+
+fn create_owner_only_dir_inner(path: &Path, exclusive: bool) -> Result<(), SandboxError> {
     let user_sid = current_user_sid_string()?;
     let sddl = owner_only_sddl(&user_sid, true);
     let sd = sddl_to_security_descriptor(&sddl)?;
@@ -882,6 +891,12 @@ pub fn create_owner_only_dir(path: &Path) -> Result<(), SandboxError> {
     if created == 0 {
         // SAFETY: Thread-local Win32 last error after `CreateDirectoryW` failure.
         let err = unsafe { GetLastError() };
+        if err == ERROR_ALREADY_EXISTS && exclusive {
+            return Err(SandboxError::PolicyViolation(format!(
+                "owner-only directory '{}' already exists",
+                path.display()
+            )));
+        }
         if err != ERROR_ALREADY_EXISTS {
             return Err(SandboxError::Transport(format!(
                 "CreateDirectoryW('{}') failed: {}",

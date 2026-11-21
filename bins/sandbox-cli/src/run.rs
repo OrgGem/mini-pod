@@ -778,7 +778,7 @@ impl OutputStage {
                     .map_err(|error| error.to_string())
             };
             #[cfg(windows)]
-            let result = sandbox_vmm::os::windows::create_owner_only_dir(&path)
+            let result = sandbox_vmm::os::windows::create_new_owner_only_dir(&path)
                 .map_err(|error| error.to_string());
             match result {
                 Ok(()) => {
