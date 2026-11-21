@@ -5,11 +5,12 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sandbox_core::{DestroyStatus, SandboxError, SandboxId};
 
-use crate::safe_tar::{ensure_safe_dir_path, reject_symlink_or_reparse};
+use crate::safe_tar::{apply_open_no_follow, ensure_safe_dir_path, reject_symlink_or_reparse};
 use crate::{is_symlink_or_reparse, map_fs_error};
 
 const JOURNAL_FORMAT_VERSION: &str = "1";
@@ -17,6 +18,30 @@ const JOURNAL_EXT: &str = ".journal";
 const MAX_JOURNAL_FILE_BYTES: usize = 1024 * 1024;
 const MAX_SANDBOX_ID_LEN: usize = 128;
 const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(5);
+
+static NEXT_JOURNAL_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct ReconciliationScan {
+    pub(crate) records: Vec<JournalRecord>,
+    pub(crate) corrupt_files: usize,
+}
+
+struct TempJournalFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempJournalFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn is_journal_tmp_file_name(file_name: &str) -> bool {
+    file_name.ends_with(".tmp") || file_name.contains(".journal.tmp.")
+}
 
 /// Durable sandbox lifecycle phase persisted across daemon crashes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,56 +111,87 @@ impl JournalStore {
         &self.root_dir
     }
 
-    /// Atomically persists `record` (`<id>.journal.tmp` -> `write_all` -> `sync_all` -> `rename`
-    /// -> parent directory `sync_all` on Unix).
+    /// Atomically persists `record` (`<id>.journal.tmp.<pid>.<seq>` -> `write_all` -> `sync_all`
+    /// -> `rename` -> parent directory `sync_all` on Unix).
     pub fn write_record(&self, record: &JournalRecord) -> Result<(), SandboxError> {
         validate_sandbox_id_filename(&record.sandbox_id)?;
         ensure_safe_dir_path(&self.root_dir, true)?;
 
         let encoded = encode_record(record)?;
         let stem = record.sandbox_id.as_str();
-        let tmp_path = self.root_dir.join(format!("{stem}{JOURNAL_EXT}.tmp"));
         let final_path = self.root_dir.join(format!("{stem}{JOURNAL_EXT}"));
-
-        ensure_target_not_link_if_exists(&tmp_path)?;
         ensure_target_not_link_if_exists(&final_path)?;
 
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
-        let mut file = opts
-            .open(&tmp_path)
-            .map_err(|err| map_fs_error(&tmp_path, "open temporary journal file", err))?;
+        let (mut file, mut tmp_guard) = self.create_unique_tmp_file(stem)?;
         let meta = file
             .metadata()
-            .map_err(|err| map_fs_error(&tmp_path, "inspect temporary journal file", err))?;
-        reject_symlink_or_reparse(&tmp_path, &meta)?;
+            .map_err(|err| map_fs_error(&tmp_guard.path, "inspect temporary journal file", err))?;
+        reject_symlink_or_reparse(&tmp_guard.path, &meta)?;
         if !meta.file_type().is_file() {
             return Err(SandboxError::PolicyViolation(format!(
                 "temporary journal path '{}' is not a regular file",
-                tmp_path.display()
+                tmp_guard.path.display()
             )));
         }
 
         file.write_all(encoded.as_bytes())
-            .map_err(|err| map_fs_error(&tmp_path, "write temporary journal file", err))?;
+            .map_err(|err| map_fs_error(&tmp_guard.path, "write temporary journal file", err))?;
         file.sync_all()
-            .map_err(|err| map_fs_error(&tmp_path, "sync temporary journal file", err))?;
+            .map_err(|err| map_fs_error(&tmp_guard.path, "sync temporary journal file", err))?;
         drop(file);
 
-        fs::rename(&tmp_path, &final_path)
+        ensure_target_not_link_if_exists(&final_path)?;
+        fs::rename(&tmp_guard.path, &final_path)
             .map_err(|err| map_fs_error(&final_path, "atomically commit journal record", err))?;
+        tmp_guard.armed = false;
 
         sync_dir_unix(&self.root_dir)?;
         Ok(())
     }
 
-    /// Loads all committed `.journal` records for startup reconciliation, skipping `*.tmp` files.
+    fn create_unique_tmp_file(
+        &self,
+        stem: &str,
+    ) -> Result<(File, TempJournalFileGuard), SandboxError> {
+        let pid = std::process::id();
+        for _ in 0..16 {
+            let seq = NEXT_JOURNAL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = self
+                .root_dir
+                .join(format!("{stem}{JOURNAL_EXT}.tmp.{pid}.{seq}"));
+
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            apply_open_no_follow(&mut opts);
+
+            match opts.open(&tmp_path) {
+                Ok(file) => {
+                    return Ok((
+                        file,
+                        TempJournalFileGuard {
+                            path: tmp_path,
+                            armed: true,
+                        },
+                    ));
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(map_fs_error(&tmp_path, "open temporary journal file", err));
+                }
+            }
+        }
+        Err(SandboxError::Internal(format!(
+            "exhausted temporary journal filenames in '{}'",
+            self.root_dir.display()
+        )))
+    }
+
+    /// Loads all committed `.journal` records, skipping temporary staging files.
     pub fn load_records(&self) -> Result<Vec<JournalRecord>, SandboxError> {
         if !self.check_root_exists_and_safe()? {
             return Ok(Vec::new());
@@ -152,7 +208,7 @@ impl JournalStore {
             let Some(file_name) = file_name_os.to_str() else {
                 continue;
             };
-            if file_name.ends_with(".tmp") {
+            if is_journal_tmp_file_name(file_name) {
                 continue;
             }
             let Some(stem) = file_name.strip_suffix(JOURNAL_EXT) else {
@@ -165,6 +221,53 @@ impl JournalStore {
 
         records.sort_by(|a, b| a.sandbox_id.cmp(&b.sandbox_id));
         Ok(records)
+    }
+
+    /// Scans `journals/` for startup reconciliation: sweeps leftover crash `*.tmp*` staging files
+    /// and isolates per-file `.journal` corruption so valid sibling orphans still reconcile.
+    pub(crate) fn scan_for_reconciliation(&self) -> Result<ReconciliationScan, SandboxError> {
+        if !self.check_root_exists_and_safe()? {
+            return Ok(ReconciliationScan {
+                records: Vec::new(),
+                corrupt_files: 0,
+            });
+        }
+
+        let entries = fs::read_dir(&self.root_dir)
+            .map_err(|err| map_fs_error(&self.root_dir, "read journal directory", err))?;
+
+        let mut records = Vec::new();
+        let mut corrupt_files = 0usize;
+        for entry_res in entries {
+            let entry = entry_res
+                .map_err(|err| map_fs_error(&self.root_dir, "iterate journal directory", err))?;
+            let file_name_os = entry.file_name();
+            let Some(file_name) = file_name_os.to_str() else {
+                continue;
+            };
+            let path = entry.path();
+            if is_journal_tmp_file_name(file_name) {
+                let _ = remove_file_idempotent(&path);
+                continue;
+            }
+            let Some(stem) = file_name.strip_suffix(JOURNAL_EXT) else {
+                continue;
+            };
+
+            match self.read_and_decode_record(&path, stem) {
+                Ok(record) => records.push(record),
+                Err(SandboxError::InvalidSpec(_)) => {
+                    corrupt_files += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        records.sort_by(|a, b| a.sandbox_id.cmp(&b.sandbox_id));
+        Ok(ReconciliationScan {
+            records,
+            corrupt_files,
+        })
     }
 
     /// Loads a single committed `.journal` record by sandbox ID, if present.
@@ -221,11 +324,22 @@ impl JournalStore {
             )));
         }
 
-        let file = File::open(path).map_err(|err| map_fs_error(path, "open journal file", err))?;
+        let mut open_opts = OpenOptions::new();
+        open_opts.read(true);
+        apply_open_no_follow(&mut open_opts);
+        let file = open_opts
+            .open(path)
+            .map_err(|err| map_fs_error(path, "open journal file", err))?;
         let open_meta = file
             .metadata()
             .map_err(|err| map_fs_error(path, "inspect opened journal file", err))?;
         reject_symlink_or_reparse(path, &open_meta)?;
+        if !open_meta.file_type().is_file() {
+            return Err(SandboxError::PolicyViolation(format!(
+                "opened journal entry '{}' is not a regular file",
+                path.display()
+            )));
+        }
 
         let mut raw = Vec::new();
         file.take((MAX_JOURNAL_FILE_BYTES as u64).saturating_add(1))
@@ -278,15 +392,25 @@ impl JournalStore {
         Ok(total)
     }
 
-    /// Idempotently removes a sandbox's committed journal (and any leftover `.tmp` file).
+    /// Idempotently removes a sandbox's committed journal (and any leftover `.tmp*` staging files).
     pub fn remove_record(&self, id: &SandboxId) -> Result<(), SandboxError> {
         validate_sandbox_id_filename(id)?;
         let stem = id.as_str();
         let final_path = self.root_dir.join(format!("{stem}{JOURNAL_EXT}"));
-        let tmp_path = self.root_dir.join(format!("{stem}{JOURNAL_EXT}.tmp"));
+        let legacy_tmp_path = self.root_dir.join(format!("{stem}{JOURNAL_EXT}.tmp"));
 
         let removed_final = remove_file_idempotent(&final_path)?;
-        let _ = remove_file_idempotent(&tmp_path)?;
+        let _ = remove_file_idempotent(&legacy_tmp_path)?;
+        let tmp_prefix = format!("{stem}{JOURNAL_EXT}.tmp.");
+        if let Ok(entries) = fs::read_dir(&self.root_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&tmp_prefix) {
+                        let _ = remove_file_idempotent(&entry.path());
+                    }
+                }
+            }
+        }
         if removed_final {
             sync_dir_unix(&self.root_dir)?;
         }
@@ -476,6 +600,11 @@ fn sync_dir_unix(dir: &Path) -> Result<(), SandboxError> {
 }
 
 fn encode_record(record: &JournalRecord) -> Result<String, SandboxError> {
+    if record.pid.is_some() != record.start_token.is_some() {
+        return Err(SandboxError::InvalidSpec(
+            "journal pid and start_token must both be present or both be None".to_owned(),
+        ));
+    }
     let mut out = String::new();
     writeln!(out, "version={JOURNAL_FORMAT_VERSION}")
         .map_err(|e| SandboxError::Internal(e.to_string()))?;
@@ -547,6 +676,11 @@ fn decode_record(text: &str) -> Result<JournalRecord, SandboxError> {
             SandboxError::InvalidSpec(format!("invalid journal start_token '{raw}': {err}"))
         })?),
     };
+    if pid.is_some() != start_token.is_some() {
+        return Err(SandboxError::InvalidSpec(
+            "journal pid and start_token must both be present or both be 'none'".to_owned(),
+        ));
+    }
     let expires_raw = expect_kv(&mut lines, "expires_at_unix_ms")?;
     let expires_at_unix_ms = expires_raw.parse::<u64>().map_err(|err| {
         SandboxError::InvalidSpec(format!(
@@ -856,5 +990,77 @@ mod tests {
 
         assert_eq!(store.load_record(&rec.sandbox_id).unwrap(), Some(rec.clone()));
         assert_eq!(store.load_records().unwrap(), vec![rec]);
+    }
+
+    #[test]
+    fn journal_store_concurrent_writes_same_id_and_reconcile_scan_isolates_corruption() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = TestTempDir::new("journal-concurrent");
+        let store = Arc::new(JournalStore::new(tmp.path().join("journals")).unwrap());
+        let id = SandboxId::new("sb-shared");
+        let threads = 8usize;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let mut handles = Vec::new();
+        for idx in 0..threads {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let id = id.clone();
+            let artifact = tmp.path().join(format!("overlay-{idx}.qcow2"));
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for step in 0..20u64 {
+                    let rec = JournalRecord {
+                        sandbox_id: id.clone(),
+                        state: JournalLifecycleState::Active,
+                        pid: Some(1000 + idx as u32),
+                        start_token: Some(50_000 + step),
+                        artifact_paths: vec![artifact.clone()],
+                        expires_at_unix_ms: 1_700_000_000_000 + step,
+                    };
+                    store.write_record(&rec).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let committed = store.load_record(&id).unwrap().expect("committed record");
+        assert_eq!(committed.sandbox_id, id);
+
+        // Half-populated pid/start_token must be rejected on both write and decode.
+        assert!(matches!(
+            store.write_record(&JournalRecord {
+                sandbox_id: SandboxId::new("half-ident"),
+                state: JournalLifecycleState::Spawning,
+                pid: Some(42),
+                start_token: None,
+                artifact_paths: Vec::new(),
+                expires_at_unix_ms: 1,
+            }),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        fs::write(
+            store.root_dir().join("corrupt-sibling.journal"),
+            b"version=1\nsandbox_id=corrupt-sibling\nstate=active\npid=42\nstart_token=none\nexpires_at_unix_ms=1\nartifact_count=0\n",
+        )
+        .unwrap();
+        let stale_tmp = store.root_dir().join("sb-shared.journal.tmp.9999.1");
+        fs::write(&stale_tmp, b"partial-crash").unwrap();
+
+        let scan = store.scan_for_reconciliation().unwrap();
+        assert_eq!(scan.corrupt_files, 1);
+        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records[0].sandbox_id, id);
+        assert!(
+            !stale_tmp.exists(),
+            "stale .journal.tmp.<pid>.<seq> must be swept during reconciliation scan"
+        );
+        assert!(
+            store.root_dir().join("corrupt-sibling.journal").exists(),
+            "corrupt journal file must be preserved for inspection"
+        );
     }
 }

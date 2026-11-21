@@ -1,7 +1,7 @@
 //! Layer 2 `RuntimeManager` implementation: sandbox lifecycle orchestration,
 //! durable crash journaling, TTL lease enforcement, and safe workspace copy I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -24,14 +24,15 @@ use crate::egress::{
 use crate::exec_stream::ExecStream;
 use crate::journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,
+    ReconciliationScan,
 };
 use crate::ports::{
     DiskOverlayPort, PreBootJournalHook, PreparedOverlay, SandboxTunnelPort, VmBootConfig,
     VmRuntimePort, VmSessionPort,
 };
 use crate::safe_tar::{
-    ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes, pack_host_path_to_tar,
-    validate_tar_bytes,
+    apply_open_no_follow, ensure_safe_dir_path, extract_tar_safely, measure_dir_bytes,
+    pack_host_path_to_tar, validate_tar_bytes,
 };
 use crate::tunnel::TunnelStream;
 use crate::warm_pool::{
@@ -239,6 +240,36 @@ impl Drop for DestroySlotGuard<'_> {
     }
 }
 
+struct SandboxLifecycleGuard<'a> {
+    map: &'a Mutex<HashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    id: SandboxId,
+    inner_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    mutex_arc: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for SandboxLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.inner_guard.take());
+        let mut map = lock_unpoisoned(self.map);
+        if let Some(existing) = map.get(&self.id) {
+            if Arc::ptr_eq(existing, &self.mutex_arc) && Arc::strong_count(&self.mutex_arc) == 2 {
+                map.remove(&self.id);
+            }
+        }
+    }
+}
+
+struct InFlightSpawnGuard<'a> {
+    set: &'a Mutex<HashSet<SandboxId>>,
+    id: SandboxId,
+}
+
+impl Drop for InFlightSpawnGuard<'_> {
+    fn drop(&mut self) {
+        lock_unpoisoned(self.set).remove(&self.id);
+    }
+}
+
 /// Layer 2 `RuntimeManager` orchestrating VMs, disk overlays, leases, and crash recovery.
 pub struct LocalRuntimeManager {
     config: RuntimeManagerConfig,
@@ -252,7 +283,9 @@ pub struct LocalRuntimeManager {
     admission: AdmissionController,
     active: Arc<Mutex<HashMap<SandboxId, ActiveSandbox>>>,
     warm_pool: WarmPoolStore,
+    in_flight_spawns: Mutex<HashSet<SandboxId>>,
     in_flight_destroys: Mutex<HashMap<SandboxId, watch::Sender<bool>>>,
+    lifecycle_locks: Mutex<HashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
     destroy_listeners: Mutex<Vec<DestroyListener>>,
     next_seq: AtomicU64,
@@ -353,7 +386,9 @@ impl LocalRuntimeManager {
             admission,
             active,
             warm_pool,
+            in_flight_spawns: Mutex::new(HashSet::new()),
             in_flight_destroys: Mutex::new(HashMap::new()),
+            lifecycle_locks: Mutex::new(HashMap::new()),
             sweeper_abort: Mutex::new(None),
             destroy_listeners: Mutex::new(Vec::new()),
             next_seq: AtomicU64::new(1),
@@ -713,16 +748,22 @@ impl LocalRuntimeManager {
     }
 
     /// Reconciles persisted crash-recovery journals on daemon startup, killing verified orphans
-    /// and cleaning remaining sandbox artifacts.
+    /// and cleaning remaining sandbox artifacts while isolating individual corrupt `.journal` files.
     pub async fn reconcile_startup(&self) -> Result<ReconciliationReport, SandboxError> {
-        let records = self.load_records_async().await?;
-        let mut report = ReconciliationReport::default();
+        let scan = self.scan_for_reconciliation_async().await?;
+        let mut report = ReconciliationReport {
+            records_seen: scan.corrupt_files,
+            orphans_killed: 0,
+            cleaned: 0,
+            remaining: scan.corrupt_files,
+        };
 
-        for record in records {
+        for record in scan.records {
             let is_live = {
                 let active = lock_unpoisoned(&self.active);
                 active.contains_key(&record.sandbox_id)
                     || self.warm_pool.contains_live_id(&record.sandbox_id)
+                    || self.is_in_flight_spawn(&record.sandbox_id)
             };
             if is_live {
                 continue;
@@ -921,10 +962,49 @@ impl LocalRuntimeManager {
         }
     }
 
+    async fn acquire_lifecycle_lock(&self, id: &SandboxId) -> SandboxLifecycleGuard<'_> {
+        let mutex_arc = {
+            let mut map = lock_unpoisoned(&self.lifecycle_locks);
+            Arc::clone(
+                map.entry(id.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let inner_guard = Arc::clone(&mutex_arc).lock_owned().await;
+        SandboxLifecycleGuard {
+            map: &self.lifecycle_locks,
+            id: id.clone(),
+            inner_guard: Some(inner_guard),
+            mutex_arc,
+        }
+    }
+
+    fn begin_cold_spawn(&self, id: &SandboxId) -> InFlightSpawnGuard<'_> {
+        lock_unpoisoned(&self.in_flight_spawns).insert(id.clone());
+        InFlightSpawnGuard {
+            set: &self.in_flight_spawns,
+            id: id.clone(),
+        }
+    }
+
+    fn is_in_flight_spawn(&self, id: &SandboxId) -> bool {
+        lock_unpoisoned(&self.in_flight_spawns).contains(id)
+    }
+
     fn get_active_op_target(
         &self,
         id: &SandboxId,
     ) -> Result<(Arc<dyn VmSessionPort>, PathBuf, u32, NetworkPolicy), SandboxError> {
+        let destroying = {
+            let map = lock_unpoisoned(&self.in_flight_destroys);
+            map.contains_key(id)
+        };
+        if destroying {
+            return Err(SandboxError::LeaseExpired(format!(
+                "sandbox '{id}' is being destroyed"
+            )));
+        }
+
         let now = Instant::now();
         {
             let active = lock_unpoisoned(&self.active);
@@ -946,16 +1026,6 @@ impl LocalRuntimeManager {
                     entry.network_policy.clone(),
                 ));
             }
-        }
-
-        let destroying = {
-            let map = lock_unpoisoned(&self.in_flight_destroys);
-            map.contains_key(id)
-        };
-        if destroying {
-            return Err(SandboxError::LeaseExpired(format!(
-                "sandbox '{id}' is being destroyed"
-            )));
         }
 
         Err(SandboxError::NotFound(format!(
@@ -1133,29 +1203,30 @@ impl LocalRuntimeManager {
         target_state: JournalLifecycleState,
     ) -> Result<BootedSandbox, SandboxError> {
         let work_dir = self.sandboxes_dir.join(sandbox_id.as_str());
-        let work_dir_for_create = work_dir.clone();
-        tokio::task::spawn_blocking(move || ensure_safe_dir_path(&work_dir_for_create, true))
-            .await
-            .map_err(|err| {
-                SandboxError::Internal(format!("create sandbox work_dir task failed: {err}"))
-            })??;
-
         let initial_expires_ms = expires_at_unix_ms(spec.lease_ttl);
-        if let Err(err) = self
-            .write_journal_async(JournalRecord {
-                sandbox_id: sandbox_id.clone(),
-                state: JournalLifecycleState::Spawning,
-                pid: None,
-                start_token: None,
-                artifact_paths: vec![work_dir.clone()],
-                expires_at_unix_ms: initial_expires_ms,
-            })
-            .await
-        {
-            let _ = cleanup_artifacts_with_backoff(
-                std::slice::from_ref(&work_dir),
-                self.config.cleanup_max_attempts,
-                self.config.cleanup_initial_delay,
+        self.write_journal_async(JournalRecord {
+            sandbox_id: sandbox_id.clone(),
+            state: JournalLifecycleState::Spawning,
+            pid: None,
+            start_token: None,
+            artifact_paths: vec![work_dir.clone()],
+            expires_at_unix_ms: initial_expires_ms,
+        })
+        .await?;
+
+        let work_dir_for_create = work_dir.clone();
+        let create_dir_res =
+            tokio::task::spawn_blocking(move || ensure_safe_dir_path(&work_dir_for_create, true))
+                .await
+                .map_err(|err| {
+                    SandboxError::Internal(format!("create sandbox work_dir task failed: {err}"))
+                })?;
+        if let Err(err) = create_dir_res {
+            self.rollback_spawn(
+                &sandbox_id,
+                None,
+                vec![work_dir],
+                initial_expires_ms,
             )
             .await;
             return Err(err);
@@ -1584,9 +1655,9 @@ impl LocalRuntimeManager {
             .map_err(|err| SandboxError::Internal(format!("journal load task failed: {err}")))?
     }
 
-    async fn load_records_async(&self) -> Result<Vec<JournalRecord>, SandboxError> {
+    async fn scan_for_reconciliation_async(&self) -> Result<ReconciliationScan, SandboxError> {
         let journal = self.journal.clone();
-        tokio::task::spawn_blocking(move || journal.load_records())
+        tokio::task::spawn_blocking(move || journal.scan_for_reconciliation())
             .await
             .map_err(|err| SandboxError::Internal(format!("journal scan task failed: {err}")))?
     }
@@ -1653,6 +1724,7 @@ impl RuntimeManager for LocalRuntimeManager {
 
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
+        let spawn_guard = self.begin_cold_spawn(&sandbox_id);
 
         let booted = self
             .boot_sandbox_with_journal(
@@ -1665,6 +1737,7 @@ impl RuntimeManager for LocalRuntimeManager {
         let expires_at = booted.expires_at;
         let lease =
             self.register_active_sandbox(sandbox_id, &spec, booted, expires_at, permit, false);
+        drop(spawn_guard);
         self.warm_pool.record_cold_spawn();
         Ok(lease)
     }
@@ -1676,19 +1749,20 @@ impl RuntimeManager for LocalRuntimeManager {
             ));
         }
 
-        let new_expires_ms = expires_at_unix_ms(ttl);
-        let updated_record = {
-            let now = Instant::now();
-            let destroying = {
-                let map = lock_unpoisoned(&self.in_flight_destroys);
-                map.contains_key(id)
-            };
-            if destroying {
-                return Err(SandboxError::LeaseExpired(format!(
-                    "sandbox '{id}' is being destroyed"
-                )));
-            }
+        let _lifecycle = self.acquire_lifecycle_lock(id).await;
+        let destroying = {
+            let map = lock_unpoisoned(&self.in_flight_destroys);
+            map.contains_key(id)
+        };
+        if destroying {
+            return Err(SandboxError::LeaseExpired(format!(
+                "sandbox '{id}' is being destroyed"
+            )));
+        }
 
+        let new_expires_ms = expires_at_unix_ms(ttl);
+        let (prev_expires_at, updated_record) = {
+            let now = Instant::now();
             let mut active = lock_unpoisoned(&self.active);
             let Some(entry) = active.get_mut(id) else {
                 return Err(SandboxError::NotFound(format!(
@@ -1705,28 +1779,29 @@ impl RuntimeManager for LocalRuntimeManager {
                     "sandbox '{id}' VM process is no longer alive"
                 )));
             }
+            let prev_expires_at = entry.expires_at;
             entry.expires_at = now + ttl;
-            JournalRecord {
-                sandbox_id: id.clone(),
-                state: JournalLifecycleState::Active,
-                pid: Some(entry.session.pid()),
-                start_token: Some(entry.session.start_token()),
-                artifact_paths: entry.artifact_paths.clone(),
-                expires_at_unix_ms: new_expires_ms,
+            (
+                prev_expires_at,
+                JournalRecord {
+                    sandbox_id: id.clone(),
+                    state: JournalLifecycleState::Active,
+                    pid: Some(entry.session.pid()),
+                    start_token: Some(entry.session.start_token()),
+                    artifact_paths: entry.artifact_paths.clone(),
+                    expires_at_unix_ms: new_expires_ms,
+                },
+            )
+        };
+
+        if let Err(err) = self.write_journal_async(updated_record).await {
+            let mut active = lock_unpoisoned(&self.active);
+            if let Some(entry) = active.get_mut(id) {
+                entry.expires_at = prev_expires_at;
             }
-        };
-
-        self.write_journal_async(updated_record).await?;
-
-        let still_active = {
-            let active = lock_unpoisoned(&self.active);
-            active.contains_key(id)
-        };
-        if !still_active {
-            return Err(SandboxError::LeaseExpired(format!(
-                "sandbox '{id}' was destroyed while renewing lease"
-            )));
+            return Err(err);
         }
+
         Ok(())
     }
 
@@ -1812,13 +1887,27 @@ impl RuntimeManager for LocalRuntimeManager {
         }
 
         let _slot = self.acquire_destroy_slot(id).await;
-        self.notify_destroy_listeners(id);
+        let _lifecycle = self.acquire_lifecycle_lock(id).await;
 
-        let removed_active = {
+        let mut removed_active = {
             let mut active = lock_unpoisoned(&self.active);
             active.remove(id)
         };
-        let journal_rec = self.load_record_async(id.clone()).await?;
+        if removed_active.is_none()
+            && (self.warm_pool.contains_live_id(id) || self.is_in_flight_spawn(id))
+        {
+            removed_active = lock_unpoisoned(&self.active).remove(id);
+            if removed_active.is_none() {
+                return Ok(DestroyStatus::AllResourcesCleaned);
+            }
+        }
+        self.notify_destroy_listeners(id);
+
+        let journal_rec = match self.load_record_async(id.clone()).await {
+            Ok(rec) => rec,
+            Err(SandboxError::InvalidSpec(_)) if removed_active.is_some() => None,
+            Err(err) => return Err(err),
+        };
 
         if removed_active.is_none() && journal_rec.is_none() {
             return Ok(DestroyStatus::AllResourcesCleaned);
@@ -2057,6 +2146,7 @@ fn acquire_exclusive_state_lock(state_dir: &Path) -> Result<File, SandboxError> 
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    apply_open_no_follow(&mut opts);
     let file = opts
         .open(&lock_path)
         .map_err(|err| map_fs_error(&lock_path, "open state lock file", err))?;
@@ -4465,5 +4555,189 @@ mod tests {
         let remaining = mgr.list_active_sandboxes();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, lease_b.id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_renew_lease_and_destroy_keep_journal_consistent_and_never_resurrect() {
+        let tmp = TestTempDir::new("mgr-renew-destroy-race");
+        let state_dir = tmp.path().join("state");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mgr = Arc::new(
+            LocalRuntimeManager::new(base_config(state_dir.clone()), overlay, vm).unwrap(),
+        );
+        let journals = JournalStore::new(state_dir.join("journals")).unwrap();
+
+        // Part 1: Two concurrent renewals with distinct TTLs must leave on-disk journal consistent
+        // with the final in-memory expiry (never scrambling writes or colliding on `.tmp`).
+        let lease = mgr.spawn(valid_spec(Duration::from_secs(30))).await.unwrap();
+        let m1 = Arc::clone(&mgr);
+        let m2 = Arc::clone(&mgr);
+        let id1 = lease.id.clone();
+        let id2 = lease.id.clone();
+        let (r1, r2) = tokio::join!(
+            m1.renew_lease(&id1, Duration::from_secs(60)),
+            m2.renew_lease(&id2, Duration::from_secs(600))
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        let disk_rec = journals
+            .load_record(&lease.id)
+            .unwrap()
+            .expect("journal present after concurrent renewals");
+        let mem_remaining_ms = mgr
+            .list_active_sandboxes()
+            .into_iter()
+            .find(|s| s.id == lease.id)
+            .expect("active sandbox summary")
+            .remaining_ttl_ms;
+        let disk_remaining_ms = disk_rec.expires_at_unix_ms.saturating_sub(unix_now_ms());
+        assert!(
+            mem_remaining_ms.abs_diff(disk_remaining_ms) < 5_000,
+            "in-memory TTL ({mem_remaining_ms} ms) diverged from on-disk journal ({disk_remaining_ms} ms)"
+        );
+        mgr.destroy(&lease.id).await.unwrap();
+        assert!(journals.load_record(&lease.id).unwrap().is_none());
+
+        // Part 2: Concurrent `renew_lease` + `destroy` must never resurrect `<id>.journal` on disk.
+        for _ in 0..16 {
+            let raced = mgr.spawn(valid_spec(Duration::from_secs(60))).await.unwrap();
+            let mr = Arc::clone(&mgr);
+            let md = Arc::clone(&mgr);
+            let id_r = raced.id.clone();
+            let id_d = raced.id.clone();
+            let (_renew_res, destroy_res) = tokio::join!(
+                mr.renew_lease(&id_r, Duration::from_secs(120)),
+                md.destroy(&id_d)
+            );
+            assert_eq!(destroy_res.unwrap(), DestroyStatus::AllResourcesCleaned);
+            assert!(
+                journals.load_record(&raced.id).unwrap().is_none(),
+                "destroy raced with renew_lease and resurrected journal for {}",
+                raced.id
+            );
+        }
+        assert!(
+            lock_unpoisoned(&mgr.lifecycle_locks).is_empty(),
+            "per-sandbox lifecycle locks must prune themselves on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_ignores_unleased_warm_pool_and_in_flight_spawning_sandboxes() {
+        let tmp = TestTempDir::new("mgr-destroy-unleased-guard");
+        let state_dir = tmp.path().join("state");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+
+        let mut cfg = base_config(state_dir.clone());
+        cfg.warm_pool.target_size = 1;
+        cfg.warm_pool.template_spec = Some(valid_spec(Duration::from_secs(60)));
+        let mgr = Arc::new(LocalRuntimeManager::new(cfg, overlay, vm.clone()).unwrap());
+
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+        let journals = JournalStore::new(state_dir.join("journals")).unwrap();
+        let warm_records = journals.load_records().unwrap();
+        assert_eq!(warm_records.len(), 1);
+        let warm_id = warm_records[0].sandbox_id.clone();
+
+        // Calling destroy on an unleased Warm Pool ID must NOT kill the warm VM via its `.journal`.
+        assert_eq!(
+            mgr.destroy(&warm_id).await.unwrap(),
+            DestroyStatus::AllResourcesCleaned
+        );
+        assert_eq!(mgr.warm_pool_stats().ready_vms, 1);
+        assert!(journals.load_record(&warm_id).unwrap().is_some());
+
+        // Likewise, calling destroy on a pre-handshake cold-spawning ID must NOT reap it mid-boot.
+        let ext_ipc = tmp.path().join("spawn.sock");
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+        lock_unpoisoned(&vm.state).pre_handshake_stall = Some((ext_ipc, spawned_tx));
+
+        let mgr_spawn = Arc::clone(&mgr);
+        let spawn_task = tokio::spawn(async move {
+            let mut cold_spec = valid_spec(Duration::from_secs(60));
+            cold_spec.budget.guest_vcpus = 2;
+            mgr_spawn.spawn(cold_spec).await
+        });
+        let (spawning_pid, _) = spawned_rx.await.unwrap();
+        let spawning_id = journals
+            .load_records()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.pid == Some(spawning_pid))
+            .expect("spawning journal")
+            .sandbox_id;
+
+        assert_eq!(
+            mgr.destroy(&spawning_id).await.unwrap(),
+            DestroyStatus::AllResourcesCleaned
+        );
+        assert!(
+            journals.load_record(&spawning_id).unwrap().is_some(),
+            "in-flight cold spawn journal must remain intact while spawn is still running"
+        );
+        spawn_task.abort();
+        let _ = spawn_task.await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_isolates_corrupt_journal_and_destroy_listener_runs_after_removal() {
+        let tmp = TestTempDir::new("mgr-reconcile-corrupt-and-listener");
+        let state_dir = tmp.path().join("state");
+        let orphan_dir = tmp.path().join("orphan-work");
+        fs::create_dir_all(&orphan_dir).unwrap();
+
+        let journals = JournalStore::new(state_dir.join("journals")).unwrap();
+        journals
+            .write_record(&JournalRecord {
+                sandbox_id: SandboxId::new("valid-orphan"),
+                state: JournalLifecycleState::Active,
+                pid: Some(77_001),
+                start_token: Some(88_002),
+                artifact_paths: vec![orphan_dir.clone()],
+                expires_at_unix_ms: 1,
+            })
+            .unwrap();
+        fs::write(
+            journals.root_dir().join("broken.journal"),
+            b"corrupt-non-kv-content\n",
+        )
+        .unwrap();
+
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        lock_unpoisoned(&vm.state)
+            .live_orphans
+            .insert((77_001, 88_002));
+
+        let mgr = Arc::new(LocalRuntimeManager::new(base_config(state_dir), overlay, vm).unwrap());
+        let report = mgr.reconcile_startup().await.unwrap();
+        assert_eq!(report.records_seen, 2);
+        assert_eq!(report.orphans_killed, 1);
+        assert_eq!(report.cleaned, 1);
+        assert_eq!(report.remaining, 1);
+        assert!(!orphan_dir.exists());
+        assert!(journals.root_dir().join("broken.journal").exists());
+
+        // Verify destroy listeners observe `active_sandbox_network(id) == Err(...)`.
+        let mgr_weak = Arc::downgrade(&mgr);
+        let saw_still_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_clone = Arc::clone(&saw_still_active);
+        mgr.register_destroy_listener(move |destroyed_id| {
+            if let Some(m) = mgr_weak.upgrade() {
+                if m.active_sandbox_network(destroyed_id).is_ok() {
+                    saw_clone.store(true, Ordering::Release);
+                }
+            }
+        });
+
+        let lease = mgr.spawn(valid_spec(Duration::from_secs(60))).await.unwrap();
+        mgr.destroy(&lease.id).await.unwrap();
+        assert!(
+            !saw_still_active.load(Ordering::Acquire),
+            "destroy listener ran before sandbox was removed from active map"
+        );
     }
 }

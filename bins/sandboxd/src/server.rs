@@ -233,13 +233,6 @@ impl DaemonState {
         )
         .await?;
 
-        // Re-check liveness so a concurrent destroy during listener bind never leaks an orphan entry.
-        if let Err(err) = self.runtime.active_sandbox_network(id) {
-            compat.registry().release_all();
-            handle.shutdown().await;
-            return Err(err);
-        }
-
         let displaced = {
             let mut map = self
                 .docker_compat
@@ -259,6 +252,20 @@ impl DaemonState {
         };
         if let Some(old) = displaced {
             old.shutdown().await;
+        }
+
+        // Re-check liveness AFTER publishing into `docker_compat` (paired with `destroy` removing
+        // from `active` BEFORE `notify_destroy_listeners`) so concurrent destroy never leaks an entry.
+        if let Err(err) = self.runtime.active_sandbox_network(id) {
+            let raced = self
+                .docker_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
+            if let Some(leaked) = raced {
+                leaked.shutdown().await;
+            }
+            return Err(err);
         }
 
         Ok(uri)

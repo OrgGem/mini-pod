@@ -11,6 +11,7 @@ use crate::error::SandboxError;
 
 const COPY_IO_BUFFER_BYTES: usize = 64 * 1024;
 pub const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+pub const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 static NEXT_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -57,6 +58,23 @@ const UNIX_O_NOFOLLOW: Option<i32> = Some(0x0100);
     ))
 ))]
 const UNIX_O_NOFOLLOW: Option<i32> = None;
+
+/// Configures `opts` not to follow terminal symlinks (`O_NOFOLLOW` on Unix) or Windows reparse
+/// points (`FILE_FLAG_OPEN_REPARSE_POINT` on Windows) so post-open handle inspection sees the
+/// link/reparse entry itself rather than a target swapped in via TOCTOU.
+pub fn apply_open_no_follow(opts: &mut OpenOptions) {
+    #[cfg(unix)]
+    if let Some(flag) = UNIX_O_NOFOLLOW {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(flag);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let _ = opts;
+}
 
 enum PlannedEntry {
     Dir {
@@ -955,13 +973,21 @@ fn open_source_regular_no_follow(
 
     let mut opts = OpenOptions::new();
     opts.read(true);
-    #[cfg(unix)]
-    if let Some(flag) = UNIX_O_NOFOLLOW {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(flag);
+    apply_open_no_follow(&mut opts);
+    let file = opts
+        .open(path)
+        .map_err(|err| map_fs_error(path, "open source file", err))?;
+    let open_meta = file
+        .metadata()
+        .map_err(|err| map_fs_error(path, "inspect opened source file", err))?;
+    reject_symlink_or_reparse(path, &open_meta)?;
+    if !open_meta.file_type().is_file() {
+        return Err(SandboxError::PolicyViolation(format!(
+            "refusing non-regular opened source file '{}'",
+            path.display()
+        )));
     }
-    opts.open(path)
-        .map_err(|err| map_fs_error(path, "open source file", err))
+    Ok(file)
 }
 
 struct StagedExtractFile {
@@ -984,10 +1010,8 @@ impl StagedExtractFile {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
-                if let Some(flag) = UNIX_O_NOFOLLOW {
-                    opts.custom_flags(flag);
-                }
             }
+            apply_open_no_follow(&mut opts);
             match opts.open(&tmp_path) {
                 Ok(file) => {
                     return Ok(Self {
