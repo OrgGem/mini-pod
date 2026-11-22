@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sandbox_client::{pack_path_to_tar_bytes, ClientOutputKind, SandboxClient};
+use sandbox_core::safe_tar::{apply_open_no_follow, ensure_safe_dir_path, reject_symlink_or_reparse};
 use sandbox_core::{ExecExitStatus, ExecRequest, ExecTarget, SandboxError, SandboxId};
 use tokio::io::AsyncWriteExt;
 
@@ -371,8 +372,23 @@ async fn export_image_to_host_tar(
     output_tar: &Path,
     deadline: Duration,
 ) -> Result<u64, SandboxError> {
+    struct TempFileGuard(Option<PathBuf>);
+    impl TempFileGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(p) = &self.0 {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+
     if let Ok(meta) = fs::symlink_metadata(output_tar) {
-        if meta.file_type().is_symlink() || meta.is_dir() {
+        reject_symlink_or_reparse(output_tar, &meta)?;
+        if meta.is_dir() {
             return Err(SandboxError::PolicyViolation(format!(
                 "--output-tar '{}' must not be a directory or symlink",
                 output_tar.display()
@@ -383,12 +399,8 @@ async fn export_image_to_host_tar(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|err| {
-        SandboxError::Transport(format!(
-            "failed creating parent directory '{}': {err}",
-            parent.display()
-        ))
-    })?;
+    ensure_safe_dir_path(parent, true)?;
+
     let file_name = output_tar
         .file_name()
         .and_then(|n| n.to_str())
@@ -400,17 +412,24 @@ async fn export_image_to_host_tar(
         })?;
     let seq = BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+    let mut tmp_guard = TempFileGuard(Some(tmp_path.clone()));
 
-    let mut tmp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            SandboxError::Transport(format!(
-                "failed creating temporary archive '{}': {err}",
-                tmp_path.display()
-            ))
-        })?;
+    let mut tmp_opts = OpenOptions::new();
+    tmp_opts.write(true).create_new(true);
+    apply_open_no_follow(&mut tmp_opts);
+    let mut tmp_file = tmp_opts.open(&tmp_path).map_err(|err| {
+        SandboxError::Transport(format!(
+            "failed creating temporary archive '{}': {err}",
+            tmp_path.display()
+        ))
+    })?;
+    let open_meta = tmp_file.metadata().map_err(|err| {
+        SandboxError::Transport(format!(
+            "failed inspecting temporary archive '{}': {err}",
+            tmp_path.display()
+        ))
+    })?;
+    reject_symlink_or_reparse(&tmp_path, &open_meta)?;
 
     let req = ExecRequest {
         target: ExecTarget::Guest,
@@ -487,14 +506,25 @@ async fn export_image_to_host_tar(
     }
     drop(tmp_file);
 
+    if let Ok(meta) = fs::symlink_metadata(output_tar) {
+        reject_symlink_or_reparse(output_tar, &meta)?;
+        if meta.is_dir() {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(SandboxError::PolicyViolation(format!(
+                "'--output-tar' target '{}' is a directory",
+                output_tar.display()
+            )));
+        }
+    }
+
     fs::rename(&tmp_path, output_tar).map_err(|err| {
-        let _ = fs::remove_file(&tmp_path);
         SandboxError::Transport(format!(
             "failed renaming '{}' -> '{}': {err}",
             tmp_path.display(),
             output_tar.display()
         ))
     })?;
+    tmp_guard.disarm();
 
     Ok(total_bytes)
 }
@@ -552,5 +582,58 @@ mod tests {
             bad_tag.validate_and_normalize(),
             Err(SandboxError::InvalidSpec(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn export_image_to_host_tar_rejects_directory_and_symlink_targets() {
+        let dir = std::env::temp_dir().join(format!(
+            "mp-img-export-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let ep = if cfg!(windows) {
+            sandbox_client::ControlEndpoint::NamedPipe(r"\\.\pipe\img-export-test".to_owned())
+        } else {
+            sandbox_client::ControlEndpoint::UnixSocket(PathBuf::from("/tmp/img-export-test.sock"))
+        };
+        let client = SandboxClient::new(ep);
+
+        let sub_dir = dir.join("dir-target");
+        fs::create_dir_all(&sub_dir).unwrap();
+        assert!(matches!(
+            export_image_to_host_tar(
+                &client,
+                &SandboxId::new("sb-1"),
+                "demo:1",
+                &sub_dir,
+                Duration::from_secs(5),
+            )
+            .await,
+            Err(SandboxError::PolicyViolation(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let real = dir.join("real.tar");
+            fs::write(&real, b"tar").unwrap();
+            let sym = dir.join("sym.tar");
+            symlink(&real, &sym).unwrap();
+            assert!(matches!(
+                export_image_to_host_tar(
+                    &client,
+                    &SandboxId::new("sb-1"),
+                    "demo:1",
+                    &sym,
+                    Duration::from_secs(5),
+                )
+                .await,
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

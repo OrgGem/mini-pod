@@ -1747,22 +1747,28 @@ pub async fn execute_with_client(
             } else {
                 println!("{id}: {status:?}");
             }
-            Ok(0)
+            match status {
+                DestroyStatus::AllResourcesCleaned => Ok(0),
+                DestroyStatus::ProcessExited { .. } => Ok(1),
+            }
         }
     }
 }
 
 fn exit_status_to_code(exit: ExecExitStatus) -> u8 {
+    if exit.timed_out {
+        return 124;
+    }
     match exit.code {
-        Some(0) => 0,
-        Some(code) => ((code & 0xff) as u8).max(1),
-        None => {
-            if exit.timed_out {
-                124
-            } else {
+        Some(0) => {
+            if exit.stdout_truncated || exit.stderr_truncated {
                 1
+            } else {
+                0
             }
         }
+        Some(code) => ((code & 0xff) as u8).max(1),
+        None => 1,
     }
 }
 
@@ -2443,6 +2449,72 @@ mod tests {
             }),
             124
         );
+        assert_eq!(
+            exit_status_to_code(ExecExitStatus {
+                code: Some(0),
+                timed_out: true,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }),
+            124
+        );
+        assert_eq!(
+            exit_status_to_code(ExecExitStatus {
+                code: Some(0),
+                timed_out: false,
+                stdout_truncated: true,
+                stderr_truncated: false,
+            }),
+            1
+        );
+        assert_eq!(
+            exit_status_to_code(ExecExitStatus {
+                code: Some(0),
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: true,
+            }),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_process_exited_returns_nonzero_exit_code() {
+        use sandbox_client::{
+            read_control_frame, write_control_frame, ControlRequest, ControlResponse,
+        };
+        use tokio::io::duplex;
+
+        let ep = if cfg!(windows) {
+            ControlEndpoint::NamedPipe(r"\\.\pipe\cli-destroy-test".to_owned())
+        } else {
+            ControlEndpoint::UnixSocket(PathBuf::from("/tmp/cli-destroy-test.sock"))
+        };
+        let client = SandboxClient::with_connector(ep, |_| async move {
+            let (c, mut s) = duplex(16 * 1024);
+            tokio::spawn(async move {
+                let raw = read_control_frame(&mut s).await.unwrap().unwrap();
+                let req = ControlRequest::from_json_bytes(&raw).unwrap();
+                assert!(matches!(req, ControlRequest::Destroy { .. }));
+                let resp = ControlResponse::Destroyed(DestroyStatus::ProcessExited {
+                    remaining_artifacts: vec![PathBuf::from("/tmp/leftover.qcow2")],
+                });
+                write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                    .await
+                    .unwrap();
+            });
+            Ok(c)
+        });
+        let code = execute_with_client(
+            &client,
+            true,
+            CliCommand::Destroy {
+                id: SandboxId::new("sb-partial"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 1);
     }
 
     #[test]

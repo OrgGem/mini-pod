@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 const { platformPackage } = require('../launcher');
@@ -17,6 +17,27 @@ function tempDir(t) {
   return directory;
 }
 
+function resolveWindowsBinaryDir() {
+  const candidates = [];
+  if (process.env.CARGO_TARGET_DIR) {
+    candidates.push(
+      path.join(process.env.CARGO_TARGET_DIR, 'release'),
+      path.join(process.env.CARGO_TARGET_DIR, 'debug'),
+    );
+  }
+  candidates.push(
+    path.resolve(__dirname, '../../target/release'),
+    path.resolve(__dirname, '../../target/debug'),
+  );
+  const found = candidates.find(dir =>
+    fs.existsSync(path.join(dir, 'sandbox-cli.exe')) && fs.existsSync(path.join(dir, 'sandboxd.exe'))
+  );
+  if (!found) {
+    throw new Error(`Could not locate sandbox-cli.exe and sandboxd.exe in: ${candidates.join(', ')}`);
+  }
+  return found;
+}
+
 function installFixture(root, { withBinaryPackage }) {
   const stagedMain = path.join(root, 'staged-main');
   stage('main', main.version, stagedMain);
@@ -27,7 +48,7 @@ function installFixture(root, { withBinaryPackage }) {
 
   if (withBinaryPackage) {
     const binaryPackage = path.join(installRoot, 'mini-pod-win32-x64');
-    stage('x86_64-pc-windows-msvc', main.version, binaryPackage, path.resolve(__dirname, '../../target/release'));
+    stage('x86_64-pc-windows-msvc', main.version, binaryPackage, resolveWindowsBinaryDir());
   }
   return installedMain;
 }
@@ -100,4 +121,63 @@ test('Unix launcher forwards spaced arguments, stdio, and the binary exit status
   assert.equal(result.status, 7);
   assert.deepEqual(JSON.parse(result.stdout), ['a value with spaces', '--fail']);
   assert.equal(result.stderr, 'fake failure\n');
+});
+
+test('Unix launcher asynchronously forwards SIGTERM to spawned child', { skip: process.platform === 'win32' }, async t => {
+  const root = tempDir(t);
+  const stagedMain = path.join(root, 'staged-main');
+  stage('main', main.version, stagedMain);
+  const installRoot = path.join(root, 'install', 'node_modules', '@orggem');
+  const installedMain = path.join(installRoot, 'mini-pod');
+  fs.mkdirSync(installRoot, { recursive: true });
+  fs.cpSync(stagedMain, installedMain, { recursive: true });
+
+  const glibcVersion = process.platform === 'linux'
+    ? process.report.getReport().header.glibcVersionRuntime
+    : undefined;
+  const binaryPackageName = platformPackage(process.platform, process.arch, glibcVersion).split('/')[1];
+  const binaryPackage = path.join(installRoot, binaryPackageName);
+  const binaryDirectory = path.join(binaryPackage, 'bin');
+  fs.mkdirSync(binaryDirectory, { recursive: true });
+  fs.writeFileSync(path.join(binaryPackage, 'package.json'), JSON.stringify({ name: `@orggem/${binaryPackageName}`, version: main.version }));
+  const marker = path.join(root, 'sigterm.marker');
+  const fakeBinary = path.join(binaryDirectory, 'sandbox-cli');
+  fs.writeFileSync(fakeBinary, [
+    '#!/usr/bin/env node',
+    'const fs = require("node:fs");',
+    `process.on("SIGTERM", () => { fs.writeFileSync(${JSON.stringify(marker)}, "caught"); process.exit(0); });`,
+    'process.stdout.write("READY\\n");',
+    'setInterval(() => {}, 1000);',
+    '',
+  ].join('\n'));
+  fs.chmodSync(fakeBinary, 0o755);
+
+  const child = spawn(process.execPath, [path.join(installedMain, 'bin', 'sandbox-cli.js')], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for READY, stdout=${stdout}`)), 5000);
+    child.stdout.on('data', chunk => {
+      stdout += chunk.toString('utf8');
+      if (stdout.includes('READY\n')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    child.on('error', reject);
+  });
+
+  child.kill('SIGTERM');
+  const [code, signal] = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for launcher exit')), 5000);
+    child.on('exit', (c, s) => {
+      clearTimeout(timer);
+      resolve([c, s]);
+    });
+  });
+
+  assert.equal(signal, null);
+  assert.equal(code, 0);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'caught');
 });

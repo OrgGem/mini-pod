@@ -1,7 +1,7 @@
 'use strict';
 
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 
 const packages = new Set([
   'win32-x64',
@@ -36,13 +36,41 @@ function run(command) {
       throw new Error(`The ${packageName} binary package is missing. Reinstall with optional dependencies enabled.`);
     }
     const executable = path.join(path.dirname(packageJson), 'bin', command + (process.platform === 'win32' ? '.exe' : ''));
-    const result = spawnSync(executable, process.argv.slice(2), { stdio: 'inherit' });
-    if (result.error) throw result.error;
-    if (result.signal) {
-      process.kill(process.pid, result.signal);
-    } else {
-      process.exitCode = result.status ?? 1;
+    const child = spawn(executable, process.argv.slice(2), { stdio: 'inherit' });
+    const signalHandlers = [];
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+      const handler = () => {
+        if (!child.killed) {
+          try {
+            child.kill(sig);
+          } catch {
+            // Ignore errors if the child already exited between check and signal delivery.
+          }
+        }
+      };
+      signalHandlers.push([sig, handler]);
+      process.on(sig, handler);
     }
+    const cleanupSignals = () => {
+      for (const [sig, handler] of signalHandlers) {
+        process.off(sig, handler);
+      }
+    };
+
+    child.on('error', err => {
+      cleanupSignals();
+      console.error(`${command}: ${err.message}`);
+      process.exitCode = 1;
+    });
+
+    child.on('exit', (code, signal) => {
+      cleanupSignals();
+      if (signal) {
+        process.kill(process.pid, signal);
+      } else {
+        process.exitCode = code ?? 1;
+      }
+    });
   } catch (err) {
     console.error(`${command}: ${err.message}`);
     process.exitCode = 1;

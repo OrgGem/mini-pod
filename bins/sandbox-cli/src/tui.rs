@@ -1269,7 +1269,7 @@ pub fn parse_podman_ps_tsv(raw: &str) -> Vec<ContainerRow> {
     rows
 }
 
-/// Strips ANSI CSI/OSC escape sequences and raw C0/C1 control characters from untrusted text.
+/// Strips ANSI CSI/OSC/DCS/SOS/PM/APC escape sequences and raw C0/C1 control characters from untrusted text.
 pub fn sanitize_terminal_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -1284,7 +1284,7 @@ pub fn sanitize_terminal_text(input: &str) -> String {
                         }
                     }
                 }
-                Some(']') => {
+                Some(']' | 'P' | 'X' | '^' | '_') => {
                     let _ = chars.next();
                     while let Some(c) = chars.next() {
                         if c == '\x07' {
@@ -1303,7 +1303,9 @@ pub fn sanitize_terminal_text(input: &str) -> String {
             }
             continue;
         }
-        if ch == '\n' || ch == '\t' || !ch.is_control() {
+        if ch == '\t' {
+            out.push_str("    ");
+        } else if ch == '\n' || (!matches!(ch, '\u{0080}'..='\u{009f}') && !ch.is_control()) {
             out.push(ch);
         }
     }
@@ -1351,7 +1353,7 @@ fn draw_header(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let (conn_span, metrics_line) = match (&app.daemon_status, &app.daemon_error) {
         (_, Some(err)) => (
             Span::styled(
-                format!(" DISCONNECTED ({err}) "),
+                format!(" DISCONNECTED ({}) ", sanitize_terminal_text(err)),
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Red)
@@ -1362,7 +1364,7 @@ fn draw_header(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         ),
         (Some(st), None) => (
             Span::styled(
-                format!(" CONNECTED v{} ", st.version),
+                format!(" CONNECTED v{} ", sanitize_terminal_text(&st.version)),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Green)
@@ -1468,7 +1470,7 @@ fn draw_sandboxes_pane(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                 (None, _) => "-",
             };
             Row::new(vec![
-                Cell::from(sb.id.as_str().to_owned()),
+                Cell::from(sanitize_terminal_text(sb.id.as_str())),
                 Cell::from(sb.pid.to_string()),
                 Cell::from(format_network_short(&sb.network)),
                 Cell::from(rss),
@@ -1535,7 +1537,8 @@ fn draw_containers_pane(f: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     if let Some(err) = app.container_errors.get(&sb.id) {
         f.render_widget(
             Paragraph::new(format!(
-                "Failed querying Podman containers:\n{err}\n\nPress [c] to retry."
+                "Failed querying Podman containers:\n{}\n\nPress [c] to retry.",
+                sanitize_terminal_text(err)
             ))
             .style(Style::default().fg(Color::Red))
             .wrap(Wrap { trim: true })
@@ -3306,7 +3309,7 @@ f6e5d4c3b2a1\tjob-1\talpine:3.20\texited\tExited (0) 3 minutes ago\t
             );
         }
 
-        let dirty = "ok\x1b[31mred\x1b[0m\x1b]52;c;cHdu\x07\x08xin chào";
-        assert_eq!(sanitize_terminal_text(dirty), "okredxin chào");
+        let dirty = "ok\x1b[31mred\x1b[0m\x1b]52;c;cHdu\x07\x1bP1$q\x1b\\\x1b^pm\x07\u{0085}\u{009b}\x08\txin chào";
+        assert_eq!(sanitize_terminal_text(dirty), "okred    xin chào");
     }
 }

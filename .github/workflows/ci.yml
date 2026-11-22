@@ -44,6 +44,11 @@ jobs:
       - name: Run unit and component test suite
         run: cargo test --workspace --locked
 
+      - name: Run npm launcher tests
+        run: |
+          cargo build --locked -p sandbox-cli -p sandboxd
+          node --test npm/test/launcher.test.js
+
   guest-linux-musl:
     name: Guest Static Musl Check & Test (rust:alpine)
     runs-on: ubuntu-latest

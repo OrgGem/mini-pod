@@ -12,7 +12,7 @@ on:
         default: "dev"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -358,6 +358,16 @@ jobs:
               cp /tmp/cargo-target/guest-release/sandbox-agent /out/sandbox-agent
               chmod 0755 /out/tiny-init /out/sandbox-agent
               file /out/tiny-init /out/sandbox-agent
+              for bin in /out/tiny-init /out/sandbox-agent; do
+                if readelf -d "$bin" 2>/dev/null | grep -Eq '\(NEEDED\)'; then
+                  echo "ERROR: $bin has dynamic NEEDED dependencies" >&2
+                  exit 1
+                fi
+                if readelf -l "$bin" | grep -Eq 'INTERP|Requesting program interpreter'; then
+                  echo "ERROR: $bin has a dynamic program interpreter" >&2
+                  exit 1
+                fi
+              done
             '
 
           ARCHIVE_NAME="${STAGE_DIR}.tar.gz"
@@ -379,6 +389,9 @@ jobs:
     needs:
       - build-host
       - build-guest-linux-musl
+      - build-npm-main
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

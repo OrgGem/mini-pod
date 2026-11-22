@@ -5,7 +5,7 @@
 //! port-forwarding through `sandboxd`'s owner-only `DockerCompatServer` endpoint — requiring zero
 //! Docker or `docker-compose` installation on either the Host or the Guest VM.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Read as _;
@@ -101,6 +101,7 @@ pub struct ServiceSpec {
     pub expose: Vec<u16>,
     pub mounts: Vec<ComposeMount>,
     pub networks: Vec<ServiceNetwork>,
+    pub network_mode: Option<String>,
     pub depends_on: Vec<String>,
 }
 
@@ -773,6 +774,7 @@ pub fn parse_compose_yaml(
     }
 
     let mut services = BTreeMap::new();
+    let mut seen_container_names = BTreeSet::new();
     let mut needs_default_network = false;
 
     for (raw_svc_key, svc_val) in services_map {
@@ -792,12 +794,33 @@ pub fn parse_compose_yaml(
                 "service '{svc_name}' sets privileged=true, which is forbidden inside sandbox isolation"
             )));
         }
-        if let Some(net_mode) = map_get_str(svc_hash, "network_mode")? {
-            if net_mode.trim().eq_ignore_ascii_case("host") {
+        let network_mode = if let Some(net_mode) = map_get_str(svc_hash, "network_mode")? {
+            let trimmed = net_mode.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.eq_ignore_ascii_case("host") {
                 return Err(SandboxError::PolicyViolation(format!(
                     "service '{svc_name}' sets network_mode='host', which is forbidden inside sandbox isolation"
                 )));
+            } else if trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("bridge")
+                || trimmed.eq_ignore_ascii_case("default")
+            {
+                Some(trimmed.to_ascii_lowercase())
+            } else {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "service '{svc_name}' sets unsupported network_mode '{net_mode}' (expected 'none', 'bridge', or 'default')"
+                )));
             }
+        } else {
+            None
+        };
+        if matches!(network_mode.as_deref(), Some("none"))
+            && map_get(svc_hash, "networks").is_some_and(|v| !v.is_null())
+        {
+            return Err(SandboxError::InvalidSpec(format!(
+                "service '{svc_name}' cannot specify both network_mode='none' and 'networks'"
+            )));
         }
 
         let build = parse_service_build(svc_hash, base_dir, &svc_name)?;
@@ -821,6 +844,11 @@ pub fn parse_compose_yaml(
             }
             None => format!("{project_name}-{svc_name}-1"),
         };
+        if !seen_container_names.insert(container_name.clone()) {
+            return Err(SandboxError::InvalidSpec(format!(
+                "duplicate container_name '{container_name}' across services"
+            )));
+        }
 
         let command = parse_command_or_entrypoint(svc_hash, "command", &svc_name)?;
         let entrypoint = parse_command_or_entrypoint(svc_hash, "entrypoint", &svc_name)?;
@@ -837,7 +865,11 @@ pub fn parse_compose_yaml(
             &project_name,
             &mut declared_volumes,
         )?;
-        let networks = parse_service_networks(svc_hash, &svc_name, &declared_networks)?;
+        let networks = if matches!(network_mode.as_deref(), Some("none")) {
+            Vec::new()
+        } else {
+            parse_service_networks(svc_hash, &svc_name, &declared_networks)?
+        };
         if networks.iter().any(|n| n.network_key == "default") {
             needs_default_network = true;
         }
@@ -861,6 +893,7 @@ pub fn parse_compose_yaml(
                 expose,
                 mounts,
                 networks,
+                network_mode,
                 depends_on,
             },
         );
@@ -1206,6 +1239,13 @@ fn parse_service_env(
             )?;
             let content = read_confined_env_file(&path, svc_name)?;
             for (line_no, raw_line) in content.trim_start_matches('\u{feff}').lines().enumerate() {
+                if raw_line.contains('\0') {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "env_file {}:{} contains forbidden NUL byte",
+                        path.display(),
+                        line_no + 1
+                    )));
+                }
                 let trimmed = raw_line.trim();
                 if trimmed.is_empty() || trimmed.starts_with('#') {
                     continue;
@@ -1219,7 +1259,22 @@ fn parse_service_env(
                     )));
                 };
                 let key = k.trim();
-                let val = v.trim().trim_matches('"').trim_matches('\'');
+                if key.is_empty() || key.contains(|c: char| c.is_whitespace() || c == '=') {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "invalid env_file key at {}:{}",
+                        path.display(),
+                        line_no + 1
+                    )));
+                }
+                let v_trimmed = v.trim();
+                let val = if v_trimmed.len() >= 2
+                    && ((v_trimmed.starts_with('"') && v_trimmed.ends_with('"'))
+                        || (v_trimmed.starts_with('\'') && v_trimmed.ends_with('\'')))
+                {
+                    &v_trimmed[1..v_trimmed.len() - 1]
+                } else {
+                    v_trimmed
+                };
                 env.insert(key.to_owned(), val.to_owned());
             }
         }
@@ -1946,7 +2001,9 @@ fn build_container_create_payload(spec: &ComposeSpec, svc: &ServiceSpec) -> Valu
         );
     }
 
-    if let Some(primary_net) = svc.networks.first() {
+    if matches!(svc.network_mode.as_deref(), Some("none")) {
+        hc.insert("NetworkMode".to_owned(), Value::String("none".to_owned()));
+    } else if let Some(primary_net) = svc.networks.first() {
         let actual_net = spec
             .networks
             .get(&primary_net.network_key)
@@ -2778,6 +2835,71 @@ services:
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::Transport(_)), "got {err:?}");
+
+        // 5. network_mode: none, unsupported network_mode, duplicate container_name, and env_file quoting.
+        let none_yaml = "\
+services:
+  isolated_job:
+    image: alpine:latest
+    network_mode: none
+";
+        let none_spec = parse_compose_yaml(none_yaml, &proj, Some("demo")).unwrap();
+        assert!(!none_spec.networks.contains_key("default"));
+        let none_payload =
+            build_container_create_payload(&none_spec, &none_spec.services["isolated_job"]);
+        assert_eq!(none_payload["HostConfig"]["NetworkMode"], "none");
+        assert!(none_payload.get("NetworkingConfig").is_none());
+
+        assert!(matches!(
+            parse_compose_yaml(
+                "services:\n  a:\n    image: alpine\n    network_mode: none\n    networks: [default]\n",
+                &proj,
+                Some("demo")
+            ),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            parse_compose_yaml(
+                "services:\n  a:\n    image: alpine\n    network_mode: macvlan\n",
+                &proj,
+                Some("demo")
+            ),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            parse_compose_yaml(
+                "services:\n  a:\n    image: alpine\n    container_name: same\n  b:\n    image: alpine\n    container_name: same\n",
+                &proj,
+                Some("demo")
+            ),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        fs::write(
+            proj.join("quotes.env"),
+            "SINGLE_STRIP=\"'inner'\"\nDBL=\"\"nested\"\"\nUNMATCHED=\"keep\n",
+        )
+        .unwrap();
+        let env_spec = parse_compose_yaml(
+            "services:\n  app:\n    image: alpine\n    env_file: quotes.env\n",
+            &proj,
+            Some("demo"),
+        )
+        .unwrap();
+        let env = &env_spec.services["app"].env;
+        assert_eq!(env["SINGLE_STRIP"], "'inner'");
+        assert_eq!(env["DBL"], "\"nested\"");
+        assert_eq!(env["UNMATCHED"], "\"keep");
+
+        fs::write(proj.join("bad-key.env"), "=missing_key\n").unwrap();
+        assert!(matches!(
+            parse_compose_yaml(
+                "services:\n  app:\n    image: alpine\n    env_file: bad-key.env\n",
+                &proj,
+                Some("demo")
+            ),
+            Err(SandboxError::InvalidSpec(_))
+        ));
 
         let _ = fs::remove_dir_all(&tmp);
     }

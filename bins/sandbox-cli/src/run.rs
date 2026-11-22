@@ -625,14 +625,27 @@ fn watch_interrupts() -> Result<(tokio::task::JoinHandle<()>, watch::Receiver<bo
     let (sender, receiver) = watch::channel(false);
     #[cfg(unix)]
     let task = {
-        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .map_err(|error| {
-                SandboxError::Internal(format!("cannot register interrupt handler: {error}"))
-            })?;
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt()).map_err(|error| {
+            SandboxError::Internal(format!("cannot register SIGINT handler: {error}"))
+        })?;
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|error| {
+            SandboxError::Internal(format!("cannot register SIGTERM handler: {error}"))
+        })?;
+        let mut sighup = signal(SignalKind::hangup()).ok();
         tokio::spawn(async move {
-            if signal.recv().await.is_some() {
-                let _ = sender.send(true);
+            tokio::select! {
+                _ = sigint.recv() => {},
+                _ = sigterm.recv() => {},
+                _ = async {
+                    if let Some(ref mut h) = sighup {
+                        let _ = h.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {},
             }
+            let _ = sender.send(true);
         })
     };
     #[cfg(windows)]
