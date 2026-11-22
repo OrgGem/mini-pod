@@ -1019,8 +1019,10 @@ fn query_macos_proc_bsd_start_token(pid: u32) -> Result<Option<(bool, u64)>, San
     let expected_size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: `proc_bsdinfo` is a POD C struct written by `proc_pidinfo(PROC_PIDTBSDINFO)`.
     let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+    // Query active process table first (`arg = 0`), then retry with `arg = 1` (`findzomb = 1` in
+    // XNU `bsd/kern/proc_info.c`) so unreaped `SZOMB` leaders in `zombproc` are also detected.
     // SAFETY: `info` provides `expected_size` writable bytes for `PROC_PIDTBSDINFO`.
-    let rc = unsafe {
+    let mut rc = unsafe {
         libc::proc_pidinfo(
             raw_pid,
             libc::PROC_PIDTBSDINFO,
@@ -1029,6 +1031,18 @@ fn query_macos_proc_bsd_start_token(pid: u32) -> Result<Option<(bool, u64)>, San
             expected_size,
         )
     };
+    if rc <= 0 {
+        // SAFETY: Same valid `info` buffer; `arg = 1` enables `proc_find_zombref` on XNU.
+        rc = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+                expected_size,
+            )
+        };
+    }
     if rc <= 0 {
         let err = io::Error::last_os_error();
         return match err.raw_os_error() {
@@ -1480,7 +1494,19 @@ mod tests {
                 Err(_) => false,
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            match query_macos_proc_bsd_start_token(pid) {
+                Ok(Some((is_zombie, actual_start_token))) => {
+                    is_zombie
+                        || (expected_start_token != 0
+                            && actual_start_token != expected_start_token)
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = expected_start_token;
             false

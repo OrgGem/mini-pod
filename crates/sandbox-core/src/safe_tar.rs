@@ -1329,7 +1329,7 @@ fn verify_opened_regular_matches(
 
 /// macOS maps `/var`, `/tmp`, and `/etc` at `/` as SIP-protected symlinks to `private/*`.
 /// Permit ONLY those exact root system links while still checking every descendant component.
-fn is_allowed_macos_root_symlink(path: &Path, meta: &fs::Metadata) -> bool {
+pub fn is_allowed_macos_root_symlink(path: &Path, meta: &fs::Metadata) -> bool {
     #[cfg(target_os = "macos")]
     {
         if meta.file_type().is_symlink() {

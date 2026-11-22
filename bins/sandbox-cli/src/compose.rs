@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use sandbox_client::{ControlEndpoint, SandboxClient};
 use sandbox_core::safe_tar::{
-    apply_open_no_follow, is_symlink_or_reparse, reject_symlink_or_reparse,
+    apply_open_no_follow, is_allowed_macos_root_symlink, is_symlink_or_reparse,
+    reject_symlink_or_reparse,
 };
 use sandbox_core::{ExecRequest, ExecTarget, SandboxError, SandboxId};
 use serde_json::{json, Map, Value};
@@ -1060,7 +1061,9 @@ fn resolve_confined_project_subpath(
     }
 
     if let Ok(base_meta) = fs::symlink_metadata(base_dir) {
-        reject_symlink_or_reparse(base_dir, &base_meta)?;
+        if !is_allowed_macos_root_symlink(base_dir, &base_meta) {
+            reject_symlink_or_reparse(base_dir, &base_meta)?;
+        }
     }
     let mut cur = base_dir.to_path_buf();
     for part in rel_stack {

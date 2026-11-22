@@ -763,6 +763,9 @@ fn ensure_existing_path_no_symlink(path: &Path) -> Result<(), String> {
                 cur.push(part);
                 let meta = fs::symlink_metadata(&cur)
                     .map_err(|err| format!("failed to inspect '{}': {err}", cur.display()))?;
+                if is_allowed_macos_root_symlink(&cur, &meta) {
+                    continue;
+                }
                 if is_symlink_or_reparse(&meta) {
                     return Err(format!(
                         "path component '{}' is a symlink or reparse point",
@@ -785,6 +788,9 @@ fn step_dir_no_symlink(cur: &mut PathBuf, part: &std::ffi::OsStr, create_missing
     cur.push(part);
     match fs::symlink_metadata(&*cur) {
         Ok(meta) => {
+            if is_allowed_macos_root_symlink(cur, &meta) {
+                return Ok(());
+            }
             if is_symlink_or_reparse(&meta) {
                 return Err(format!(
                     "path component '{}' is a symlink or reparse point",
@@ -1143,6 +1149,32 @@ fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
         }
     }
     meta.file_type().is_symlink()
+}
+
+fn is_allowed_macos_root_symlink(path: &Path, meta: &fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if meta.file_type().is_symlink() {
+            let expected = if path == Path::new("/var") {
+                Some("private/var")
+            } else if path == Path::new("/tmp") {
+                Some("private/tmp")
+            } else if path == Path::new("/etc") {
+                Some("private/etc")
+            } else {
+                None
+            };
+            if let Some(target) = expected {
+                return fs::read_link(path).is_ok_and(|link| link == Path::new(target));
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, meta);
+        false
+    }
 }
 
 #[cfg(test)]
