@@ -1114,15 +1114,7 @@ fn attach_linux_cgroup_v2(
     };
     let self_cg_dir = cgroup_v2_dir_path(cgroup_mount, &self_cgroup_rel);
 
-    let mut candidates = Vec::with_capacity(2);
-    candidates.push(self_cg_dir.clone());
-    if self_cg_dir != cgroup_mount {
-        if let Some(parent) = self_cg_dir.parent() {
-            if parent.starts_with(cgroup_mount) {
-                candidates.push(parent.to_path_buf());
-            }
-        }
-    }
+    let candidates = cgroup_parent_candidates(cgroup_mount, &self_cg_dir);
 
     for candidate in candidates {
         if let Some((dir, caps)) = try_attach_in_cgroup_parent(
@@ -1136,6 +1128,29 @@ fn attach_linux_cgroup_v2(
     }
 
     (None, fallback_caps)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_parent_candidates(cgroup_mount: &Path, self_cg_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    let in_init_scope = self_cg_dir.file_name() == Some(std::ffi::OsStr::new("init.scope"));
+    let parent_in_mount = (self_cg_dir != cgroup_mount)
+        .then(|| self_cg_dir.parent())
+        .flatten()
+        .filter(|parent| parent.starts_with(cgroup_mount))
+        .map(Path::to_path_buf);
+
+    if in_init_scope {
+        if let Some(parent) = parent_in_mount {
+            candidates.push(parent);
+        }
+    } else {
+        candidates.push(self_cg_dir.to_path_buf());
+        if let Some(parent) = parent_in_mount {
+            candidates.push(parent);
+        }
+    }
+    candidates
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1156,6 +1171,9 @@ fn enable_cgroup_subtree_controllers_with_evacuate<F>(
                 if err.kind() == io::ErrorKind::ResourceBusy
                     || err.raw_os_error() == Some(libc::EBUSY) =>
             {
+                if parent_cg.file_name() == Some(std::ffi::OsStr::new("init.scope")) {
+                    return false;
+                }
                 let scope_dir = parent_cg.join("init.scope");
                 match fs::symlink_metadata(&scope_dir) {
                     Ok(meta) if !meta.file_type().is_symlink() && meta.is_dir() => {}
@@ -1724,5 +1742,42 @@ mod tests {
             ]
         );
         assert_eq!(enabled, vec!["+cpu", "+memory"]);
+
+        // Second spawn sees `/proc/self/cgroup` pointing to `S/init.scope`: candidates must
+        // prefer parent `S` only so `sandboxd` never creates `S/init.scope/init.scope/...`.
+        let mount = Path::new("/sys/fs/cgroup");
+        let svc_cg = mount.join("user.slice/minipod.service");
+        let evacuated_self = svc_cg.join("init.scope");
+        assert_eq!(
+            cgroup_parent_candidates(mount, &svc_cg),
+            vec![svc_cg.clone(), mount.join("user.slice")]
+        );
+        assert_eq!(
+            cgroup_parent_candidates(mount, &evacuated_self),
+            vec![svc_cg.clone()]
+        );
+
+        let nested_scope = dir.0.join("init.scope");
+        let nested_subtree = nested_scope.join("cgroup.subtree_control");
+        let nested_procs = nested_scope.join("cgroup.procs");
+        fs::write(&nested_procs, "1234\n").unwrap();
+        let mut nested_attempts = 0usize;
+        enable_cgroup_subtree_controllers_with_evacuate(
+            &nested_scope,
+            &nested_subtree,
+            &nested_procs,
+            true,
+            true,
+            |path, _| {
+                if path == nested_subtree {
+                    Err(io::Error::from_raw_os_error(libc::EBUSY))
+                } else {
+                    nested_attempts += 1;
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(nested_attempts, 0);
+        assert!(!nested_scope.join("init.scope").exists());
     }
 }
