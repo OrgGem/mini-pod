@@ -19,17 +19,23 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
-use sandbox_client::{DaemonStatusInfo, SandboxClient, SandboxSummaryInfo};
+use sandbox_client::{ControlEndpoint, DaemonStatusInfo, SandboxClient, SandboxSummaryInfo};
+use sandbox_core::safe_tar::{apply_open_no_follow, is_symlink_or_reparse};
 use sandbox_core::{
     AccelerationPolicy, ExecRequest, ExecTarget, IsolationMode, NetworkPolicy, ResourceBudget,
     SandboxError, SandboxId, SandboxSpec,
 };
+use serde_json::{json, Map, Value};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::cli::format_network_short;
-use crate::compose::{compose_up_in_sandbox, load_compose_spec_from_path, split_shell_words};
-use crate::image_build::{build_image_in_sandbox, ImageBuildSpec};
+use crate::compose::{
+    compose_up_in_sandbox, docker_http_error, docker_json_request, extract_inspected_host_ports,
+    format_container_list_ports, load_compose_spec_from_path, parse_restart_policy_str,
+    parse_short_port, percent_encode_component, split_shell_words, validate_safe_identifier,
+};
+use crate::image_build::{build_image_in_sandbox, validate_image_tag, ImageBuildSpec};
 
 // shortcut: cap TUI output buffer at 500 lines, add disk transcript export if full history is needed
 const MAX_OUTPUT_LINES: usize = 500;
@@ -472,7 +478,7 @@ impl TuiApp {
     }
 
     pub fn push_log(&mut self, tone: LogTone, text: impl Into<String>) {
-        let raw = text.into();
+        let raw = sanitize_terminal_text(&text.into());
         for line in raw.lines() {
             if self.output.len() >= MAX_OUTPUT_LINES {
                 self.output.pop_front();
@@ -1251,15 +1257,58 @@ pub fn parse_podman_ps_tsv(raw: &str) -> Vec<ContainerRow> {
             ports_raw.to_owned()
         };
         rows.push(ContainerRow {
-            id,
-            name,
-            image,
-            state,
-            status,
-            ports,
+            id: sanitize_terminal_text(&id),
+            name: sanitize_terminal_text(&name),
+            image: sanitize_terminal_text(&image),
+            state: sanitize_terminal_text(&state),
+            status: sanitize_terminal_text(&status),
+            ports: sanitize_terminal_text(&ports),
         });
     }
     rows
+}
+
+/// Strips ANSI CSI/OSC escape sequences and raw C0/C1 control characters from untrusted text.
+pub fn sanitize_terminal_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    let _ = chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    let _ = chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if ch == '\n' || ch == '\t' {
+            out.push(ch);
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Renders the complete TUI frame (used both by the live Crossterm loop and headless `TestBackend` tests).
@@ -2220,18 +2269,40 @@ fn dispatch_tui_command(
             run_args,
         } => {
             tokio::spawn(async move {
-                let full_cmd = format!("/usr/bin/podman run -d {run_args}");
-                let req = build_exec_req(
-                    ExecTarget::Guest,
-                    vec!["/bin/sh".to_owned(), "-c".to_owned(), full_cmd],
-                    120,
-                );
-                send_exec_outcome(
-                    &tx,
-                    format!("[{sandbox_id}] podman run -d {run_args}"),
-                    client.exec_collect(&sandbox_id, req).await,
-                    Some(sandbox_id),
-                );
+                match run_container_via_docker_compat(&client, &sandbox_id, &run_args).await {
+                    Ok((ctr_label, ports_summary)) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Success,
+                                text: format!(
+                                    "[OK] Started container {ctr_label} in {sandbox_id} ({ports_summary})"
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: true,
+                            refresh_containers_for: Some(sandbox_id),
+                            select_sandbox: None,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Error,
+                                text: format!(
+                                    "[ERR] Failed starting container in {sandbox_id}: {err}"
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: false,
+                            refresh_containers_for: None,
+                            select_sandbox: None,
+                        });
+                    }
+                }
             });
         }
         TuiCommand::LoadImageTar {
@@ -2421,31 +2492,62 @@ fn dispatch_tui_command(
             currently_running,
         } => {
             tokio::spawn(async move {
-                let argv = if currently_running {
-                    vec![
-                        "/usr/bin/podman".to_owned(),
-                        "stop".to_owned(),
-                        "-t".to_owned(),
-                        "3".to_owned(),
-                        "--".to_owned(),
-                        container_id.clone(),
-                    ]
-                } else {
-                    vec![
-                        "/usr/bin/podman".to_owned(),
-                        "start".to_owned(),
-                        "--".to_owned(),
-                        container_id.clone(),
-                    ]
-                };
                 let verb = if currently_running { "stop" } else { "start" };
-                let req = build_exec_req(ExecTarget::Guest, argv, 30);
-                send_exec_outcome(
-                    &tx,
-                    format!("[{sandbox_id}] podman {verb} {container_id}"),
-                    client.exec_collect(&sandbox_id, req).await,
-                    Some(sandbox_id),
-                );
+                let res = async {
+                    let uri = client.enable_docker_compat(&sandbox_id, false).await?;
+                    let ep = ControlEndpoint::parse(&uri)?;
+                    let enc = percent_encode_component(&container_id);
+                    let path = if currently_running {
+                        format!("/containers/{enc}/stop?t=3")
+                    } else {
+                        format!("/containers/{enc}/start")
+                    };
+                    let (st, body) = docker_json_request(&ep, "POST", &path, None).await?;
+                    if (200..300).contains(&st) || st == 304 {
+                        Ok::<(), SandboxError>(())
+                    } else {
+                        Err(docker_http_error(
+                            &format!("{verb} container '{container_id}'"),
+                            st,
+                            &body,
+                        ))
+                    }
+                }
+                .await;
+                match res {
+                    Ok(()) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Success,
+                                text: format!(
+                                    "[OK] Container {container_id} {verb}ped in {sandbox_id}"
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: true,
+                            refresh_containers_for: Some(sandbox_id),
+                            select_sandbox: None,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Error,
+                                text: format!(
+                                    "[ERR] Failed to {verb} container {container_id} in {sandbox_id}: {err}"
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: false,
+                            refresh_containers_for: Some(sandbox_id),
+                            select_sandbox: None,
+                        });
+                    }
+                }
             });
         }
         TuiCommand::ContainerLogs {
@@ -2475,20 +2577,57 @@ fn dispatch_tui_command(
             container_id,
         } => {
             tokio::spawn(async move {
-                let argv = vec![
-                    "/usr/bin/podman".to_owned(),
-                    "rm".to_owned(),
-                    "-f".to_owned(),
-                    "--".to_owned(),
-                    container_id.clone(),
-                ];
-                let req = build_exec_req(ExecTarget::Guest, argv, 30);
-                send_exec_outcome(
-                    &tx,
-                    format!("[{sandbox_id}] podman rm -f {container_id}"),
-                    client.exec_collect(&sandbox_id, req).await,
-                    Some(sandbox_id),
-                );
+                let res = async {
+                    let uri = client.enable_docker_compat(&sandbox_id, false).await?;
+                    let ep = ControlEndpoint::parse(&uri)?;
+                    let enc = percent_encode_component(&container_id);
+                    let path = format!("/containers/{enc}?force=true");
+                    let (st, body) = docker_json_request(&ep, "DELETE", &path, None).await?;
+                    if (200..300).contains(&st) || st == 404 {
+                        Ok::<(), SandboxError>(())
+                    } else {
+                        Err(docker_http_error(
+                            &format!("remove container '{container_id}'"),
+                            st,
+                            &body,
+                        ))
+                    }
+                }
+                .await;
+                match res {
+                    Ok(()) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Success,
+                                text: format!(
+                                    "[OK] Removed container {container_id} from {sandbox_id}"
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: true,
+                            refresh_containers_for: Some(sandbox_id),
+                            select_sandbox: None,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(BgEvent::ActionFinished {
+                            busy_done: true,
+                            headline: OutputLine {
+                                tone: LogTone::Error,
+                                text: format!(
+                                    "[ERR] Failed removing container {container_id} from {sandbox_id}: {err}"
+                                ),
+                            },
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            refresh_all: false,
+                            refresh_containers_for: Some(sandbox_id),
+                            select_sandbox: None,
+                        });
+                    }
+                }
             });
         }
     }
@@ -2511,6 +2650,26 @@ async fn query_podman_containers(
     client: &SandboxClient,
     sandbox_id: &SandboxId,
 ) -> Result<Vec<ContainerRow>, String> {
+    // If Docker compatibility is already active on this sandbox, query `/containers/json?all=true`
+    // so host-forwarded `127.0.0.1:<port>` bindings are reflected accurately.
+    if let Ok(sandboxes) = client.list_sandboxes().await {
+        if let Some(uri) = sandboxes
+            .into_iter()
+            .find(|s| &s.id == sandbox_id)
+            .and_then(|s| s.docker_endpoint)
+        {
+            if let Ok(ep) = ControlEndpoint::parse(&uri) {
+                if let Ok((200, body)) =
+                    docker_json_request(&ep, "GET", "/containers/json?all=true", None).await
+                {
+                    if let Ok(rows) = parse_docker_containers_json(&body) {
+                        return Ok(rows);
+                    }
+                }
+            }
+        }
+    }
+
     let req = build_exec_req(
         ExecTarget::Guest,
         vec![
@@ -2538,24 +2697,319 @@ async fn query_podman_containers(
     Ok(parse_podman_ps_tsv(&String::from_utf8_lossy(&out.stdout)))
 }
 
+fn parse_docker_containers_json(body: &[u8]) -> Result<Vec<ContainerRow>, SandboxError> {
+    let arr: Vec<Value> = serde_json::from_slice(body)
+        .map_err(|err| SandboxError::Transport(format!("invalid /containers/json: {err}")))?;
+    let mut rows = Vec::with_capacity(arr.len());
+    for item in arr {
+        let id = item["Id"].as_str().unwrap_or("").to_owned();
+        if id.is_empty() {
+            continue;
+        }
+        let name = item["Names"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(Value::as_str)
+            .map(|n| n.trim_start_matches('/').to_owned())
+            .unwrap_or_else(|| id.chars().take(12).collect());
+        let image = item["Image"].as_str().unwrap_or("-").to_owned();
+        let state = item["State"].as_str().unwrap_or("unknown").to_owned();
+        let status = item["Status"].as_str().unwrap_or("").to_owned();
+        let ports = format_container_list_ports(&item["Ports"]);
+        rows.push(ContainerRow {
+            id: sanitize_terminal_text(&id),
+            name: sanitize_terminal_text(&name),
+            image: sanitize_terminal_text(&image),
+            state: sanitize_terminal_text(&state),
+            status: sanitize_terminal_text(&status),
+            ports: sanitize_terminal_text(&ports),
+        });
+    }
+    Ok(rows)
+}
+
+/// Parses safe TUI `podman run` arguments into `(container_name, image, create_json_payload)`
+/// without ever invoking a shell, enforcing policy and forwarding `-p` ports via `DockerCompat`.
+pub fn parse_tui_run_container_spec(
+    raw_args: &str,
+) -> Result<(Option<String>, String, Value), SandboxError> {
+    let tokens = split_shell_words(raw_args)?;
+    if tokens.is_empty() {
+        return Err(SandboxError::InvalidSpec(
+            "container run arguments must include an image name".to_owned(),
+        ));
+    }
+
+    let mut name: Option<String> = None;
+    let mut ports = Vec::new();
+    let mut env = Vec::new();
+    let mut workdir: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut hostname: Option<String> = None;
+    let mut entrypoint: Option<String> = None;
+    let mut network: Option<String> = None;
+    let mut restart = None;
+    let mut auto_remove = false;
+    let mut idx = 0usize;
+
+    let take_opt_val = |flag: &str, idx: &mut usize| -> Result<String, SandboxError> {
+        *idx += 1;
+        tokens.get(*idx).cloned().ok_or_else(|| {
+            SandboxError::InvalidSpec(format!("missing value after '{flag}'"))
+        })
+    };
+
+    while idx < tokens.len() {
+        let tok = tokens[idx].as_str();
+        if tok == "--" {
+            idx += 1;
+            break;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            break;
+        }
+
+        if matches!(tok, "-d" | "--detach") {
+            idx += 1;
+            continue;
+        }
+        if tok == "--rm" {
+            auto_remove = true;
+            idx += 1;
+            continue;
+        }
+        if tok == "--privileged"
+            || tok.starts_with("--privileged=")
+            || matches!(tok, "-v" | "--volume" | "--mount")
+            || tok.starts_with("--volume=")
+            || tok.starts_with("--mount=")
+        {
+            return Err(SandboxError::PolicyViolation(format!(
+                "flag '{tok}' is forbidden in sandbox container run"
+            )));
+        }
+
+        let (flag, inline_val) = match tok.split_once('=') {
+            Some((f, v)) => (f, Some(v.to_owned())),
+            None => (tok, None),
+        };
+        let next_val = |inline: Option<String>, idx: &mut usize| -> Result<String, SandboxError> {
+            match inline {
+                Some(v) => Ok(v),
+                None => take_opt_val(flag, idx),
+            }
+        };
+
+        match flag {
+            "--name" => {
+                let n = next_val(inline_val, &mut idx)?;
+                validate_safe_identifier(&n, "container name")?;
+                name = Some(n);
+            }
+            "-p" | "--publish" => {
+                let p = next_val(inline_val, &mut idx)?;
+                ports.push(parse_short_port(&p, "tui")?);
+            }
+            "-e" | "--env" => {
+                let kv = next_val(inline_val, &mut idx)?;
+                if kv.is_empty() || !kv.contains('=') || kv.contains('\0') {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "invalid -e/--env '{kv}' (expected KEY=VALUE)"
+                    )));
+                }
+                env.push(kv);
+            }
+            "-w" | "--workdir" => {
+                workdir = Some(next_val(inline_val, &mut idx)?);
+            }
+            "-u" | "--user" => {
+                user = Some(next_val(inline_val, &mut idx)?);
+            }
+            "--hostname" => {
+                hostname = Some(next_val(inline_val, &mut idx)?);
+            }
+            "--entrypoint" => {
+                entrypoint = Some(next_val(inline_val, &mut idx)?);
+            }
+            "--network" | "--net" => {
+                let net = next_val(inline_val, &mut idx)?;
+                if net.trim().eq_ignore_ascii_case("host") {
+                    return Err(SandboxError::PolicyViolation(
+                        "network mode 'host' is forbidden inside sandbox isolation".to_owned(),
+                    ));
+                }
+                network = Some(net);
+            }
+            "--restart" => {
+                let pol = next_val(inline_val, &mut idx)?;
+                restart = Some(parse_restart_policy_str(&pol, "tui")?);
+            }
+            other => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "unsupported container run flag '{other}' (supported: -d, --rm, --name, -p, -e, -w, -u, --hostname, --entrypoint, --network, --restart)"
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    let image = tokens.get(idx).cloned().ok_or_else(|| {
+        SandboxError::InvalidSpec("missing container image in run arguments".to_owned())
+    })?;
+    validate_image_tag(&image)?;
+    let cmd: Vec<String> = tokens[idx + 1..].to_vec();
+
+    let mut root = Map::new();
+    root.insert("Image".to_owned(), Value::String(image.clone()));
+    if !cmd.is_empty() {
+        root.insert("Cmd".to_owned(), json!(cmd));
+    }
+    if let Some(ep) = entrypoint {
+        root.insert("Entrypoint".to_owned(), json!([ep]));
+    }
+    if !env.is_empty() {
+        root.insert("Env".to_owned(), json!(env));
+    }
+    if let Some(wd) = workdir {
+        root.insert("WorkingDir".to_owned(), Value::String(wd));
+    }
+    if let Some(u) = user {
+        root.insert("User".to_owned(), Value::String(u));
+    }
+    if let Some(hn) = hostname {
+        root.insert("Hostname".to_owned(), Value::String(hn));
+    }
+
+    let mut exposed_ports = Map::new();
+    let mut port_bindings: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for port in &ports {
+        let key = format!("{}/tcp", port.container_port);
+        exposed_ports.insert(key.clone(), json!({}));
+        let host_port_str = port.host_port.map(|hp| hp.to_string()).unwrap_or_default();
+        port_bindings.entry(key).or_default().push(json!({
+            "HostIp": "127.0.0.1",
+            "HostPort": host_port_str,
+        }));
+    }
+    if !exposed_ports.is_empty() {
+        root.insert("ExposedPorts".to_owned(), Value::Object(exposed_ports));
+    }
+
+    let mut hc = Map::new();
+    if auto_remove {
+        hc.insert("AutoRemove".to_owned(), Value::Bool(true));
+    }
+    if !port_bindings.is_empty() {
+        let pb_map: Map<String, Value> = port_bindings
+            .into_iter()
+            .map(|(k, v)| (k, Value::Array(v)))
+            .collect();
+        hc.insert("PortBindings".to_owned(), Value::Object(pb_map));
+    }
+    if let Some(net) = network {
+        hc.insert("NetworkMode".to_owned(), Value::String(net));
+    }
+    if let Some(r) = restart {
+        hc.insert(
+            "RestartPolicy".to_owned(),
+            json!({
+                "Name": r.name,
+                "MaximumRetryCount": r.maximum_retry_count,
+            }),
+        );
+    }
+    root.insert("HostConfig".to_owned(), Value::Object(hc));
+
+    Ok((name, image, Value::Object(root)))
+}
+
+async fn run_container_via_docker_compat(
+    client: &SandboxClient,
+    sandbox_id: &SandboxId,
+    raw_args: &str,
+) -> Result<(String, String), SandboxError> {
+    let (name_opt, _image, payload) = parse_tui_run_container_spec(raw_args)?;
+    let docker_uri = client.enable_docker_compat(sandbox_id, false).await?;
+    let docker_ep = ControlEndpoint::parse(&docker_uri)?;
+
+    let create_path = match &name_opt {
+        Some(n) => format!("/containers/create?name={}", percent_encode_component(n)),
+        None => "/containers/create".to_owned(),
+    };
+    let (cst, cbody) = docker_json_request(&docker_ep, "POST", &create_path, Some(&payload)).await?;
+    if cst != 201 {
+        return Err(docker_http_error("create container", cst, &cbody));
+    }
+    let created: Value = serde_json::from_slice(&cbody)
+        .map_err(|err| SandboxError::Transport(format!("invalid create container JSON: {err}")))?;
+    let ctr_id = created["Id"]
+        .as_str()
+        .ok_or_else(|| SandboxError::Transport("create container missing 'Id'".to_owned()))?
+        .to_owned();
+
+    let enc_id = percent_encode_component(&ctr_id);
+    let (sst, sbody) =
+        docker_json_request(&docker_ep, "POST", &format!("/containers/{enc_id}/start"), None)
+            .await?;
+    if sst != 204 && sst != 304 {
+        return Err(docker_http_error("start container", sst, &sbody));
+    }
+
+    let (ist, ibody) =
+        docker_json_request(&docker_ep, "GET", &format!("/containers/{enc_id}/json"), None).await?;
+    let host_ports = if ist == 200 {
+        serde_json::from_slice::<Value>(&ibody)
+            .ok()
+            .map(|v| extract_inspected_host_ports(&v))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let label = name_opt.unwrap_or_else(|| ctr_id.chars().take(12).collect());
+    let ports_summary = if host_ports.is_empty() {
+        "detached".to_owned()
+    } else {
+        host_ports.join(", ")
+    };
+    Ok((label, ports_summary))
+}
+
 async fn stream_image_tar_into_podman(
     client: &SandboxClient,
     sandbox_id: &SandboxId,
     host_tar_path: &std::path::Path,
 ) -> Result<(String, String), String> {
-    let meta = tokio::fs::symlink_metadata(host_tar_path)
-        .await
-        .map_err(|e| format!("cannot inspect '{}': {e}", host_tar_path.display()))?;
-    if !meta.file_type().is_file() {
-        return Err(format!(
-            "'{}' must be a regular non-symlink .tar file",
-            host_tar_path.display()
-        ));
-    }
+    let path_owned = host_tar_path.to_path_buf();
+    let std_file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
+        let meta = std::fs::symlink_metadata(&path_owned)
+            .map_err(|e| format!("cannot inspect '{}': {e}", path_owned.display()))?;
+        if is_symlink_or_reparse(&meta) || !meta.file_type().is_file() {
+            return Err(format!(
+                "'{}' must be a regular non-symlink .tar file",
+                path_owned.display()
+            ));
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        apply_open_no_follow(&mut opts);
+        let f = opts
+            .open(&path_owned)
+            .map_err(|e| format!("cannot open '{}': {e}", path_owned.display()))?;
+        let open_meta = f
+            .metadata()
+            .map_err(|e| format!("cannot stat '{}': {e}", path_owned.display()))?;
+        if is_symlink_or_reparse(&open_meta) || !open_meta.file_type().is_file() {
+            return Err(format!(
+                "'{}' must be a regular non-symlink .tar file",
+                path_owned.display()
+            ));
+        }
+        Ok(f)
+    })
+    .await
+    .map_err(|e| format!("file open task failed: {e}"))??;
 
-    let mut file = tokio::fs::File::open(host_tar_path)
-        .await
-        .map_err(|e| format!("cannot open '{}': {e}", host_tar_path.display()))?;
+    let mut file = tokio::fs::File::from_std(std_file);
 
     let req = build_exec_req(
         ExecTarget::Guest,
@@ -2837,5 +3291,43 @@ f6e5d4c3b2a1\tjob-1\talpine:3.20\texited\tExited (0) 3 minutes ago\t
             sandboxes: Ok(vec![sample_sandbox("sb-ctr-1"), sample_sandbox("sb-ctr-2")]),
         });
         assert_eq!(app.selected_sandbox, 1);
+    }
+
+    #[test]
+    fn parse_tui_run_container_spec_preserves_literal_argv_ports_and_rejects_unsafe_flags() {
+        let (name, image, payload) = parse_tui_run_container_spec(
+            "--name web-1 -p 8080:80 -e MODE=prod echo-http:latest --banner 'hi; touch /tmp/pwn'",
+        )
+        .unwrap();
+        assert_eq!(name.as_deref(), Some("web-1"));
+        assert_eq!(image, "echo-http:latest");
+        assert_eq!(
+            payload["Cmd"],
+            json!(["--banner", "hi; touch /tmp/pwn"])
+        );
+        assert_eq!(
+            payload["HostConfig"]["PortBindings"]["80/tcp"][0]["HostIp"],
+            "127.0.0.1"
+        );
+        assert_eq!(
+            payload["HostConfig"]["PortBindings"]["80/tcp"][0]["HostPort"],
+            "8080"
+        );
+        assert_eq!(payload["Env"], json!(["MODE=prod"]));
+
+        for forbidden in [
+            "--privileged alpine:latest",
+            "-v /etc:/host alpine:latest",
+            "--network=host alpine:latest",
+            "--unknown-flag alpine:latest",
+        ] {
+            assert!(
+                parse_tui_run_container_spec(forbidden).is_err(),
+                "expected '{forbidden}' to be rejected"
+            );
+        }
+
+        let dirty = "ok\x1b[31mred\x1b[0m\x1b]52;c;cHdu\x07\x08xin chào";
+        assert_eq!(sanitize_terminal_text(dirty), "okredxin chào");
     }
 }

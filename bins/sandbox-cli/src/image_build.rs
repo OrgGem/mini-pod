@@ -137,7 +137,7 @@ pub fn validate_image_tag(tag: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn normalize_relative_dockerfile(raw: &str) -> Result<String, SandboxError> {
+pub(crate) fn normalize_relative_dockerfile(raw: &str) -> Result<String, SandboxError> {
     let unified = raw.trim().replace('\\', "/");
     let stripped = unified.strip_prefix("./").unwrap_or(&unified);
     if stripped.is_empty()
@@ -191,7 +191,7 @@ pub async fn build_image_in_sandbox(
             spec.context_dir.display()
         ))
     })?;
-    if ctx_meta.file_type().is_symlink() || !ctx_meta.is_dir() {
+    if sandbox_core::safe_tar::is_symlink_or_reparse(&ctx_meta) || !ctx_meta.is_dir() {
         return Err(SandboxError::PolicyViolation(format!(
             "build context '{}' must be a regular non-symlink directory",
             spec.context_dir.display()

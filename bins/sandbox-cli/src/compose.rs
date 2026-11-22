@@ -6,17 +6,24 @@
 //! Docker or `docker-compose` installation on either the Host or the Guest VM.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Read as _;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use sandbox_client::{ControlEndpoint, SandboxClient};
+use sandbox_core::safe_tar::{
+    apply_open_no_follow, is_symlink_or_reparse, reject_symlink_or_reparse,
+};
 use sandbox_core::{ExecRequest, ExecTarget, SandboxError, SandboxId};
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use yaml_rust2::{Yaml, YamlLoader};
 
-use crate::image_build::{build_image_in_sandbox, validate_image_tag, ImageBuildSpec};
+use crate::image_build::{
+    build_image_in_sandbox, normalize_relative_dockerfile, validate_image_tag, ImageBuildSpec,
+};
 
 const LABEL_PROJECT: &str = "com.docker.compose.project";
 const LABEL_SERVICE: &str = "com.docker.compose.service";
@@ -24,7 +31,10 @@ const LABEL_NETWORK: &str = "com.docker.compose.network";
 const LABEL_VOLUME: &str = "com.docker.compose.volume";
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_LINE_BYTES: usize = 8 * 1024;
+const MAX_HTTP_TRAILER_LINES: usize = 128;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENV_FILE_BYTES: usize = 1024 * 1024;
 
 const DEFAULT_COMPOSE_FILENAMES: &[&str] = &[
     "compose.yaml",
@@ -582,7 +592,7 @@ fn resolve_compose_file(explicit: Option<&Path>) -> Result<PathBuf, SandboxError
                 path.display()
             ))
         })?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
+        if is_symlink_or_reparse(&meta) || !meta.is_file() {
             return Err(SandboxError::PolicyViolation(format!(
                 "compose file '{}' must be a regular non-symlink file",
                 path.display()
@@ -597,7 +607,7 @@ fn resolve_compose_file(explicit: Option<&Path>) -> Result<PathBuf, SandboxError
     for candidate_name in DEFAULT_COMPOSE_FILENAMES {
         let candidate = cwd.join(candidate_name);
         if let Ok(meta) = fs::symlink_metadata(&candidate) {
-            if !meta.file_type().is_symlink() && meta.is_file() {
+            if !is_symlink_or_reparse(&meta) && meta.is_file() {
                 return Ok(candidate);
             }
         }
@@ -631,7 +641,7 @@ pub fn load_compose_spec_from_path(
             compose_path.display()
         ))
     })?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
+    if is_symlink_or_reparse(&meta) || !meta.is_file() {
         return Err(SandboxError::PolicyViolation(format!(
             "compose file '{}' must be a regular non-symlink file",
             compose_path.display()
@@ -886,7 +896,7 @@ fn sanitize_project_name(raw: &str) -> Result<String, SandboxError> {
     Ok(trimmed)
 }
 
-fn validate_safe_identifier(val: &str, label: &str) -> Result<(), SandboxError> {
+pub(crate) fn validate_safe_identifier(val: &str, label: &str) -> Result<(), SandboxError> {
     let mut chars = val.chars();
     let Some(first) = chars.next() else {
         return Err(SandboxError::InvalidSpec(format!("{label} cannot be empty")));
@@ -946,7 +956,11 @@ fn parse_service_build(
     }
     if let Some(ctx_rel) = b_val.as_str() {
         return Ok(Some(ServiceBuildSpec {
-            context_dir: resolve_local_subpath(base_dir, ctx_rel)?,
+            context_dir: resolve_confined_project_subpath(
+                base_dir,
+                ctx_rel,
+                &format!("service '{svc_name}' build.context"),
+            )?,
             dockerfile: None,
             args: Vec::new(),
             target: None,
@@ -959,7 +973,23 @@ fn parse_service_build(
         ))
     })?;
     let ctx_rel = map_get_str(bh, "context")?.unwrap_or_else(|| ".".to_owned());
-    let dockerfile = map_get_str(bh, "dockerfile")?;
+    let context_dir = resolve_confined_project_subpath(
+        base_dir,
+        &ctx_rel,
+        &format!("service '{svc_name}' build.context"),
+    )?;
+    let dockerfile = match map_get_str(bh, "dockerfile")? {
+        Some(df_raw) => {
+            let norm = normalize_relative_dockerfile(&df_raw)?;
+            let _ = resolve_confined_project_subpath(
+                &context_dir,
+                &norm,
+                &format!("service '{svc_name}' build.dockerfile"),
+            )?;
+            Some(norm)
+        }
+        None => None,
+    };
     let target = map_get_str(bh, "target")?;
     let no_cache = map_get(bh, "no_cache")
         .and_then(Yaml::as_bool)
@@ -970,7 +1000,7 @@ fn parse_service_build(
         args.extend(map);
     }
     Ok(Some(ServiceBuildSpec {
-        context_dir: resolve_local_subpath(base_dir, &ctx_rel)?,
+        context_dir,
         dockerfile,
         args,
         target,
@@ -978,17 +1008,68 @@ fn parse_service_build(
     }))
 }
 
-fn resolve_local_subpath(base_dir: &Path, raw: &str) -> Result<PathBuf, SandboxError> {
-    let p = Path::new(raw.trim());
-    if p.as_os_str().is_empty() {
-        return Err(SandboxError::InvalidSpec(
-            "path in Compose file must not be empty".to_owned(),
-        ));
+fn resolve_confined_project_subpath(
+    base_dir: &Path,
+    raw: &str,
+    label: &str,
+) -> Result<PathBuf, SandboxError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(SandboxError::InvalidSpec(format!(
+            "{label} must not be empty or contain NUL bytes"
+        )));
     }
+    let raw_bytes = trimmed.as_bytes();
+    let has_drive_prefix =
+        raw_bytes.len() >= 2 && raw_bytes[0].is_ascii_alphabetic() && raw_bytes[1] == b':';
+    if has_drive_prefix || trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Err(SandboxError::PolicyViolation(format!(
+            "{label} '{trimmed}' must be a relative path confined inside project directory '{}'",
+            base_dir.display()
+        )));
+    }
+
+    let unified = trimmed.replace('\\', "/");
+    let p = Path::new(&unified);
     if p.is_absolute() {
-        return Ok(p.to_path_buf());
+        return Err(SandboxError::PolicyViolation(format!(
+            "{label} '{trimmed}' must not be an absolute path",
+        )));
     }
-    Ok(base_dir.join(p))
+
+    let mut rel_stack: Vec<OsString> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(part) => rel_stack.push(part.to_os_string()),
+            Component::ParentDir => {
+                if rel_stack.pop().is_none() {
+                    return Err(SandboxError::PolicyViolation(format!(
+                        "{label} '{trimmed}' escapes Compose project directory '{}'",
+                        base_dir.display()
+                    )));
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(SandboxError::PolicyViolation(format!(
+                    "{label} '{trimmed}' must stay inside Compose project directory '{}'",
+                    base_dir.display()
+                )));
+            }
+        }
+    }
+
+    if let Ok(base_meta) = fs::symlink_metadata(base_dir) {
+        reject_symlink_or_reparse(base_dir, &base_meta)?;
+    }
+    let mut cur = base_dir.to_path_buf();
+    for part in rel_stack {
+        cur.push(part);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            reject_symlink_or_reparse(&cur, &meta)?;
+        }
+    }
+    Ok(cur)
 }
 
 fn parse_command_or_entrypoint(
@@ -1115,25 +1196,12 @@ fn parse_service_env(
             }
         }
         for rel in files {
-            let path = resolve_local_subpath(base_dir, &rel)?;
-            let meta = fs::symlink_metadata(&path).map_err(|err| {
-                SandboxError::InvalidSpec(format!(
-                    "service '{svc_name}' env_file '{}' cannot be accessed: {err}",
-                    path.display()
-                ))
-            })?;
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return Err(SandboxError::PolicyViolation(format!(
-                    "service '{svc_name}' env_file '{}' must be a regular non-symlink file",
-                    path.display()
-                )));
-            }
-            let content = fs::read_to_string(&path).map_err(|err| {
-                SandboxError::InvalidSpec(format!(
-                    "failed reading env_file '{}': {err}",
-                    path.display()
-                ))
-            })?;
+            let path = resolve_confined_project_subpath(
+                base_dir,
+                &rel,
+                &format!("service '{svc_name}' env_file"),
+            )?;
+            let content = read_confined_env_file(&path, svc_name)?;
             for (line_no, raw_line) in content.trim_start_matches('\u{feff}').lines().enumerate() {
                 let trimmed = raw_line.trim();
                 if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1161,6 +1229,62 @@ fn parse_service_env(
     }
 
     Ok(env)
+}
+
+fn read_confined_env_file(path: &Path, svc_name: &str) -> Result<String, SandboxError> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        SandboxError::InvalidSpec(format!(
+            "service '{svc_name}' env_file '{}' cannot be accessed: {err}",
+            path.display()
+        ))
+    })?;
+    if is_symlink_or_reparse(&meta) || !meta.is_file() {
+        return Err(SandboxError::PolicyViolation(format!(
+            "service '{svc_name}' env_file '{}' must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    apply_open_no_follow(&mut opts);
+    let mut file = opts.open(path).map_err(|err| {
+        SandboxError::InvalidSpec(format!(
+            "service '{svc_name}' env_file '{}' cannot be opened: {err}",
+            path.display()
+        ))
+    })?;
+    let open_meta = file.metadata().map_err(|err| {
+        SandboxError::InvalidSpec(format!(
+            "service '{svc_name}' env_file '{}' cannot be inspected: {err}",
+            path.display()
+        ))
+    })?;
+    if is_symlink_or_reparse(&open_meta) || !open_meta.file_type().is_file() {
+        return Err(SandboxError::PolicyViolation(format!(
+            "service '{svc_name}' env_file '{}' must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    let mut buf = Vec::new();
+    (&mut file)
+        .take((MAX_ENV_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|err| {
+            SandboxError::InvalidSpec(format!("failed reading env_file '{}': {err}", path.display()))
+        })?;
+    if buf.len() > MAX_ENV_FILE_BYTES {
+        return Err(SandboxError::BudgetExceeded(format!(
+            "service '{svc_name}' env_file '{}' exceeds {} bytes",
+            path.display(),
+            MAX_ENV_FILE_BYTES
+        )));
+    }
+    String::from_utf8(buf).map_err(|err| {
+        SandboxError::InvalidSpec(format!(
+            "service '{svc_name}' env_file '{}' is not valid UTF-8: {err}",
+            path.display()
+        ))
+    })
 }
 
 fn parse_key_val_collection(
@@ -1219,6 +1343,13 @@ fn parse_restart_policy(
     let Some(raw) = map_get_str(svc_hash, "restart")? else {
         return Ok(None);
     };
+    parse_restart_policy_str(&raw, svc_name).map(Some)
+}
+
+pub(crate) fn parse_restart_policy_str(
+    raw: &str,
+    svc_name: &str,
+) -> Result<RestartSpec, SandboxError> {
     let trimmed = raw.trim();
     if let Some(retries_str) = trimmed.strip_prefix("on-failure:") {
         let retries = retries_str.parse::<u32>().map_err(|_| {
@@ -1226,16 +1357,16 @@ fn parse_restart_policy(
                 "invalid restart policy '{trimmed}' in service '{svc_name}'"
             ))
         })?;
-        return Ok(Some(RestartSpec {
+        return Ok(RestartSpec {
             name: "on-failure".to_owned(),
             maximum_retry_count: retries,
-        }));
+        });
     }
     match trimmed {
-        "no" | "always" | "unless-stopped" | "on-failure" => Ok(Some(RestartSpec {
+        "no" | "always" | "unless-stopped" | "on-failure" => Ok(RestartSpec {
             name: trimmed.to_owned(),
             maximum_retry_count: 0,
-        })),
+        }),
         other => Err(SandboxError::InvalidSpec(format!(
             "unsupported restart policy '{other}' in service '{svc_name}'"
         ))),
@@ -1292,7 +1423,7 @@ fn parse_service_ports(
     Ok(ports)
 }
 
-fn parse_short_port(raw: &str, svc_name: &str) -> Result<ComposePort, SandboxError> {
+pub(crate) fn parse_short_port(raw: &str, svc_name: &str) -> Result<ComposePort, SandboxError> {
     let trimmed = raw.trim();
     let (port_part, proto) = match trimmed.rsplit_once('/') {
         Some((p, pr)) => (p, pr),
@@ -2070,7 +2201,7 @@ async fn list_project_containers(
     Ok(out)
 }
 
-fn extract_inspected_host_ports(inspect: &Value) -> Vec<String> {
+pub(crate) fn extract_inspected_host_ports(inspect: &Value) -> Vec<String> {
     let mut ports = Vec::new();
     let Some(map) = inspect["NetworkSettings"]["Ports"].as_object() else {
         return ports;
@@ -2089,7 +2220,7 @@ fn extract_inspected_host_ports(inspect: &Value) -> Vec<String> {
     ports
 }
 
-fn format_container_list_ports(ports_val: &Value) -> String {
+pub(crate) fn format_container_list_ports(ports_val: &Value) -> String {
     let Some(arr) = ports_val.as_array() else {
         return "-".to_owned();
     };
@@ -2111,7 +2242,7 @@ fn format_container_list_ports(ports_val: &Value) -> String {
     }
 }
 
-fn percent_encode_component(raw: &str) -> String {
+pub(crate) fn percent_encode_component(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for b in raw.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -2123,7 +2254,7 @@ fn percent_encode_component(raw: &str) -> String {
     out
 }
 
-fn docker_http_error(op: &str, status: u16, body: &[u8]) -> SandboxError {
+pub(crate) fn docker_http_error(op: &str, status: u16, body: &[u8]) -> SandboxError {
     let detail = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| v["message"].as_str().map(str::to_owned))
@@ -2136,16 +2267,27 @@ fn docker_http_error(op: &str, status: u16, body: &[u8]) -> SandboxError {
 }
 
 /// Sends a single HTTP/1.1 JSON request (`Connection: close`) over the owner-only `DockerCompat` IPC endpoint.
-async fn docker_json_request(
+pub(crate) async fn docker_json_request(
     endpoint: &ControlEndpoint,
     method: &str,
     path_and_query: &str,
     json_body: Option<&Value>,
 ) -> Result<(u16, Vec<u8>), SandboxError> {
-    let mut stream = SandboxClient::new(endpoint.clone())
+    let stream = SandboxClient::new(endpoint.clone())
         .connect_with_connector()
         .await?;
+    docker_json_request_over_stream(stream, method, path_and_query, json_body).await
+}
 
+async fn docker_json_request_over_stream<S>(
+    mut stream: S,
+    method: &str,
+    path_and_query: &str,
+    json_body: Option<&Value>,
+) -> Result<(u16, Vec<u8>), SandboxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let body_bytes = match json_body {
         Some(val) => serde_json::to_vec(val)
             .map_err(|err| SandboxError::Internal(format!("JSON serialize failed: {err}")))?,
@@ -2179,16 +2321,11 @@ async fn docker_json_request(
         .map_err(|err| SandboxError::Transport(format!("Docker IPC flush failed: {err}")))?;
 
     let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    let n = reader
-        .read_line(&mut status_line)
-        .await
-        .map_err(|err| SandboxError::Transport(format!("Docker IPC status read failed: {err}")))?;
-    if n == 0 {
-        return Err(SandboxError::Transport(
-            "unexpected EOF reading Docker IPC response".to_owned(),
-        ));
-    }
+    let status_line = read_http_line_bounded(&mut reader, MAX_HTTP_LINE_BYTES, "status line")
+        .await?
+        .ok_or_else(|| {
+            SandboxError::Transport("unexpected EOF reading Docker IPC response".to_owned())
+        })?;
 
     let mut status_parts = status_line.trim_end().splitn(3, ' ');
     let _http_ver = status_parts.next();
@@ -2202,16 +2339,12 @@ async fn docker_json_request(
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut header_bytes = status_line.len();
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).await.map_err(|err| {
-            SandboxError::Transport(format!("Docker IPC header read failed: {err}"))
-        })?;
-        if read == 0 {
-            return Err(SandboxError::Transport(
-                "unexpected EOF in Docker HTTP headers".to_owned(),
-            ));
-        }
-        header_bytes += read;
+        let line = read_http_line_bounded(&mut reader, MAX_HTTP_LINE_BYTES, "header line")
+            .await?
+            .ok_or_else(|| {
+                SandboxError::Transport("unexpected EOF in Docker HTTP headers".to_owned())
+            })?;
+        header_bytes = header_bytes.saturating_add(line.len());
         if header_bytes > MAX_HTTP_HEADER_BYTES {
             return Err(SandboxError::Transport(
                 "Docker HTTP response headers exceeded 64 KiB".to_owned(),
@@ -2237,31 +2370,52 @@ async fn docker_json_request(
     if is_chunked {
         let mut out = Vec::new();
         loop {
-            let mut size_line = String::new();
-            let r = reader.read_line(&mut size_line).await.map_err(|err| {
-                SandboxError::Transport(format!("chunk size read failed: {err}"))
-            })?;
-            if r == 0 {
-                return Err(SandboxError::Transport(
-                    "unexpected EOF reading HTTP chunk size".to_owned(),
-                ));
-            }
+            let size_line =
+                read_http_line_bounded(&mut reader, MAX_HTTP_LINE_BYTES, "chunk size line")
+                    .await?
+                    .ok_or_else(|| {
+                        SandboxError::Transport(
+                            "unexpected EOF reading HTTP chunk size".to_owned(),
+                        )
+                    })?;
             let hex_part = size_line
                 .trim()
                 .split(';')
                 .next()
                 .unwrap_or("")
                 .trim();
+            if hex_part.is_empty()
+                || hex_part.len() > 16
+                || !hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(SandboxError::Transport(format!(
+                    "invalid HTTP chunk length '{hex_part}'"
+                )));
+            }
             let chunk_len = usize::from_str_radix(hex_part, 16).map_err(|_| {
                 SandboxError::Transport(format!("invalid HTTP chunk length '{hex_part}'"))
             })?;
             if chunk_len == 0 {
-                // Drain trailing CRLF / trailers until blank line.
+                let mut trailer_lines = 0usize;
+                let mut trailer_bytes = 0usize;
                 loop {
-                    let mut trailer = String::new();
-                    let tr = reader.read_line(&mut trailer).await.unwrap_or(0);
-                    if tr == 0 || trailer.trim().is_empty() {
+                    let Some(trailer) =
+                        read_http_line_bounded(&mut reader, MAX_HTTP_LINE_BYTES, "chunk trailer")
+                            .await?
+                    else {
                         break;
+                    };
+                    if trailer.trim_end_matches(['\r', '\n']).is_empty() {
+                        break;
+                    }
+                    trailer_lines += 1;
+                    trailer_bytes = trailer_bytes.saturating_add(trailer.len());
+                    if trailer_lines > MAX_HTTP_TRAILER_LINES
+                        || trailer_bytes > MAX_HTTP_HEADER_BYTES
+                    {
+                        return Err(SandboxError::Transport(
+                            "Docker HTTP chunked trailers exceeded limits".to_owned(),
+                        ));
                     }
                 }
                 break;
@@ -2282,6 +2436,11 @@ async fn docker_json_request(
                 .read_exact(&mut crlf)
                 .await
                 .map_err(|err| SandboxError::Transport(format!("chunk CRLF read failed: {err}")))?;
+            if crlf != *b"\r\n" {
+                return Err(SandboxError::Transport(
+                    "missing CRLF after HTTP chunk payload".to_owned(),
+                ));
+            }
         }
         return Ok((status, out));
     }
@@ -2315,6 +2474,48 @@ async fn docker_json_request(
         ));
     }
     Ok((status, out))
+}
+
+async fn read_http_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+    ctx: &str,
+) -> Result<Option<String>, SandboxError> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(|err| {
+            SandboxError::Transport(format!("Docker HTTP {ctx} read failed: {err}"))
+        })?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(buf).map(Some).map_err(|err| {
+                SandboxError::Transport(format!("Docker HTTP {ctx} is not UTF-8: {err}"))
+            });
+        }
+        if let Some(nl_pos) = available.iter().position(|&b| b == b'\n') {
+            let take_len = nl_pos + 1;
+            if buf.len().saturating_add(take_len) > max_bytes {
+                return Err(SandboxError::Transport(format!(
+                    "Docker HTTP {ctx} exceeded {max_bytes} bytes"
+                )));
+            }
+            buf.extend_from_slice(&available[..take_len]);
+            reader.consume(take_len);
+            return String::from_utf8(buf).map(Some).map_err(|err| {
+                SandboxError::Transport(format!("Docker HTTP {ctx} is not UTF-8: {err}"))
+            });
+        }
+        let n = available.len();
+        if buf.len().saturating_add(n) > max_bytes {
+            return Err(SandboxError::Transport(format!(
+                "Docker HTTP {ctx} exceeded {max_bytes} bytes"
+            )));
+        }
+        buf.extend_from_slice(available);
+        reader.consume(n);
+    }
 }
 
 #[cfg(test)]
@@ -2466,5 +2667,107 @@ services:
             parse_compose_yaml(cycle_yaml, Path::new("."), Some("p")),
             Err(SandboxError::InvalidSpec(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn confines_build_context_dockerfile_and_env_file_and_bounds_http_lines() {
+        let tmp = std::env::temp_dir().join(format!("minipod-compose-confine-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let proj = tmp.join("project");
+        let outside = tmp.join("outside");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.env"), "SECRET=leaked\n").unwrap();
+        fs::write(proj.join("app.env"), "APP_MODE=safe\n").unwrap();
+
+        // 1. Valid in-project `env_file` and `build.context` succeed.
+        let ok_yaml = r#"
+services:
+  app:
+    build:
+      context: ./sub
+      dockerfile: Dockerfile
+    env_file:
+      - ./app.env
+"#;
+        let ok_spec = parse_compose_yaml(ok_yaml, &proj, Some("demo")).unwrap();
+        assert_eq!(
+            ok_spec.services["app"].env.get("APP_MODE").map(String::as_str),
+            Some("safe")
+        );
+
+        // 2. Traversal `..` and external absolute paths in `build.context`, `dockerfile`, and `env_file` fail.
+        for bad_yaml in [
+            "services:\n  app:\n    build: ../outside\n",
+            "services:\n  app:\n    build: /etc\n",
+            "services:\n  app:\n    build: C:\\Windows\n",
+            "services:\n  app:\n    build:\n      context: .\n      dockerfile: ../Dockerfile\n",
+            "services:\n  app:\n    image: alpine:latest\n    env_file: ../outside/secret.env\n",
+            "services:\n  app:\n    image: alpine:latest\n    env_file: /etc/passwd\n",
+        ] {
+            let res = parse_compose_yaml(bad_yaml, &proj, Some("demo"));
+            assert!(
+                matches!(
+                    res,
+                    Err(SandboxError::PolicyViolation(_) | SandboxError::InvalidSpec(_))
+                ),
+                "expected confinement rejection for:\n{bad_yaml}\ngot: {res:?}"
+            );
+        }
+
+        // 3. Windows junction / Unix symlink inside project escaping to `outside` is rejected.
+        #[cfg(windows)]
+        {
+            let junc = proj.join("linked_out");
+            let st = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &junc.to_string_lossy(),
+                    &outside.to_string_lossy(),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let junc_env_yaml =
+                "services:\n  app:\n    image: alpine:latest\n    env_file: ./linked_out/secret.env\n";
+            assert!(matches!(
+                parse_compose_yaml(junc_env_yaml, &proj, Some("demo")),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+            let junc_ctx_yaml = "services:\n  app:\n    build: ./linked_out\n";
+            assert!(matches!(
+                parse_compose_yaml(junc_ctx_yaml, &proj, Some("demo")),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, proj.join("linked_out")).unwrap();
+            let sym_env_yaml =
+                "services:\n  app:\n    image: alpine:latest\n    env_file: ./linked_out/secret.env\n";
+            assert!(matches!(
+                parse_compose_yaml(sym_env_yaml, &proj, Some("demo")),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        // 4. `docker_json_request_over_stream` bounds oversized HTTP lines before `\n`.
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        tokio::spawn(async move {
+            let mut req_drain = [0u8; 512];
+            let _ = server_io.read(&mut req_drain).await;
+            let huge_header = vec![b'X'; MAX_HTTP_LINE_BYTES + 512];
+            let _ = server_io.write_all(b"HTTP/1.1 200 OK\r\nX-Long: ").await;
+            let _ = server_io.write_all(&huge_header).await;
+            let _ = server_io.shutdown().await;
+        });
+        let err = docker_json_request_over_stream(client_io, "GET", "/_ping", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(_)), "got {err:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
