@@ -66,31 +66,39 @@ pub(crate) struct ExecScope {
 }
 
 impl ExecScope {
-    /// Creates a fresh per-exec cgroup v2 scope on Linux if `/sys/fs/cgroup` is writable,
-    /// falling back gracefully to process-group + `/proc` tree tracking in unprivileged host tests.
-    pub(crate) fn prepare(stream_id: StreamId, is_container_exec: bool) -> Self {
+    /// Host-side protocol tests may lack a delegated cgroup. In the VM a requested
+    /// limit must be installed before the first workload process is allowed to start.
+    pub(crate) fn prepare(
+        stream_id: StreamId,
+        is_container_exec: bool,
+        pids_max: Option<u32>,
+    ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            if let Some((dir, procs_file)) = try_create_linux_exec_cgroup(stream_id) {
-                return Self {
-                    cgroup_dir: Some(dir),
-                    spawn_procs_file: Mutex::new(Some(procs_file)),
-                    is_container_exec,
-                    leader_starttime: AtomicU64::new(0),
-                };
+            match create_linux_exec_cgroup(stream_id, pids_max) {
+                Ok((dir, procs_file)) => {
+                    return Ok(Self {
+                        cgroup_dir: Some(dir),
+                        spawn_procs_file: Mutex::new(Some(procs_file)),
+                        is_container_exec,
+                        leader_starttime: AtomicU64::new(0),
+                    })
+                }
+                Err(error) if pids_max.is_some() => return Err(error),
+                Err(_) => {}
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = stream_id;
+        let _ = (stream_id, pids_max);
 
-        Self {
+        Ok(Self {
             #[cfg(target_os = "linux")]
             cgroup_dir: None,
             spawn_procs_file: Mutex::new(None),
             is_container_exec,
             #[cfg(target_os = "linux")]
             leader_starttime: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Captures the unreaped leader's `/proc/<pid>/stat` `starttime` right after `spawn()` so
@@ -203,8 +211,18 @@ fn resolve_writable_cgroup_parent() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn try_create_linux_exec_cgroup(stream_id: StreamId) -> Option<(PathBuf, File)> {
-    let parent = resolve_writable_cgroup_parent();
+fn create_linux_exec_cgroup(
+    stream_id: StreamId,
+    pids_max: Option<u32>,
+) -> io::Result<(PathBuf, File)> {
+    let parent = if pids_max.is_some() {
+        // The guest owns this cgroup mount. The agent remains outside each capped leaf.
+        let root = Path::new(CGROUP_ROOT);
+        fs::write(root.join("cgroup.subtree_control"), "+pids")?;
+        root.to_path_buf()
+    } else {
+        resolve_writable_cgroup_parent()
+    };
     let seq = NEXT_EXEC_SCOPE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = parent.join(format!(
         "minipod-exec-{}-{}-{}",
@@ -212,12 +230,20 @@ fn try_create_linux_exec_cgroup(stream_id: StreamId) -> Option<(PathBuf, File)> 
         stream_id.0,
         seq
     ));
-    fs::create_dir(&dir).ok()?;
-    match OpenOptions::new().write(true).open(dir.join("cgroup.procs")) {
-        Ok(file) => Some((dir, file)),
-        Err(_) => {
+    fs::create_dir(&dir)?;
+    let open = || {
+        if let Some(limit) = pids_max {
+            fs::write(dir.join("pids.max"), limit.to_string())?;
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+    };
+    match open() {
+        Ok(file) => Ok((dir, file)),
+        Err(error) => {
             let _ = fs::remove_dir(&dir);
-            None
+            Err(error)
         }
     }
 }
@@ -823,7 +849,7 @@ mod tests {
             }
         };
 
-        let scope = ExecScope::prepare(StreamId(900), false);
+        let scope = ExecScope::prepare(StreamId(900), false, None).unwrap();
         let mut id_cmd = Command::new("id");
         id_cmd.arg("-G").stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_exec_command(&mut id_cmd, Some(target_user), &scope);
@@ -841,7 +867,7 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let scope2 = std::sync::Arc::new(ExecScope::prepare(StreamId(901), false));
+            let scope2 = std::sync::Arc::new(ExecScope::prepare(StreamId(901), false, None).unwrap());
             let scope2_bg = std::sync::Arc::clone(&scope2);
             let mut child = thread::spawn(move || {
                 let mut cmd = Command::new("/bin/sleep");
