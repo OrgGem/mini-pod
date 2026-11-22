@@ -159,6 +159,7 @@ impl Drop for UnixServerHandle {
 enum StreamNext {
     Continue,
     Close,
+    AbortEarly,
     Hijacked {
         upstream_stream: TunnelStream,
         upstream_pre_buf: Vec<u8>,
@@ -271,11 +272,13 @@ impl DockerCompatServer {
                         true,
                     )
                     .await;
+                    shutdown_and_drain_after_early_abort(&mut client_reader).await;
                     return Ok(());
                 }
                 Err(HttpError::MalformedHead(msg)) => {
                     let _ =
                         write_json_error(&mut client_reader, 400, "Bad Request", &msg, true).await;
+                    shutdown_and_drain_after_early_abort(&mut client_reader).await;
                     return Ok(());
                 }
                 Err(HttpError::Io(err)) => return Err(err),
@@ -288,6 +291,7 @@ impl DockerCompatServer {
                         true,
                     )
                     .await;
+                    shutdown_and_drain_after_early_abort(&mut client_reader).await;
                     return Ok(());
                 }
             };
@@ -295,6 +299,10 @@ impl DockerCompatServer {
             match self.dispatch_request(&mut client_reader, req).await? {
                 StreamNext::Continue => continue,
                 StreamNext::Close => return Ok(()),
+                StreamNext::AbortEarly => {
+                    shutdown_and_drain_after_early_abort(&mut client_reader).await;
+                    return Ok(());
+                }
                 StreamNext::Hijacked {
                     upstream_stream,
                     upstream_pre_buf,
@@ -573,10 +581,15 @@ impl DockerCompatServer {
         let canonical_path = match canonicalize_docker_path(&req.path) {
             Ok(path) => path,
             Err(reason) => {
+                let (_, next) = close_mode_for_rejected_request(&req, false);
                 write_json_error(client, 400, "Bad Request", reason, true)
                     .await
                     .map_err(http_to_io)?;
-                return Ok(StreamNext::Close);
+                return Ok(if matches!(next, StreamNext::AbortEarly) {
+                    StreamNext::AbortEarly
+                } else {
+                    StreamNext::Close
+                });
             }
         };
         req.path = canonical_path;
@@ -587,8 +600,8 @@ impl DockerCompatServer {
 
         let route = match parse_docker_route(&req.method, &req.path) {
             DockerRoute::ForbiddenLibpod => {
-                // Close if `req` carries an unread body or upgrade intent so keep-alive framing never desyncs.
-                let close = should_close_rejected_request(&req, false);
+                // Close/drain if `req` carries an unread body or upgrade intent so keep-alive framing never desyncs.
+                let (close, next) = close_mode_for_rejected_request(&req, false);
                 write_json_error(
                     client,
                     403,
@@ -598,22 +611,14 @@ impl DockerCompatServer {
                 )
                 .await
                 .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
+                return Ok(next);
             }
             DockerRoute::ForbiddenRoute(reason) => {
-                let close = should_close_rejected_request(&req, false);
+                let (close, next) = close_mode_for_rejected_request(&req, false);
                 write_json_error(client, 403, "Forbidden", reason, close)
                     .await
                     .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
+                return Ok(next);
             }
             DockerRoute::ContainerCreate => {
                 let (ver_prefix, _) = strip_api_version(&req.path);
@@ -674,30 +679,22 @@ impl DockerCompatServer {
             DockerRoute::ImageBuild => {
                 let params = decode_all_query_params(req.query.as_deref());
                 if let Err(rejection) = validate_image_build_query(&params) {
-                    let close = should_close_rejected_request(&req, false);
+                    let (close, next) = close_mode_for_rejected_request(&req, false);
                     write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                         .await
                         .map_err(http_to_io)?;
-                    return Ok(if close {
-                        StreamNext::Close
-                    } else {
-                        StreamNext::Continue
-                    });
+                    return Ok(next);
                 }
                 RouteDispatch::Pass
             }
             DockerRoute::ImageCreate => {
                 let params = decode_all_query_params(req.query.as_deref());
                 if let Err(rejection) = validate_image_create_query(&params) {
-                    let close = should_close_rejected_request(&req, false);
+                    let (close, next) = close_mode_for_rejected_request(&req, false);
                     write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                         .await
                         .map_err(http_to_io)?;
-                    return Ok(if close {
-                        StreamNext::Close
-                    } else {
-                        StreamNext::Continue
-                    });
+                    return Ok(next);
                 }
                 RouteDispatch::Pass
             }
@@ -836,7 +833,11 @@ impl DockerCompatServer {
         C: FnOnce(&HttpRequestHead, &HttpResponseHead, &[u8], M),
     {
         let Some(mut up_req) = prepare_expect_header(client, &req).await? else {
-            return Ok(StreamNext::Close);
+            return Ok(if matches!(req.body_mode(), BodyMode::Empty) {
+                StreamNext::Close
+            } else {
+                StreamNext::AbortEarly
+            });
         };
 
         let raw_body = match read_body_bytes(client, req.body_mode(), MAX_BUFFERED_BODY_BYTES).await
@@ -851,12 +852,12 @@ impl DockerCompatServer {
                     true,
                 )
                 .await;
-                return Ok(StreamNext::Close);
+                return Ok(StreamNext::AbortEarly);
             }
             Err(HttpError::Io(err)) => return Err(err),
             Err(err) => {
                 let _ = write_json_error(client, 400, "Bad Request", &err.to_string(), true).await;
-                return Ok(StreamNext::Close);
+                return Ok(StreamNext::AbortEarly);
             }
         };
 
@@ -864,15 +865,11 @@ impl DockerCompatServer {
         let (rewritten, meta) = match sanitize(&raw_body, &policy) {
             Ok(pair) => pair,
             Err(rejection) => {
-                let close = should_close_rejected_request(&req, true);
+                let (close, next) = close_mode_for_rejected_request(&req, true);
                 write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                     .await
                     .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
+                return Ok(next);
             }
         };
 
@@ -885,28 +882,20 @@ impl DockerCompatServer {
         {
             Ok(stream) => stream,
             Err(err) => {
-                let close = should_close_rejected_request(&req, true);
+                let (close, next) = close_mode_for_rejected_request(&req, true);
                 write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                     .await
                     .map_err(http_to_io)?;
-                return Ok(if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                });
+                return Ok(next);
             }
         };
 
         if let Err(err) = write_request_and_bytes(&mut upstream, &up_req, &rewritten).await {
-            let close = should_close_rejected_request(&req, true);
+            let (close, next) = close_mode_for_rejected_request(&req, true);
             write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                 .await
                 .map_err(http_to_io)?;
-            return Ok(if close {
-                StreamNext::Close
-            } else {
-                StreamNext::Continue
-            });
+            return Ok(next);
         }
 
         let mut up_reader = PrefixedReader::new(upstream);
@@ -1258,6 +1247,28 @@ impl DockerCompatServer {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let body_mode = req.body_mode();
+        let wants_100_continue = match validate_expect_header(req) {
+            Ok(v) => v,
+            Err(bad_token) => {
+                let res = write_json_error(
+                    client,
+                    417,
+                    "Expectation Failed",
+                    &format!("unsupported Expect header value '{bad_token}'"),
+                    true,
+                )
+                .await
+                .map_err(http_to_io);
+                return Err(res.map(|()| {
+                    if matches!(body_mode, BodyMode::Empty) {
+                        StreamNext::Close
+                    } else {
+                        StreamNext::AbortEarly
+                    }
+                }));
+            }
+        };
+
         let mut upstream = match self
             .tunnel_port
             .open_podman_unix_stream(&self.sandbox_id)
@@ -1265,38 +1276,26 @@ impl DockerCompatServer {
         {
             Ok(stream) => stream,
             Err(err) => {
-                let close = should_close_rejected_request(req, false);
+                let (close, next) = close_mode_for_rejected_request(req, false);
                 let res = write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                     .await
                     .map_err(http_to_io);
-                return Err(res.map(|()| {
-                    if close {
-                        StreamNext::Close
-                    } else {
-                        StreamNext::Continue
-                    }
-                }));
+                return Err(res.map(|()| next));
             }
         };
 
-        let up_req = match prepare_expect_header(client, req).await {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => return Err(Ok(StreamNext::Close)),
+        let up_req = match send_100_continue_and_strip_expect(client, req, wants_100_continue).await
+        {
+            Ok(prepared) => prepared,
             Err(err) => return Err(Err(err)),
         };
 
         if let Err(err) = write_request_head(&mut upstream, &up_req).await {
-            let close = should_close_rejected_request(req, false);
+            let (close, next) = close_mode_for_rejected_request(req, false);
             let res = write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                 .await
                 .map_err(http_to_io);
-            return Err(res.map(|()| {
-                if close {
-                    StreamNext::Close
-                } else {
-                    StreamNext::Continue
-                }
-            }));
+            return Err(res.map(|()| next));
         }
 
         if let Err(err) = forward_body(client, &mut upstream, body_mode).await {
@@ -1304,7 +1303,7 @@ impl DockerCompatServer {
                 HttpError::InvalidChunk(_) | HttpError::MalformedHead(_) => {
                     let _ = write_json_error(client, 400, "Bad Request", &err.to_string(), true)
                         .await;
-                    return Err(Ok(StreamNext::Close));
+                    return Err(Ok(StreamNext::AbortEarly));
                 }
                 HttpError::Io(io_err) => {
                     let mut up_reader = PrefixedReader::new(upstream);
@@ -1344,8 +1343,7 @@ impl DockerCompatServer {
                             }
                             let _ = client.flush().await;
                         }
-                        shutdown_and_drain_after_early_abort(client).await;
-                        return Err(Ok(StreamNext::Close));
+                        return Err(Ok(StreamNext::AbortEarly));
                     }
                     let _ = write_json_error(
                         client,
@@ -1355,14 +1353,12 @@ impl DockerCompatServer {
                         true,
                     )
                     .await;
-                    shutdown_and_drain_after_early_abort(client).await;
-                    return Err(Ok(StreamNext::Close));
+                    return Err(Ok(StreamNext::AbortEarly));
                 }
                 _ => {
                     let _ = write_json_error(client, 502, "Bad Gateway", &err.to_string(), true)
                         .await;
-                    shutdown_and_drain_after_early_abort(client).await;
-                    return Err(Ok(StreamNext::Close));
+                    return Err(Ok(StreamNext::AbortEarly));
                 }
             }
         }
@@ -1414,10 +1410,17 @@ impl DockerCompatServer {
     }
 }
 
-fn should_close_rejected_request(req: &HttpRequestHead, body_consumed: bool) -> bool {
-    req.wants_close()
-        || req.wants_upgrade()
-        || (!body_consumed && !matches!(req.body_mode(), BodyMode::Empty))
+fn close_mode_for_rejected_request(req: &HttpRequestHead, body_consumed: bool) -> (bool, StreamNext) {
+    let has_unread_body = !body_consumed && !matches!(req.body_mode(), BodyMode::Empty);
+    let close = req.wants_close() || req.wants_upgrade() || has_unread_body;
+    let next = if has_unread_body {
+        StreamNext::AbortEarly
+    } else if close {
+        StreamNext::Close
+    } else {
+        StreamNext::Continue
+    };
+    (close, next)
 }
 
 async fn stream_upstream_response<S>(
@@ -1470,7 +1473,7 @@ where
     let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
     let mut discard = [0u8; 8192];
     let mut drained = 0usize;
-    const MAX_DRAIN_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_DRAIN_BYTES: usize = 64 * 1024 * 1024;
     while drained < MAX_DRAIN_BYTES {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1913,7 +1916,10 @@ fn decode_all_query_params(query: Option<&str>) -> Vec<(String, String)> {
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            (percent_decode(k), percent_decode(v))
+            (
+                percent_decode_query_component(k),
+                percent_decode_query_component(v),
+            )
         })
         .collect()
 }
@@ -1922,8 +1928,8 @@ fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     let q = query?;
     for pair in q.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if percent_decode(k) == key {
-            let decoded = percent_decode(v);
+        if percent_decode_query_component(k) == key {
+            let decoded = percent_decode_query_component(v);
             if !decoded.is_empty() {
                 return Some(decoded);
             }
@@ -1939,11 +1945,16 @@ fn query_has_truthy_param(query: Option<&str>, key: &str) -> bool {
     val == "1" || val.eq_ignore_ascii_case("true")
 }
 
-fn percent_decode(input: &str) -> String {
+fn percent_decode_bytes(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
+        if plus_as_space && bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
                 out.push((hi << 4) | lo);
@@ -1957,6 +1968,14 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn percent_decode(input: &str) -> String {
+    percent_decode_bytes(input, false)
+}
+
+fn percent_decode_query_component(input: &str) -> String {
+    percent_decode_bytes(input, true)
+}
+
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -1966,34 +1985,30 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-async fn prepare_expect_header<S>(
-    client: &mut PrefixedReader<S>,
-    req: &HttpRequestHead,
-) -> io::Result<Option<HttpRequestHead>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+fn validate_expect_header(req: &HttpRequestHead) -> Result<bool, String> {
     let mut has_100_continue = false;
     for (k, v) in &req.headers {
         if k.eq_ignore_ascii_case("expect") {
-            let trimmed = v.trim();
-            if trimmed.eq_ignore_ascii_case("100-continue") {
-                has_100_continue = true;
-            } else if !trimmed.is_empty() {
-                write_json_error(
-                    client,
-                    417,
-                    "Expectation Failed",
-                    &format!("unsupported Expect header value '{trimmed}'"),
-                    true,
-                )
-                .await
-                .map_err(http_to_io)?;
-                return Ok(None);
+            for token in v.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                if token.eq_ignore_ascii_case("100-continue") {
+                    has_100_continue = true;
+                } else {
+                    return Err(token.to_owned());
+                }
             }
         }
     }
+    Ok(has_100_continue)
+}
 
+async fn send_100_continue_and_strip_expect<S>(
+    client: &mut PrefixedReader<S>,
+    req: &HttpRequestHead,
+    has_100_continue: bool,
+) -> io::Result<HttpRequestHead>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if has_100_continue
         && req.version == "HTTP/1.1"
         && !matches!(req.body_mode(), BodyMode::Empty)
@@ -2005,7 +2020,34 @@ where
     let mut up_req = req.clone();
     up_req.version = "HTTP/1.1".to_owned();
     strip_headers(&mut up_req.headers, &["expect"]);
-    Ok(Some(up_req))
+    Ok(up_req)
+}
+
+async fn prepare_expect_header<S>(
+    client: &mut PrefixedReader<S>,
+    req: &HttpRequestHead,
+) -> io::Result<Option<HttpRequestHead>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let has_100_continue = match validate_expect_header(req) {
+        Ok(v) => v,
+        Err(bad_token) => {
+            write_json_error(
+                client,
+                417,
+                "Expectation Failed",
+                &format!("unsupported Expect header value '{bad_token}'"),
+                true,
+            )
+            .await
+            .map_err(http_to_io)?;
+            return Ok(None);
+        }
+    };
+    send_100_continue_and_strip_expect(client, req, has_100_continue)
+        .await
+        .map(Some)
 }
 
 fn response_allows_body(request_method: &str, status: u16) -> bool {
@@ -3353,5 +3395,131 @@ mod tests {
         assert!(early_head.wants_close());
         assert!(String::from_utf8_lossy(&early_body).contains("early upstream rejection"));
         early_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn query_plus_decoding_early_abort_drains_and_417_avoids_upstream() {
+        assert_eq!(
+            percent_decode_query_component("my+container%2Fname"),
+            "my container/name"
+        );
+        assert_eq!(percent_decode("keep+plus"), "keep+plus");
+        assert_eq!(
+            extract_query_param(Some("name=my+container&other=1"), "name").as_deref(),
+            Some("my container")
+        );
+
+        struct CountingNoUpstreamTunnel(Arc<AtomicU32>);
+        #[async_trait::async_trait]
+        impl RuntimeManager for CountingNoUpstreamTunnel {
+            async fn spawn(&self, _: SandboxSpec) -> Result<SandboxLease, SandboxError> { unreachable!() }
+            async fn renew_lease(&self, _: &SandboxId, _: Duration) -> Result<(), SandboxError> { unreachable!() }
+            async fn exec_stream(&self, _: &SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> { unreachable!() }
+            async fn copy_in(&self, _: &SandboxId, _: PathBuf, _: String) -> Result<(), SandboxError> { unreachable!() }
+            async fn copy_out(&self, _: &SandboxId, _: String, _: PathBuf) -> Result<(), SandboxError> { unreachable!() }
+            async fn destroy(&self, _: &SandboxId) -> Result<DestroyStatus, SandboxError> { unreachable!() }
+        }
+        #[async_trait::async_trait]
+        impl SandboxTunnelPort for CountingNoUpstreamTunnel {
+            async fn open_podman_unix_stream(&self, _: &SandboxId) -> Result<TunnelStream, SandboxError> {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Err(SandboxError::Transport("upstream must not be opened".to_owned()))
+            }
+            async fn open_guest_tcp_stream(&self, _: &SandboxId, _: u16) -> Result<TunnelStream, SandboxError> { unreachable!() }
+        }
+
+        let upstream_opens = Arc::new(AtomicU32::new(0));
+        let server = Arc::new(DockerCompatServer::new(
+            Arc::new(CountingNoUpstreamTunnel(Arc::clone(&upstream_opens)))
+                as Arc<dyn SandboxTunnelPort>,
+            SandboxId::new("sbx-abort-drain"),
+            DockerCompatPolicy::default(),
+        ));
+        let handle = server
+            .bind_loopback_http("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = handle.local_addr();
+
+        // Helper sending request header + streaming large chunked/fixed body while concurrently
+        // reading the complete early-abort HTTP response (verifying no Winsock TCP RST loss).
+        async fn stream_and_read_early_response(
+            addr: std::net::SocketAddr,
+            req_head: String,
+            body_bytes: usize,
+        ) -> HttpResponseHead {
+            let mut conn = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+            conn.write_all(req_head.as_bytes()).await.unwrap();
+            conn.flush().await.unwrap();
+            let write_chunk = vec![b'z'; 32 * 1024];
+            let mut remaining = body_bytes;
+            while remaining > 0 {
+                let n = remaining.min(write_chunk.len());
+                if conn.write_all(&write_chunk[..n]).await.is_err() {
+                    break;
+                }
+                remaining -= n;
+                tokio::task::yield_now().await;
+            }
+            let _ = conn.flush().await;
+            let resp_head = read_response_head(&mut conn).await.unwrap();
+            let _ = read_body_bytes(&mut conn, resp_head.body_mode("POST"), 8192)
+                .await
+                .unwrap();
+            resp_head
+        }
+
+        // 1. Disallowed query param (`tlsVerify=false`) with unread streaming body -> 400 + drained cleanly.
+        let r400 = stream_and_read_early_response(
+            addr,
+            format!(
+                "POST /v1.45/images/create?fromImage=alpine&tlsVerify=false HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                256 * 1024
+            ),
+            256 * 1024,
+        )
+        .await;
+        assert_eq!(r400.status, 400);
+        assert!(r400.wants_close());
+
+        // 2. Oversized sanitized body on POST /containers/create -> 413 + drained cleanly.
+        let r413 = stream_and_read_early_response(
+            addr,
+            format!(
+                "POST /v1.45/containers/create HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                5 * 1024 * 1024
+            ),
+            512 * 1024,
+        )
+        .await;
+        assert_eq!(r413.status, 413);
+        assert!(r413.wants_close());
+
+        // 3. Combined Expect header (`100-continue, bogus`) on passthrough route -> 417 BEFORE upstream open.
+        let mut conn_417 = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+        conn_417
+            .write_all(
+                b"POST /v1.45/images/create?fromSrc=- HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue, bogus\r\nContent-Length: 4\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        conn_417.flush().await.unwrap();
+        let r417 = read_response_head(&mut conn_417).await.unwrap();
+        assert_eq!(r417.status, 417);
+        assert_eq!(upstream_opens.load(Ordering::Acquire), 0);
+
+        // 4. `+` smuggling inside `fromImage` is decoded as whitespace and rejected (400).
+        let mut conn_plus = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+        let (r_plus, _) = send_http(
+            &mut conn_plus,
+            "POST",
+            "/v1.45/images/create?fromImage=alpine+latest",
+            None,
+        )
+        .await;
+        assert_eq!(r_plus.status, 400);
+        assert_eq!(upstream_opens.load(Ordering::Acquire), 0);
+
+        handle.shutdown().await;
     }
 }

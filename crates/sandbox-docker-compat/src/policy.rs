@@ -63,6 +63,7 @@ const KNOWN_MOUNT_FIELDS: &[&str] = &[
     "TmpfsOptions",
     "ReadOnly",
 ];
+const KNOWN_TMPFS_OPTIONS_FIELDS: &[&str] = &["SizeBytes", "Mode", "Options"];
 const KNOWN_VOLUME_OPTIONS_FIELDS: &[&str] = &["NoCopy", "Labels", "DriverConfig", "Subpath"];
 const KNOWN_DRIVER_CONFIG_FIELDS: &[&str] = &["Name", "Options"];
 const KNOWN_PORT_BINDING_FIELDS: &[&str] = &["HostIp", "HostPort"];
@@ -163,9 +164,8 @@ impl std::error::Error for PolicyRejection {}
 
 /// Validates query parameters on Docker `POST /images/create`.
 ///
-/// Rejects local archive transports, non-URL local paths in `fromSrc` (allowing `"-"` for tarball
-/// upload or public `http`/`https` URLs without internal/SSRF hosts), control characters, and
-/// smuggled container/build privilege parameters.
+/// Rejects unallowlisted query keys, local archive transports, non-URL paths or non-public/SSRF
+/// destinations in `fromSrc`, invalid tags/platforms, whitespace, and control characters.
 pub fn validate_image_create_query(params: &[(String, String)]) -> Result<(), PolicyRejection> {
     for (raw_key, val) in params {
         if !raw_key.is_ascii()
@@ -180,14 +180,16 @@ pub fn validate_image_create_query(params: &[(String, String)]) -> Result<(), Po
         let key = raw_key.to_ascii_lowercase();
         match key.as_str() {
             "fromsrc" => validate_image_create_from_src(val)?,
-            "fromimage" => validate_image_create_from_image(val)?,
-            "securityopt" | "capadd" | "cgroupparent" | "privileged" | "networkmode" | "volume"
-            | "volumesfrom" | "outputs" | "remote" | "storageopt" | "devices" => {
+            "fromimage" => validate_image_create_from_image(val, "fromImage")?,
+            "repo" => validate_image_create_from_image(val, "repo")?,
+            "tag" => validate_image_create_tag(val)?,
+            "message" | "changes" => {}
+            "platform" => validate_image_create_platform(val)?,
+            _ => {
                 return Err(PolicyRejection::new(format!(
                     "POST /images/create parameter '{raw_key}' is forbidden by security policy"
                 )));
             }
-            _ => {}
         }
     }
     Ok(())
@@ -197,11 +199,15 @@ fn validate_image_create_from_src(val: &str) -> Result<(), PolicyRejection> {
     if val.is_empty() || val == "-" {
         return Ok(());
     }
-    let lower = val.to_ascii_lowercase();
-    let rest = if let Some(r) = lower.strip_prefix("http://") {
-        &val["http://".len()..val.len().min("http://".len() + r.len())]
-    } else if let Some(r) = lower.strip_prefix("https://") {
-        &val["https://".len()..val.len().min("https://".len() + r.len())]
+    if val.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' must not contain whitespace"
+        )));
+    }
+    let rest = if val.len() >= "http://".len() && val[.."http://".len()].eq_ignore_ascii_case("http://") {
+        &val["http://".len()..]
+    } else if val.len() >= "https://".len() && val[.."https://".len()].eq_ignore_ascii_case("https://") {
+        &val["https://".len()..]
     } else {
         return Err(PolicyRejection::new(format!(
             "POST /images/create fromSrc '{val}' must be '-' or a public http(s) URL"
@@ -215,7 +221,7 @@ fn validate_image_create_from_src(val: &str) -> Result<(), PolicyRejection> {
         )));
     }
 
-    let host = if authority.starts_with('[') {
+    if authority.starts_with('[') {
         let Some(end) = authority.find(']') else {
             return Err(PolicyRejection::new(format!(
                 "POST /images/create fromSrc '{val}' has an invalid IPv6 host"
@@ -225,104 +231,119 @@ fn validate_image_create_from_src(val: &str) -> Result<(), PolicyRejection> {
         if !suffix.is_empty()
             && suffix
                 .strip_prefix(':')
-                .is_none_or(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+                .is_none_or(|p| p.is_empty() || p.parse::<u16>().is_err())
         {
             return Err(PolicyRejection::new(format!(
                 "POST /images/create fromSrc '{val}' has an invalid host port"
             )));
         }
-        &authority[1..end]
-    } else if let Some((h, p)) = authority.rsplit_once(':') {
-        if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
-            h
-        } else {
-            authority
+        let ipv6_raw = &authority[1..end];
+        let v6 = ipv6_raw.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            PolicyRejection::new(format!(
+                "POST /images/create fromSrc '{val}' has an invalid bracketed IPv6 literal"
+            ))
+        })?;
+        if sandbox_runtime::is_forbidden_ip(std::net::IpAddr::V6(v6)) {
+            return Err(PolicyRejection::new(format!(
+                "POST /images/create fromSrc '{val}' targets a non-public IP address"
+            )));
         }
-    } else {
-        authority
-    };
+        return Ok(());
+    }
+
+    if authority.contains(']') {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' has an invalid authority"
+        )));
+    }
+    let mut parts = authority.split(':');
+    let host = parts.next().unwrap_or("");
+    if let Some(port) = parts.next() {
+        if parts.next().is_some() || port.is_empty() || port.parse::<u16>().is_err() {
+            return Err(PolicyRejection::new(format!(
+                "POST /images/create fromSrc '{val}' has an invalid host port"
+            )));
+        }
+    }
 
     let host_trimmed = host.trim_end_matches('.');
-    let host_lower = host_trimmed.to_ascii_lowercase();
-    if host_lower.is_empty()
-        || host_lower.contains('%')
-        || host_lower == "localhost"
-        || host_lower.ends_with(".localhost")
-        || host_lower.ends_with(".local")
-        || host_lower.ends_with(".internal")
-        || host_lower.ends_with(".localdomain")
-        || matches!(host_lower.as_str(), "ip6-localhost" | "ip6-loopback")
-    {
+    if host_trimmed.is_empty() || host_trimmed.contains('%') {
         return Err(PolicyRejection::new(format!(
             "POST /images/create fromSrc '{val}' targets a forbidden local/internal host"
         )));
     }
 
     if let Ok(ip) = host_trimmed.parse::<std::net::IpAddr>() {
-        if is_non_public_image_src_ip(ip) {
+        if sandbox_runtime::is_forbidden_ip(ip) {
             return Err(PolicyRejection::new(format!(
                 "POST /images/create fromSrc '{val}' targets a non-public IP address"
             )));
         }
+        return Ok(());
+    }
+
+    let normalized = sandbox_core::normalize_egress_domain(host_trimmed).map_err(|err| {
+        PolicyRejection::new(format!("POST /images/create fromSrc '{val}' invalid host: {err}"))
+    })?;
+    if normalized.contains('*')
+        || !normalized.contains('.')
+        || normalized == "localhost"
+        || normalized.ends_with(".localhost")
+        || normalized.ends_with(".local")
+        || normalized.ends_with(".internal")
+        || normalized.ends_with(".localdomain")
+        || matches!(normalized.as_str(), "ip6-localhost" | "ip6-loopback")
+    {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' targets a forbidden local/internal host"
+        )));
+    }
+
+    let labels: Vec<&str> = normalized.split('.').collect();
+    let tld = labels.last().copied().unwrap_or("");
+    let is_numeric_or_hex_label = |label: &str| {
+        !label.is_empty()
+            && (label.bytes().all(|b| b.is_ascii_digit())
+                || (label.starts_with("0x")
+                    && label.len() > 2
+                    && label[2..].bytes().all(|b| b.is_ascii_hexdigit())))
+    };
+    if is_numeric_or_hex_label(tld) || labels.iter().all(|l| is_numeric_or_hex_label(l)) {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' uses a disallowed non-canonical numeric/hex host"
+        )));
     }
 
     Ok(())
 }
 
-fn is_non_public_image_src_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let [a, b, c, _] = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || a == 0 // 0.0.0.0/8 "this host"
-                || (a == 100 && (64..=127).contains(&b)) // RFC 6598 CGNAT 100.64.0.0/10
-                || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
-                || (a == 192 && b == 0 && c == 2) // TEST-NET-1
-                || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
-                || (a == 198 && b == 51 && c == 100) // TEST-NET-2
-                || (a == 203 && b == 0 && c == 113) // TEST-NET-3
-                || a >= 240
-        }
-        std::net::IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_non_public_image_src_ip(std::net::IpAddr::V4(mapped));
-            }
-            let seg = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
-                || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0)
-                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0)
-                || seg[0] == 0x2002
-                || (seg[0] == 0x2001 && seg[1] == 0)
-        }
-    }
-}
-
-fn validate_image_create_from_image(val: &str) -> Result<(), PolicyRejection> {
+fn validate_image_create_from_image(val: &str, label: &str) -> Result<(), PolicyRejection> {
     if val.is_empty() {
         return Ok(());
     }
+    if val.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create {label} '{val}' must not contain whitespace"
+        )));
+    }
     if val.starts_with('/') || val.starts_with('\\') || val.contains('\\') || val.contains("..") {
         return Err(PolicyRejection::new(format!(
-            "POST /images/create fromImage '{val}' contains a forbidden filesystem path"
+            "POST /images/create {label} '{val}' contains a forbidden filesystem path"
         )));
     }
     let lower = val.to_ascii_lowercase();
     if lower.contains("://") && !lower.starts_with("docker://") {
         return Err(PolicyRejection::new(format!(
-            "POST /images/create fromImage '{val}' uses a forbidden URL scheme"
+            "POST /images/create {label} '{val}' uses a forbidden URL scheme"
         )));
     }
-    let head = lower.split('/').next().unwrap_or("");
+    let check_target = lower.strip_prefix("docker://").unwrap_or(&lower);
+    if check_target.is_empty() {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create {label} '{val}' cannot have an empty registry reference"
+        )));
+    }
+    let head = check_target.split('/').next().unwrap_or("");
     for transport in [
         "dir:",
         "oci:",
@@ -338,9 +359,61 @@ fn validate_image_create_from_image(val: &str) -> Result<(), PolicyRejection> {
     ] {
         if head.starts_with(transport) {
             return Err(PolicyRejection::new(format!(
-                "POST /images/create fromImage '{val}' uses forbidden local/non-registry transport '{transport}'"
+                "POST /images/create {label} '{val}' uses forbidden local/non-registry transport '{transport}'"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_image_create_tag(val: &str) -> Result<(), PolicyRejection> {
+    if val.is_empty() {
+        return Ok(());
+    }
+    if val.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create tag '{val}' must not contain whitespace"
+        )));
+    }
+    if let Some(hex) = val.strip_prefix("sha256:") {
+        if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(());
+        }
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create tag '{val}' has an invalid sha256 digest"
+        )));
+    }
+    let valid = val.len() <= 128
+        && !val.contains("..")
+        && val.bytes().enumerate().all(|(idx, b)| {
+            if idx == 0 {
+                b.is_ascii_alphanumeric() || b == b'_'
+            } else {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+            }
+        });
+    if !valid {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create tag '{val}' contains forbidden characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_image_create_platform(val: &str) -> Result<(), PolicyRejection> {
+    if val.is_empty() {
+        return Ok(());
+    }
+    if val.bytes().any(|b| b.is_ascii_whitespace())
+        || val.contains('\\')
+        || val.contains("..")
+        || val.contains(':')
+        || val.starts_with('/')
+        || val.ends_with('/')
+    {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create platform '{val}' is invalid"
+        )));
     }
     Ok(())
 }
@@ -1148,18 +1221,7 @@ fn validate_host_config_security(
                 let opts = opts_val.as_str().ok_or_else(|| {
                     PolicyRejection::new("HostConfig.Tmpfs option values must be strings")
                 })?;
-                if opts.contains('\0') {
-                    return Err(PolicyRejection::new(
-                        "HostConfig.Tmpfs option contains NUL byte",
-                    ));
-                }
-                for opt in opts.split(',').map(str::trim).filter(|o| !o.is_empty()) {
-                    if opt.eq_ignore_ascii_case("suid") || opt.eq_ignore_ascii_case("dev") {
-                        return Err(PolicyRejection::new(format!(
-                            "HostConfig.Tmpfs mount option '{opt}' is forbidden"
-                        )));
-                    }
-                }
+                validate_tmpfs_option_token(opts, "HostConfig.Tmpfs")?;
             }
         }
     }
@@ -1329,7 +1391,41 @@ fn sanitize_bind_mount(
     )))
 }
 
-fn sanitize_tmpfs_mount(obj: &Map<String, Value>) -> Result<(), PolicyRejection> {
+fn validate_tmpfs_option_token(opts: &str, ctx: &str) -> Result<(), PolicyRejection> {
+    if opts.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(PolicyRejection::new(format!(
+            "{ctx} option contains forbidden NUL or control character"
+        )));
+    }
+    for raw in opts.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+        let (key, val_opt) = raw.split_once('=').map_or((raw, None), |(k, v)| (k.trim(), Some(v.trim())));
+        if key.eq_ignore_ascii_case("suid") || key.eq_ignore_ascii_case("dev") {
+            return Err(PolicyRejection::new(format!(
+                "{ctx} mount option '{raw}' is forbidden"
+            )));
+        }
+        if key.eq_ignore_ascii_case("mode") {
+            let Some(mode_str) = val_opt else {
+                return Err(PolicyRejection::new(format!(
+                    "{ctx} mount option '{raw}' requires an octal mode value"
+                )));
+            };
+            let perm = u32::from_str_radix(mode_str, 8).map_err(|_| {
+                PolicyRejection::new(format!(
+                    "{ctx} mount option '{raw}' has invalid octal mode"
+                ))
+            })?;
+            if perm > 0o1777 {
+                return Err(PolicyRejection::new(format!(
+                    "{ctx} mount mode '{mode_str}' exceeds maximum permitted 01777"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_tmpfs_mount(obj: &mut Map<String, Value>) -> Result<(), PolicyRejection> {
     let target = obj
         .get("Target")
         .and_then(Value::as_str)
@@ -1344,6 +1440,67 @@ fn sanitize_tmpfs_mount(obj: &Map<String, Value>) -> Result<(), PolicyRejection>
             return Err(PolicyRejection::new(
                 "tmpfs mount cannot specify a host Source",
             ));
+        }
+    }
+    if let Some(tmpfs_opts) = obj.get_mut("TmpfsOptions") {
+        if !tmpfs_opts.is_null() {
+            let opts_obj = tmpfs_opts.as_object_mut().ok_or_else(|| {
+                PolicyRejection::new("TmpfsOptions must be a JSON object")
+            })?;
+            canonicalize_struct_keys(opts_obj, KNOWN_TMPFS_OPTIONS_FIELDS, "TmpfsOptions")?;
+            if let Some(size_val) = opts_obj.get("SizeBytes") {
+                if !size_val.is_null() && !size_val.as_i64().is_some_and(|v| v >= 0) {
+                    return Err(PolicyRejection::new(
+                        "TmpfsOptions.SizeBytes must be a non-negative integer",
+                    ));
+                }
+            }
+            if let Some(mode_val) = opts_obj.get("Mode") {
+                if !mode_val.is_null() && !mode_val.as_u64().is_some_and(|m| m <= 0o1777) {
+                    return Err(PolicyRejection::new(
+                        "TmpfsOptions.Mode must be an integer <= 01777",
+                    ));
+                }
+            }
+            if let Some(options_val) = opts_obj.get("Options") {
+                if !options_val.is_null() {
+                    let outer = options_val.as_array().ok_or_else(|| {
+                        PolicyRejection::new("TmpfsOptions.Options must be a JSON array")
+                    })?;
+                    for pair_val in outer {
+                        let pair = pair_val.as_array().ok_or_else(|| {
+                            PolicyRejection::new(
+                                "TmpfsOptions.Options entries must be string arrays",
+                            )
+                        })?;
+                        if pair.is_empty() || pair.len() > 2 {
+                            return Err(PolicyRejection::new(
+                                "TmpfsOptions.Options entries must contain 1 or 2 strings",
+                            ));
+                        }
+                        let k = pair[0].as_str().ok_or_else(|| {
+                            PolicyRejection::new("TmpfsOptions.Options entries must be strings")
+                        })?;
+                        if k.trim().is_empty() {
+                            return Err(PolicyRejection::new(
+                                "TmpfsOptions.Options entry cannot be empty",
+                            ));
+                        }
+                        if pair.len() == 2 {
+                            let v = pair[1].as_str().ok_or_else(|| {
+                                PolicyRejection::new("TmpfsOptions.Options entries must be strings")
+                            })?;
+                            validate_tmpfs_option_token(k, "TmpfsOptions.Options")?;
+                            validate_tmpfs_option_token(
+                                &format!("{}={}", k.trim(), v.trim()),
+                                "TmpfsOptions.Options",
+                            )?;
+                        } else {
+                            validate_tmpfs_option_token(k, "TmpfsOptions.Options")?;
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2225,10 +2382,73 @@ mod tests {
 
         assert!(validate_image_create_query(&[("fromImage".into(), "alpine:latest".into())]).is_ok());
         assert!(validate_image_create_query(&[("fromSrc".into(), "-".into())]).is_ok());
+        assert!(validate_image_create_query(&[("fromSrc".into(), "https://example.com/img.tar".into())]).is_ok());
+        assert!(validate_image_create_query(&[("repo".into(), "my-repo".into()), ("tag".into(), "v1.0".into())]).is_ok());
         assert!(validate_image_create_query(&[("fromSrc".into(), "/etc/passwd".into())]).is_err());
         assert!(
             validate_image_create_query(&[("fromSrc".into(), "http://127.0.0.1/img.tar".into())])
                 .is_err()
         );
+
+        // Hardened POST /images/create query & non-canonical fromSrc SSRF bypasses:
+        for forbidden_query in [
+            vec![("repo".into(), "dir:/etc".into())],
+            vec![("fromImage".into(), "alpine latest".into())],
+            vec![("fromImage".into(), "alpine".into()), ("tlsVerify".into(), "false".into())],
+            vec![("tag".into(), "../bad".into())],
+            vec![("platform".into(), "linux/amd64:bad".into())],
+            vec![("fromSrc".into(), "http://2130706433/img.tar".into())],
+            vec![("fromSrc".into(), "http://0x7f000001/img.tar".into())],
+            vec![("fromSrc".into(), "http://0177.0.0.1/img.tar".into())],
+            vec![("fromSrc".into(), "http://127.1/img.tar".into())],
+            vec![("fromSrc".into(), "http://[::ffff:127.0.0.1]/img.tar".into())],
+            vec![("fromSrc".into(), "http://[3fff::1]/img.tar".into())],
+            vec![("fromSrc".into(), "http://metadata.google.internal/img.tar".into())],
+            vec![("fromSrc".into(), "http://singlelabel/img.tar".into())],
+            vec![("fromSrc".into(), "http://*.example.com/img.tar".into())],
+            vec![("fromSrc".into(), "https://ex ample.com/img.tar".into())],
+        ] {
+            assert!(
+                validate_image_create_query(&forbidden_query).is_err(),
+                "expected POST /images/create rejection for {forbidden_query:?}"
+            );
+        }
+
+        // Hardened Mounts[].TmpfsOptions & HostConfig.Tmpfs mode enforcement:
+        for forbidden_tmpfs in [
+            json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"rw,mode=4755"}}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Mode":0o4755}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"SizeBytes":-1}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["suid"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["dev"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["mode","4755"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["rw,suid"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"UnknownField":1}}]}}),
+        ] {
+            let raw = serde_json::to_vec(&forbidden_tmpfs).unwrap();
+            assert!(
+                sanitize_container_create(&raw, &policy).is_err(),
+                "expected tmpfs policy rejection for {forbidden_tmpfs}"
+            );
+        }
+        assert!(sanitize_container_create(
+            &serde_json::to_vec(&json!({
+                "Image": "alpine",
+                "HostConfig": {
+                    "Mounts": [{
+                        "Type": "tmpfs",
+                        "Target": "/run",
+                        "TmpfsOptions": {
+                            "SizeBytes": 67_108_864,
+                            "Mode": 0o1777,
+                            "Options": [["noexec"], ["mode", "0755"]]
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+            &policy
+        )
+        .is_ok());
     }
 }
