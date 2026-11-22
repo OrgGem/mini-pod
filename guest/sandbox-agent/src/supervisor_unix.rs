@@ -66,31 +66,39 @@ pub(crate) struct ExecScope {
 }
 
 impl ExecScope {
-    /// Creates a fresh per-exec cgroup v2 scope on Linux if `/sys/fs/cgroup` is writable,
-    /// falling back gracefully to process-group + `/proc` tree tracking in unprivileged host tests.
-    pub(crate) fn prepare(stream_id: StreamId, is_container_exec: bool) -> Self {
+    /// Host-side protocol tests may lack a delegated cgroup. In the VM a requested
+    /// limit must be installed before the first workload process is allowed to start.
+    pub(crate) fn prepare(
+        stream_id: StreamId,
+        is_container_exec: bool,
+        pids_max: Option<u32>,
+    ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            if let Some((dir, procs_file)) = try_create_linux_exec_cgroup(stream_id) {
-                return Self {
-                    cgroup_dir: Some(dir),
-                    spawn_procs_file: Mutex::new(Some(procs_file)),
-                    is_container_exec,
-                    leader_starttime: AtomicU64::new(0),
-                };
+            match create_linux_exec_cgroup(stream_id, pids_max) {
+                Ok((dir, procs_file)) => {
+                    return Ok(Self {
+                        cgroup_dir: Some(dir),
+                        spawn_procs_file: Mutex::new(Some(procs_file)),
+                        is_container_exec,
+                        leader_starttime: AtomicU64::new(0),
+                    })
+                }
+                Err(error) if pids_max.is_some() => return Err(error),
+                Err(_) => {}
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = stream_id;
+        let _ = (stream_id, pids_max);
 
-        Self {
+        Ok(Self {
             #[cfg(target_os = "linux")]
             cgroup_dir: None,
             spawn_procs_file: Mutex::new(None),
             is_container_exec,
             #[cfg(target_os = "linux")]
             leader_starttime: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Captures the unreaped leader's `/proc/<pid>/stat` `starttime` right after `spawn()` so
@@ -203,8 +211,18 @@ fn resolve_writable_cgroup_parent() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn try_create_linux_exec_cgroup(stream_id: StreamId) -> Option<(PathBuf, File)> {
-    let parent = resolve_writable_cgroup_parent();
+fn create_linux_exec_cgroup(
+    stream_id: StreamId,
+    pids_max: Option<u32>,
+) -> io::Result<(PathBuf, File)> {
+    let parent = if pids_max.is_some() {
+        // The guest owns this cgroup mount. The agent remains outside each capped leaf.
+        let root = Path::new(CGROUP_ROOT);
+        fs::write(root.join("cgroup.subtree_control"), "+pids")?;
+        root.to_path_buf()
+    } else {
+        resolve_writable_cgroup_parent()
+    };
     let seq = NEXT_EXEC_SCOPE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = parent.join(format!(
         "minipod-exec-{}-{}-{}",
@@ -212,12 +230,20 @@ fn try_create_linux_exec_cgroup(stream_id: StreamId) -> Option<(PathBuf, File)> 
         stream_id.0,
         seq
     ));
-    fs::create_dir(&dir).ok()?;
-    match OpenOptions::new().write(true).open(dir.join("cgroup.procs")) {
-        Ok(file) => Some((dir, file)),
-        Err(_) => {
+    fs::create_dir(&dir)?;
+    let open = || {
+        if let Some(limit) = pids_max {
+            fs::write(dir.join("pids.max"), limit.to_string())?;
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join("cgroup.procs"))
+    };
+    match open() {
+        Ok(file) => Ok((dir, file)),
+        Err(error) => {
             let _ = fs::remove_dir(&dir);
-            None
+            Err(error)
         }
     }
 }
@@ -268,6 +294,60 @@ fn is_pid_in_container_cgroup(pid: i32) -> bool {
         return false;
     };
     cg.contains("libpod-") || cg.contains("machine.slice") || cg.contains("/container")
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn current_euid() -> libc::uid_t {
+    // SAFETY: `geteuid()` takes no pointers and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn collect_conmon_exec_targets<F>(
+    exec_pid: i32,
+    conmon_pid: i32,
+    effective_min: u64,
+    self_pid: i32,
+    table: &[ProcStatEntry],
+    lookup_entry: F,
+    in_container_cgroup: impl Fn(i32) -> bool,
+) -> Vec<(i32, u64)>
+where
+    F: FnOnce(i32) -> Option<ProcStatEntry>,
+{
+    let maybe_entry = table
+        .iter()
+        .copied()
+        .find(|e| e.pid == exec_pid)
+        .or_else(|| lookup_entry(exec_pid));
+
+    let mut discovered = Vec::new();
+    let mut exec_reused_by_older = false;
+    if let Some(exec_entry) = maybe_entry {
+        if exec_entry.starttime < effective_min {
+            exec_reused_by_older = true;
+        } else if exec_entry.ppid == conmon_pid || in_container_cgroup(exec_pid) {
+            discovered.push((exec_pid, exec_entry.starttime));
+        }
+    }
+
+    // Even if `exec_pid` exited and was reaped before cleanup ran, surviving children
+    // reparented to container PID 1 keep its `pgrp` or `session` ID inside the container cgroup.
+    if !exec_reused_by_older && exec_pid > 1 {
+        for entry in table {
+            if entry.pid != self_pid
+                && entry.pid != exec_pid
+                && entry.starttime >= effective_min
+                && (entry.pgrp == exec_pid || entry.session == exec_pid)
+                && in_container_cgroup(entry.pid)
+            {
+                discovered.push((entry.pid, entry.starttime));
+            }
+        }
+    }
+
+    discovered
 }
 
 #[cfg(target_os = "linux")]
@@ -330,21 +410,16 @@ fn discover_conmon_exec_pids(
             continue;
         }
 
-        let maybe_entry = table
-            .iter()
-            .copied()
-            .find(|e| e.pid == exec_pid)
-            .or_else(|| read_proc_stat_entry(exec_pid));
-        let Some(exec_entry) = maybe_entry else {
-            continue;
-        };
         let effective_min = min_starttime.max(conmon_start);
-        if exec_entry.starttime < effective_min {
-            continue;
-        }
-        if exec_entry.ppid == pid || is_pid_in_container_cgroup(exec_pid) {
-            discovered.push((exec_pid, exec_entry.starttime));
-        }
+        discovered.extend(collect_conmon_exec_targets(
+            exec_pid,
+            pid,
+            effective_min,
+            self_pid,
+            table,
+            read_proc_stat_entry,
+            is_pid_in_container_cgroup,
+        ));
     }
     discovered
 }
@@ -823,7 +898,7 @@ mod tests {
             }
         };
 
-        let scope = ExecScope::prepare(StreamId(900), false);
+        let scope = ExecScope::prepare(StreamId(900), false, None).unwrap();
         let mut id_cmd = Command::new("id");
         id_cmd.arg("-G").stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_exec_command(&mut id_cmd, Some(target_user), &scope);
@@ -841,7 +916,7 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let scope2 = std::sync::Arc::new(ExecScope::prepare(StreamId(901), false));
+            let scope2 = std::sync::Arc::new(ExecScope::prepare(StreamId(901), false, None).unwrap());
             let scope2_bg = std::sync::Arc::clone(&scope2);
             let mut child = thread::spawn(move || {
                 let mut cmd = Command::new("/bin/sleep");
@@ -875,5 +950,55 @@ mod tests {
                 "PR_SET_PDEATHSIG must remain armed after setgroups/setgid/setuid"
             );
         }
+    }
+
+    #[test]
+    fn collect_conmon_exec_targets_recovers_reparented_children_after_leader_reaped() {
+        let exec_pid = 4200;
+        let conmon_pid = 4100;
+        let child_pgrp = ProcStatEntry {
+            pid: 4205,
+            state: 'S',
+            ppid: 1,
+            pgrp: exec_pid,
+            session: 99,
+            starttime: 550,
+        };
+        let child_sid = ProcStatEntry {
+            pid: 4206,
+            state: 'S',
+            ppid: 1,
+            pgrp: 5000,
+            session: exec_pid,
+            starttime: 551,
+        };
+        let older_unrelated = ProcStatEntry {
+            pid: 4207,
+            state: 'S',
+            ppid: 1,
+            pgrp: exec_pid,
+            session: exec_pid,
+            starttime: 100,
+        };
+        let outside_cgroup = ProcStatEntry {
+            pid: 4208,
+            state: 'S',
+            ppid: 1,
+            pgrp: exec_pid,
+            session: exec_pid,
+            starttime: 560,
+        };
+        let table = [child_pgrp, child_sid, older_unrelated, outside_cgroup];
+
+        let found = collect_conmon_exec_targets(
+            exec_pid,
+            conmon_pid,
+            500,
+            9000,
+            &table,
+            |_| None,
+            |pid| pid != outside_cgroup.pid,
+        );
+        assert_eq!(found, vec![(4205, 550), (4206, 551)]);
     }
 }

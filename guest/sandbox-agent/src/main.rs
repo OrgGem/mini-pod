@@ -31,6 +31,8 @@ use crate::tunnel::{run_tunnel, validate_connect_request, ActiveTunnel};
 
 const VIRTIO_PORT_CANDIDATES: [&str; 2] =
     ["/dev/virtio-ports/org.minipod.agent.0", "/dev/vport0p1"];
+/// Counts Linux tasks (threads included) across the workload and its descendants.
+const GUEST_EXEC_PIDS_MAX: u32 = 128;
 const PORT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const PORT_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -379,6 +381,7 @@ fn closed_error(state: &OutboundState) -> ProtocolError {
 pub fn serve_session<R: Read + Send, W: Write + Send>(
     reader: &mut R,
     writer: &mut W,
+    guest_exec_pids_max: Option<u32>,
 ) -> Result<(), ProtocolError> {
     // Guest initiates handshake so virtio-serial never drops early host frames before port open.
     send_message(
@@ -507,6 +510,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         .insert(stream_id, handle.clone());
 
                     let spec = ExecSpec {
+                        guest_exec_pids_max,
                         stream_id,
                         target,
                         argv,
@@ -958,7 +962,7 @@ fn main() -> ExitCode {
     };
 
     eprintln!("[sandbox-agent] connected on {path}");
-    match serve_session(&mut reader, &mut writer) {
+    match serve_session(&mut reader, &mut writer, Some(GUEST_EXEC_PIDS_MAX)) {
         Ok(()) => {
             eprintln!("[sandbox-agent] session exited cleanly");
             ExitCode::SUCCESS
@@ -1075,7 +1079,7 @@ mod tests {
         thread::JoinHandle<Result<(), ProtocolError>>,
     ) {
         let ((mut host_rx, mut host_tx), (mut agent_rx, mut agent_tx)) = duplex_pair();
-        let agent = thread::spawn(move || serve_session(&mut agent_rx, &mut agent_tx));
+        let agent = thread::spawn(move || serve_session(&mut agent_rx, &mut agent_tx, None));
 
         let hello = read_frame(&mut host_rx).expect("guest must emit Hello first");
         assert_eq!(hello.header.stream_id, StreamId(0));
@@ -1382,7 +1386,7 @@ mod tests {
         let mut reader = Cursor::new(bad_ver);
         let mut writer = Vec::new();
         assert_eq!(
-            serve_session(&mut reader, &mut writer),
+            serve_session(&mut reader, &mut writer, None),
             Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION + 1))
         );
 
@@ -1390,7 +1394,7 @@ mod tests {
         let mut reader = Cursor::new(wrong_msg);
         let mut writer = Vec::new();
         assert!(matches!(
-            serve_session(&mut reader, &mut writer),
+            serve_session(&mut reader, &mut writer, None),
             Err(ProtocolError::InvalidPayload(_))
         ));
     }
@@ -1406,7 +1410,7 @@ mod tests {
         )]);
         let mut reader = Cursor::new(input);
         let mut writer = Vec::new();
-        serve_session(&mut reader, &mut writer).expect("clean EOF should return Ok(())");
+        serve_session(&mut reader, &mut writer, None).expect("clean EOF should return Ok(())");
 
         let mut out_cursor = Cursor::new(writer);
         let hello = read_frame(&mut out_cursor).unwrap();

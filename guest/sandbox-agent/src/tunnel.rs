@@ -333,11 +333,14 @@ pub(crate) fn relay_tunnel_socket(
     thread::scope(|scope| {
         let writer_handle = Arc::clone(handle);
         let writer_thread = scope.spawn(move || {
-            pump_tunnel_writer(stream_id, stdin_rx, &mut writer_sock, &writer_handle, outbound);
+            pump_tunnel_writer(stream_id, stdin_rx, &mut writer_sock, &writer_handle, outbound)
         });
 
         let read_res = pump_tunnel_reader(stream_id, &mut reader_sock, handle, outbound);
-        let _ = writer_thread.join();
+        let write_failed = writer_thread.join().unwrap_or(false);
+        if read_res.is_ok() && write_failed && !handle.is_closed() {
+            outbound.enqueue_control_after_data(stream_id, &Message::StreamClose)?;
+        }
         read_res
     })
 }
@@ -391,7 +394,7 @@ fn pump_tunnel_writer(
     writer: &mut TunnelSocket,
     handle: &ActiveTunnel,
     outbound: &OutboundQueue,
-) {
+) -> bool {
     while let Ok(TunnelInput::Data { data, eof }) = stdin_rx.recv() {
         let len = data.len();
         if handle.is_closed() {
@@ -400,8 +403,9 @@ fn pump_tunnel_writer(
         }
         if len > 0 && writer.write_all(&data).is_err() {
             handle.release_stdin_bytes(len);
+            handle.close_stdin_only();
             let _ = writer.shutdown(Shutdown::Write);
-            break;
+            return true;
         }
         handle.release_stdin_bytes(len);
         if len > 0 && !eof {
@@ -412,6 +416,7 @@ fn pump_tunnel_writer(
             break;
         }
     }
+    false
 }
 
 fn pump_tunnel_reader(
@@ -713,5 +718,88 @@ mod tests {
         let close_frame = outbound.pop_for_writer().expect("StreamClose expected");
         assert_eq!(close_frame.header.stream_id, stream_id);
         assert_eq!(close_frame.decode_message().unwrap(), Message::StreamClose);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_tunnel_emits_stream_close_after_early_peer_read_shutdown() {
+        let (host_side, mut peer) = UnixStream::pair().unwrap();
+        let reader_sock = TunnelSocket::Unix(host_side.try_clone().unwrap());
+        let writer_sock = TunnelSocket::Unix(host_side);
+
+        let outbound = Arc::new(OutboundQueue::new());
+        let stream_id = StreamId(15);
+        outbound.seed_default_credit(stream_id, StreamChannel::Stdout, 1_048_576);
+        let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            peer.shutdown(Shutdown::Read).unwrap();
+            let _ = closed_tx.send(());
+            peer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let drain_outbound = Arc::clone(&outbound);
+        let drainer = thread::spawn(move || {
+            let mut frames = Vec::new();
+            while let Some(frame) = drain_outbound.pop_for_writer() {
+                frames.push(frame);
+            }
+            frames
+        });
+
+        let worker_outbound = Arc::clone(&outbound);
+        let worker_handle = Arc::clone(&handle);
+        let worker = thread::spawn(move || {
+            relay_tunnel_socket(
+                stream_id,
+                reader_sock,
+                writer_sock,
+                &worker_handle,
+                stdin_rx,
+                &worker_outbound,
+            )
+            .unwrap();
+        });
+
+        closed_rx.recv().unwrap();
+        handle.push_stdin(vec![b'P'; 1024], false, &outbound);
+
+        worker.join().unwrap();
+        server.join().unwrap();
+        outbound.finish_and_drain();
+        let frames = drainer.join().unwrap();
+
+        let mut resp = Vec::new();
+        let mut eof_idx = None;
+        let mut close_idx = None;
+        for (idx, frame) in frames.iter().enumerate() {
+            match frame.decode_message().unwrap() {
+                Message::StreamData {
+                    channel: StreamChannel::Stdout,
+                    eof,
+                    data,
+                } => {
+                    resp.extend_from_slice(&data);
+                    if eof {
+                        eof_idx = Some(idx);
+                    }
+                }
+                Message::StreamClose => close_idx = Some(idx),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+        );
+        let eof_idx = eof_idx.expect("Stdout EOF expected");
+        let close_idx = close_idx.expect("StreamClose after early peer Shutdown::Read expected");
+        assert!(
+            close_idx > eof_idx,
+            "StreamClose ({close_idx}) must arrive after Stdout EOF ({eof_idx})"
+        );
     }
 }

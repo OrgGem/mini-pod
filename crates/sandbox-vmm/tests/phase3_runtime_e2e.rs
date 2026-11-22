@@ -75,7 +75,8 @@ fn repo_root() -> PathBuf {
 fn discover_fixtures(test_name: &str) -> Option<TestFixtures> {
     let arch = GuestArch::host_native().unwrap_or(GuestArch::X86_64);
     let root = repo_root();
-    let src_bundle_dir = root.join(".cache").join("bundles-src").join(arch.as_str());
+    let src_bundle_dir = std::env::var_os("MINIPOD_TEST_BUNDLE_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| root.join(".cache").join("bundles-src").join(arch.as_str()));
     let pub_key_path = root.join(".cache").join("keys").join("dev-bundle.pub");
 
     if !src_bundle_dir.join("manifest.v1").is_file() || !pub_key_path.is_file() {
@@ -284,6 +285,71 @@ fn unix_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[tokio::test]
+async fn e2e_guest_pid_limit_keeps_next_exec_available() {
+    let Some(fixtures) = discover_fixtures("guest_pid_limit") else {
+        return;
+    };
+    let harness = build_test_runtime(&fixtures, "mp-pids");
+    let mgr = &harness.manager;
+    let lease = mgr
+        .spawn(default_spec(Duration::from_secs(90)))
+        .await
+        .unwrap();
+    let deadline = Duration::from_secs(15);
+    // Reduce only this leaf so exercising kernel EAGAIN needs just one extra child.
+    let hit = run_shell(
+        mgr,
+        &lease.id,
+        r#"
+        set -eu
+        IFS=: read -r _ _ group < /proc/self/cgroup
+        cd "/sys/fs/cgroup$group"
+        read -r limit < pids.max
+        test "$limit" = 128
+        echo 2 > pids.max
+        if /bin/sh -c '/bin/busybox echo unexpected; exit $?'; then exit 1; fi
+        read -r event count < pids.events
+        test "$event" = max
+        test "$count" -gt 0
+        printf '%s' "$group"
+    "#,
+        deadline,
+    )
+    .await
+    .unwrap();
+    let next = run_shell(
+        mgr,
+        &lease.id,
+        r#"
+        set -eu
+        IFS=: read -r _ _ group < /proc/self/cgroup
+        cd "/sys/fs/cgroup$group"
+        read -r limit < pids.max
+        read -r event count < pids.events
+        test "$limit" = 128
+        test "$count" = 0
+        /bin/busybox true
+        printf '%s' "$group"
+    "#,
+        deadline,
+    )
+    .await
+    .unwrap();
+    mgr.destroy(&lease.id).await.unwrap();
+    for result in [&hit, &next] {
+        assert_eq!(
+            result.exit.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!result.exit.timed_out);
+        assert!(result.stdout.starts_with(b"/minipod-exec-"));
+    }
+    assert_ne!(hit.stdout, next.stdout);
 }
 
 #[tokio::test]

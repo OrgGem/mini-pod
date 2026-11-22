@@ -279,6 +279,8 @@ sandbox-cli run --input ./job /tmp/work --cwd /tmp/work --output /tmp/work/out .
 
 `run` accepts the resource, accelerator, network, and TTL options of `spawn`, as well as the working directory, user, environment, deadline, and output budget options of `exec`. It renews the lease during the operation. An interrupt requests cancellation and cleanup. With `--json`, the result contains separate `workload`, `copy_out`, and `cleanup` objects and the sandbox ID when known. Cleanup that reports `ProcessExited` or an unknown outcome makes the command fail and includes the sandbox ID when available for investigation.
 
+The Linux guest agent gives each guest exec its own cgroup v2 leaf with a limit of 128 tasks, including threads. The kernel rejects new tasks at capacity. The agent stays outside the leaf and can accept the next exec on the same VM. A failure to install the limit rejects the guest exec before launch. Commands targeting an existing Podman container use that container's resource policy.
+
 ### 5.1 Check Daemon Status & List Active Sandboxes
 
 ```bash

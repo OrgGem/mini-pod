@@ -176,6 +176,12 @@ fn execute_copy_in_with_limits(
             let entry_path = entry
                 .path()
                 .map_err(|err| format!("invalid tar entry path: {err}"))?;
+            if !matches!(entry_type, tar::EntryType::Directory) && raw_path_bytes.ends_with(b"/") {
+                return Err(format!(
+                    "tar non-directory entry '{}' must not end with '/'",
+                    entry_path.display()
+                ));
+            }
             let rel_path = validate_tar_entry_path(&raw_path_bytes, &entry_path, max_depth)?;
 
             match entry_type {
@@ -188,10 +194,11 @@ fn execute_copy_in_with_limits(
                     let rel = rel_path.ok_or_else(|| {
                         "tar regular file entry cannot target destination root '.'".to_owned()
                     })?;
-                    let entry_size = entry
+                    let header_size = entry
                         .header()
                         .size()
                         .map_err(|err| format!("invalid tar entry size: {err}"))?;
+                    let entry_size = entry.size().max(header_size);
                     let next_extracted = extracted_bytes
                         .checked_add(entry_size)
                         .ok_or_else(|| "copy_in extracted byte count overflow".to_owned())?;
@@ -535,9 +542,20 @@ fn execute_copy_out_with_limits(
                     header.set_uid(0);
                     header.set_gid(0);
                     header.set_cksum();
+                    let mut reader = CountingReader {
+                        inner: (&mut file).take(size),
+                        bytes_read: 0,
+                    };
                     builder
-                        .append_data(&mut header, &rel, (&mut file).take(size))
+                        .append_data(&mut header, &rel, &mut reader)
                         .map_err(|err| format!("failed packing file '{}': {err}", rel.display()))?;
+                    if reader.bytes_read != size {
+                        return Err(format!(
+                            "source file '{}' shrank while packing copy_out archive (expected {size} bytes, read {})",
+                            disk_path.display(),
+                            reader.bytes_read
+                        ));
+                    }
                 }
             }
         }
@@ -725,6 +743,19 @@ impl Write for TarChunkWriter<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(n as u64);
+        Ok(n)
     }
 }
 
@@ -1362,5 +1393,75 @@ mod tests {
         let err = verify_guest_opened_regular_matches(&fifo_path, &regular_meta, &fifo_meta)
             .unwrap_err();
         assert!(err.contains("not a regular file"), "got {err}");
+    }
+
+    #[test]
+    fn guest_copy_in_uses_pax_extended_size_and_rejects_trailing_slash_on_regular() {
+        let tmp = LocalTempDir::new("pax-and-slash");
+        let dst = tmp.0.join("dst");
+        let outbound = Arc::new(OutboundQueue::new());
+
+        // Construct an entry where the 12-byte ustar octal size is 0, while the PAX
+        // extended header declares size=6 so `entry.size()` catches `6 > max_bytes=4`.
+        let mut pax_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut pax_tar);
+            builder
+                .append_pax_extensions([("size", b"6".as_slice())])
+                .unwrap();
+            let mut hdr = tar::Header::new_ustar();
+            hdr.set_entry_type(tar::EntryType::Regular);
+            hdr.set_size(6);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            // Overwrite octal header size field cleanly via a custom zeroed header after PAX:
+            builder
+                .append_data(&mut hdr, "pax.txt", b"abcdef".as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        // Corrupt only the second header's octal size field (after the 1024-byte PAX entry)
+        // or test directly with max_bytes=4: either way PAX header must be honored.
+        let (handle, rx) = ActiveCopyIn::new();
+        handle.push_chunk(pax_tar, true);
+        let err_pax = execute_copy_in_with_limits(
+            StreamId(20),
+            &dst.to_string_lossy(),
+            4,
+            16,
+            8,
+            rx,
+            &outbound,
+        )
+        .unwrap_err();
+        assert!(err_pax.contains("exceeds max_bytes"), "got {err_pax}");
+
+        // Reject Regular entry whose raw path ends with '/'.
+        let mut slash_tar = Vec::new();
+        {
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_entry_type(tar::EntryType::Regular);
+            hdr.set_size(0);
+            hdr.set_mode(0o644);
+            let name_bytes = hdr.as_gnu_mut().unwrap().name.len();
+            let path = b"file/";
+            hdr.as_gnu_mut().unwrap().name[..path.len()].copy_from_slice(&path[..name_bytes.min(path.len())]);
+            hdr.set_cksum();
+            slash_tar.extend_from_slice(hdr.as_bytes());
+            slash_tar.extend_from_slice(&[0u8; 1024]);
+        }
+        let (handle2, rx2) = ActiveCopyIn::new();
+        handle2.push_chunk(slash_tar, true);
+        let err_slash = execute_copy_in_with_limits(
+            StreamId(21),
+            &dst.to_string_lossy(),
+            65_536,
+            16,
+            8,
+            rx2,
+            &outbound,
+        )
+        .unwrap_err();
+        assert!(err_slash.contains("must not end with '/'"), "got {err_slash}");
     }
 }

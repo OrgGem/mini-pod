@@ -176,6 +176,8 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mountpoint -q /proc || mount -t proc proc /proc
 mountpoint -q /sys || mount -t sysfs sysfs /sys
 mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mkdir -p /sys/fs/cgroup
+mountpoint -q /sys/fs/cgroup || mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
 for mod in virtio virtio_ring virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci virtio_console vmw_vsock_virtio_transport; do
     modprobe -q "$mod" 2>/dev/null || true

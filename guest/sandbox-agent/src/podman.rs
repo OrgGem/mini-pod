@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions, Permissions};
 #[cfg(unix)]
 use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use crate::egress_listener::{default_proxy_env_pairs, guest_proxy_url};
 #[cfg(unix)]
-use crate::supervisor_unix::{configure_process_group, kill_process_group, signal_process_group};
+use crate::supervisor_unix::{
+    configure_process_group, current_euid, kill_process_group, signal_process_group,
+};
 
 pub(crate) const PODMAN_BIN: &str = "/usr/bin/podman";
 #[cfg(unix)]
@@ -33,7 +35,7 @@ pub(crate) const PODMAN_RUN_DIR: &str = "/run/podman";
 #[cfg(any(unix, test))]
 pub(crate) const PODMAN_SOCKET_PATH: &str = "/run/podman/podman.sock";
 #[cfg(unix)]
-pub(crate) const PODMAN_LOG_PATH: &str = "/tmp/podman-service.log";
+pub(crate) const PODMAN_LOG_PATH: &str = "/run/podman/podman-service.log";
 pub(crate) const PODMAN_XDG_RUNTIME_DIR: &str = "/run";
 
 #[cfg(unix)]
@@ -232,6 +234,7 @@ impl PodmanServiceManager {
     #[cfg(unix)]
     fn spawn_service(&self) -> Result<Child, String> {
         prepare_owner_only_dir(&self.run_dir)?;
+        prepare_owner_only_dir(&self.xdg_runtime_dir.join("containers"))?;
         prepare_stale_socket(&self.socket_path)?;
         let log_file = open_log_file(&self.log_path)?;
         let log_err = log_file
@@ -290,9 +293,10 @@ impl Drop for PodmanServiceManager {
 
 #[cfg(unix)]
 fn prepare_owner_only_dir(dir: &Path) -> Result<(), String> {
+    let expected_uid = current_euid();
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.is_dir() {
+            if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != expected_uid {
                 return Err(format!(
                     "refusing unsafe non-directory podman runtime path '{}'",
                     dir.display()
@@ -302,6 +306,14 @@ fn prepare_owner_only_dir(dir: &Path) -> Result<(), String> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+            let meta = fs::symlink_metadata(dir)
+                .map_err(|e| format!("failed to inspect '{}': {e}", dir.display()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != expected_uid {
+                return Err(format!(
+                    "refusing unsafe newly created podman runtime path '{}'",
+                    dir.display()
+                ));
+            }
         }
         Err(err) => {
             return Err(format!("failed to inspect '{}': {err}", dir.display()));
@@ -346,20 +358,27 @@ fn prepare_stale_socket(socket_path: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 fn open_log_file(log_path: &Path) -> Result<File, String> {
-    if let Ok(meta) = fs::symlink_metadata(log_path) {
-        if meta.file_type().is_symlink() || meta.is_dir() {
-            return Err(format!(
-                "refusing unsafe podman log path '{}'",
-                log_path.display()
-            ));
-        }
-    }
-    OpenOptions::new()
-        .create(true)
+    let mut opts = OpenOptions::new();
+    opts.create(true)
         .write(true)
-        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = opts
         .open(log_path)
-        .map_err(|err| format!("failed to open podman log '{}': {err}", log_path.display()))
+        .map_err(|err| format!("failed to open podman log '{}': {err}", log_path.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect podman log '{}': {err}", log_path.display()))?;
+    let expected_uid = current_euid();
+    if !meta.is_file() || meta.uid() != expected_uid {
+        return Err(format!(
+            "refusing unsafe podman log path '{}'",
+            log_path.display()
+        ));
+    }
+    file.set_len(0)
+        .map_err(|err| format!("failed to truncate podman log '{}': {err}", log_path.display()))?;
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -382,11 +401,20 @@ fn terminate_child_group(child: &mut Child) {
 
 #[cfg(unix)]
 fn read_log_tail(log_path: &Path) -> String {
-    let Ok(mut file) = File::open(log_path) else {
+    let mut opts = OpenOptions::new();
+    opts.read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let Ok(file) = opts.open(log_path) else {
         return String::new();
     };
+    let Ok(meta) = file.metadata() else {
+        return String::new();
+    };
+    if !meta.is_file() || meta.uid() != current_euid() {
+        return String::new();
+    }
     let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() || buf.is_empty() {
+    if file.take(64 * 1024).read_to_end(&mut buf).is_err() || buf.is_empty() {
         return String::new();
     }
     let start = buf.len().saturating_sub(LOG_TAIL_MAX_BYTES);
@@ -408,6 +436,8 @@ mod tests {
         let mgr = PodmanServiceManager::new();
         assert_eq!(mgr.socket_path(), Path::new(PODMAN_SOCKET_PATH));
         assert!(PODMAN_SOCKET_PATH.starts_with("/run/podman/"));
+        #[cfg(unix)]
+        assert!(PODMAN_LOG_PATH.starts_with("/run/podman/"));
         assert_eq!(mgr.proxy_port(), None);
         mgr.set_proxy_port(Some(3128));
         assert_eq!(mgr.proxy_port(), Some(3128));
@@ -548,5 +578,37 @@ mod tests {
             envs.get("no_proxy").and_then(|v| v.as_deref()),
             Some(crate::egress_listener::DEFAULT_NO_PROXY)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_log_file_rejects_symlink_and_fifo_without_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("podman-log-{}-{}", std::process::id(), nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        let target = root.join("real.log");
+        fs::write(&target, b"keep-me").unwrap();
+        let sym_log = root.join("sym.log");
+        symlink(&target, &sym_log).unwrap();
+        assert!(open_log_file(&sym_log).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep-me");
+
+        let fifo = root.join("pipe.log");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+        let err = open_log_file(&fifo).expect_err("FIFO must be rejected without blocking");
+        assert!(
+            err.contains("unsafe") || err.contains("failed to open podman log"),
+            "got {err}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

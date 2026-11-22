@@ -22,6 +22,8 @@ const MAX_CONTAINER_TARGET_BYTES: usize = 128;
 const NON_UNIX_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub(crate) struct ExecSpec {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub guest_exec_pids_max: Option<u32>,
     pub stream_id: StreamId,
     pub target: ExecTargetWire,
     pub argv: Vec<String>,
@@ -407,10 +409,28 @@ fn run_exec_inner(
     }
 
     #[cfg(unix)]
-    let exec_scope = Arc::new(supervisor_unix::ExecScope::prepare(
-        stream_id,
-        matches!(spec.target, ExecTargetWire::Container { .. }),
-    ));
+    let exec_scope = {
+        // podman exec joins an existing container's own cgroup. This budget is
+        // for guest-exec descendants, including the rootless Codex executor.
+        let is_container = matches!(spec.target, ExecTargetWire::Container { .. });
+        let limit = if is_container {
+            None
+        } else {
+            spec.guest_exec_pids_max
+        };
+        match supervisor_unix::ExecScope::prepare(stream_id, is_container, limit) {
+            Ok(scope) => Arc::new(scope),
+            Err(err) => {
+                return emit_pre_spawn_failure(
+                    outbound,
+                    stream_id,
+                    125,
+                    format!("could not enforce guest exec PID limit: {err}\n").as_bytes(),
+                    spec.stderr_budget_bytes,
+                );
+            }
+        }
+    };
 
     let (program_label, mut cmd) = match prepared {
         PreparedCommand::Guest {
@@ -1100,6 +1120,7 @@ mod tests {
         env.insert("FOO".to_owned(), "bar=baz".to_owned());
         env.insert("Z_KEY".to_owned(), "val".to_owned());
         ExecSpec {
+            guest_exec_pids_max: None,
             stream_id: StreamId(1),
             target: ExecTargetWire::Container {
                 id_or_name: "web_1.app-0".to_owned(),

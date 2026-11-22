@@ -100,14 +100,38 @@ fn early_initramfs_setup() -> io::Result<()> {
         fs::create_dir_all(dir)?;
     }
 
-    const EARLY_MOUNTS: &[(&str, &str, &str)] = &[
-        ("proc", "/proc", "proc"),
-        ("sysfs", "/sys", "sysfs"),
-        ("devtmpfs", "/dev", "devtmpfs"),
-        ("tmpfs", "/run", "tmpfs"),
+    const EARLY_MOUNTS: &[(&str, &str, &str, libc::c_ulong, Option<&str>)] = &[
+        (
+            "proc",
+            "/proc",
+            "proc",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            None,
+        ),
+        (
+            "sysfs",
+            "/sys",
+            "sysfs",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            None,
+        ),
+        (
+            "devtmpfs",
+            "/dev",
+            "devtmpfs",
+            libc::MS_NOSUID | libc::MS_NOEXEC,
+            None,
+        ),
+        (
+            "tmpfs",
+            "/run",
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=0755"),
+        ),
     ];
-    for &(src, target, fstype) in EARLY_MOUNTS {
-        mount_raw(Some(src), target, Some(fstype), 0, None, true)?;
+    for &(src, target, fstype, flags, data) in EARLY_MOUNTS {
+        mount_raw(Some(src), target, Some(fstype), flags, data, true)?;
     }
     ensure_standard_fds_open();
 
@@ -187,30 +211,64 @@ fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
         Some("overlay"),
         "/newroot/etc",
         Some("overlay"),
-        0,
+        libc::MS_NOSUID | libc::MS_NODEV,
         Some(ETC_OVERLAY_OPTIONS),
         false,
     )?;
 
     for &(src, target) in WRITABLE_BIND_MOUNTS {
         mount_raw(Some(src), target, None, libc::MS_BIND, None, false)?;
+        if matches!(target, "/newroot/tmp" | "/newroot/var/tmp") {
+            mount_raw(
+                None,
+                target,
+                None,
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+                None,
+                false,
+            )?;
+        }
     }
 
-    const NEWROOT_VIRTUAL_MOUNTS: &[(&str, &str, &str)] = &[
-        ("tmpfs", "/newroot/run", "tmpfs"),
-        ("proc", "/newroot/proc", "proc"),
-        ("sysfs", "/newroot/sys", "sysfs"),
-        ("devtmpfs", "/newroot/dev", "devtmpfs"),
+    const NEWROOT_VIRTUAL_MOUNTS: &[(&str, &str, &str, libc::c_ulong, Option<&str>)] = &[
+        (
+            "tmpfs",
+            "/newroot/run",
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=0755"),
+        ),
+        (
+            "proc",
+            "/newroot/proc",
+            "proc",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            None,
+        ),
+        (
+            "sysfs",
+            "/newroot/sys",
+            "sysfs",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            None,
+        ),
+        (
+            "devtmpfs",
+            "/newroot/dev",
+            "devtmpfs",
+            libc::MS_NOSUID | libc::MS_NOEXEC,
+            None,
+        ),
     ];
-    for &(src, target, fstype) in NEWROOT_VIRTUAL_MOUNTS {
-        mount_raw(Some(src), target, Some(fstype), 0, None, false)?;
+    for &(src, target, fstype, flags, data) in NEWROOT_VIRTUAL_MOUNTS {
+        mount_raw(Some(src), target, Some(fstype), flags, data, false)?;
     }
 
     mount_raw(
         Some("cgroup2"),
         "/newroot/sys/fs/cgroup",
         Some("cgroup2"),
-        0,
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
         true,
     )?;
@@ -220,7 +278,7 @@ fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
         Some("tmpfs"),
         "/newroot/dev/shm",
         Some("tmpfs"),
-        0,
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         Some("mode=1777,size=64m"),
         false,
     )?;
@@ -230,7 +288,7 @@ fn switch_to_ro_root_with_overlay(root_dev: &str) -> io::Result<()> {
         Some("devpts"),
         "/newroot/dev/pts",
         Some("devpts"),
-        0,
+        libc::MS_NOSUID | libc::MS_NOEXEC,
         Some("newinstance,ptmxmode=0666,mode=0620"),
         false,
     )?;
