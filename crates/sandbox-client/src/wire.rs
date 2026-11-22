@@ -216,6 +216,10 @@ pub enum ControlRequest {
     Spawn {
         spec: SandboxSpec,
     },
+    SpawnKeyed {
+        operation_id: String,
+        spec: SandboxSpec,
+    },
     RenewLease {
         id: SandboxId,
         ttl_ms: u64,
@@ -253,6 +257,11 @@ impl ControlRequest {
             Self::ListSandboxes => json!({ "type": "ListSandboxes" }),
             Self::Spawn { spec } => json!({
                 "type": "Spawn",
+                "spec": encode_sandbox_spec(spec),
+            }),
+            Self::SpawnKeyed { operation_id, spec } => json!({
+                "type": "SpawnKeyed",
+                "operation_id": operation_id,
                 "spec": encode_sandbox_spec(spec),
             }),
             Self::RenewLease { id, ttl_ms } => json!({
@@ -309,6 +318,10 @@ impl ControlRequest {
             "ListSandboxes" => Ok(Self::ListSandboxes),
             "Spawn" => Ok(Self::Spawn {
                 spec: decode_sandbox_spec(req_field(obj, "spec", "ControlRequest::Spawn")?)?,
+            }),
+            "SpawnKeyed" => Ok(Self::SpawnKeyed {
+                operation_id: req_string(obj, "operation_id", "ControlRequest::SpawnKeyed")?,
+                spec: decode_sandbox_spec(req_field(obj, "spec", "ControlRequest::SpawnKeyed")?)?,
             }),
             "RenewLease" => Ok(Self::RenewLease {
                 id: SandboxId::new(req_string(obj, "id", "ControlRequest::RenewLease")?),

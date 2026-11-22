@@ -1017,6 +1017,14 @@ impl VmSessionPort for QemuVmSession {
         }
     }
 
+    fn confirmed_exited(&self) -> Result<bool, SandboxError> {
+        let mut process = lock_unpoisoned(&self.process);
+        match process.as_mut() {
+            Some(process) => Ok(process.try_wait()?.is_some()),
+            None => Err(SandboxError::Internal("VM process handle is unavailable".to_owned())),
+        }
+    }
+
     fn current_rss_bytes(&self) -> Option<u64> {
         if !self.alive.load(Ordering::Acquire) {
             return None;

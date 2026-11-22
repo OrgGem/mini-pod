@@ -47,6 +47,9 @@ pub struct CapabilityReport {
     pub egress_filter: EnforcementLevel,
 }
 
+/// Maximum lease duration (365 days) accepted by [`SandboxSpec`] and `renew_lease`.
+pub const MAX_LEASE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxSpec {
     pub isolation: IsolationMode,
@@ -86,10 +89,21 @@ impl SandboxSpec {
                 ));
             }
         }
+        if self.budget.host_cpu_quota_Millicores == Some(0) {
+            return Err(SandboxError::InvalidSpec(
+                "host_cpu_quota_Millicores must be greater than zero when specified".to_string(),
+            ));
+        }
         if self.lease_ttl.is_zero() {
             return Err(SandboxError::InvalidSpec(
                 "lease_ttl must be greater than zero".to_string(),
             ));
+        }
+        if self.lease_ttl > MAX_LEASE_TTL {
+            return Err(SandboxError::InvalidSpec(format!(
+                "lease_ttl exceeds maximum allowed duration of {} seconds",
+                MAX_LEASE_TTL.as_secs()
+            )));
         }
         if let NetworkPolicy::DomainAllowList { rules } = &self.network {
             for rule in rules {

@@ -710,6 +710,12 @@ fn parse_spawn_args(args: &Map<String, Value>) -> Result<SandboxSpec, String> {
     if ttl_secs == 0 {
         return Err("Invalid params: 'ttl_secs' must be greater than zero".to_owned());
     }
+    if Duration::from_secs(ttl_secs) > sandbox_core::MAX_LEASE_TTL {
+        return Err(format!(
+            "Invalid params: 'ttl_secs' exceeds maximum allowed duration of {} seconds",
+            sandbox_core::MAX_LEASE_TTL.as_secs()
+        ));
+    }
 
     let spec = SandboxSpec {
         isolation,
@@ -828,6 +834,12 @@ fn parse_exec_args(
     if deadline_secs == 0 {
         return Err("Invalid params: 'deadline_secs' must be greater than zero".to_owned());
     }
+    if Duration::from_secs(deadline_secs) > sandbox_core::MAX_LEASE_TTL {
+        return Err(format!(
+            "Invalid params: 'deadline_secs' exceeds maximum allowed duration of {} seconds",
+            sandbox_core::MAX_LEASE_TTL.as_secs()
+        ));
+    }
     let stdout_budget_bytes =
         opt_u64(args, "stdout_budget_bytes")?.unwrap_or(DEFAULT_EXEC_OUTPUT_BUDGET_BYTES);
     let stderr_budget_bytes =
@@ -856,7 +868,14 @@ fn parse_renew_args(args: &Map<String, Value>) -> Result<(SandboxId, Duration), 
         .and_then(Value::as_u64)
         .filter(|v| *v > 0)
         .ok_or_else(|| "Invalid params: 'ttl_secs' must be a positive integer".to_owned())?;
-    Ok((sandbox_id, Duration::from_secs(ttl_secs)))
+    let ttl = Duration::from_secs(ttl_secs);
+    if ttl > sandbox_core::MAX_LEASE_TTL {
+        return Err(format!(
+            "Invalid params: 'ttl_secs' exceeds maximum allowed duration of {} seconds",
+            sandbox_core::MAX_LEASE_TTL.as_secs()
+        ));
+    }
+    Ok((sandbox_id, ttl))
 }
 
 fn parse_copy_in_args(args: &Map<String, Value>) -> Result<(SandboxId, PathBuf, String), String> {

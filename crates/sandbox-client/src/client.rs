@@ -652,12 +652,26 @@ impl SandboxClient {
         }
     }
 
+    /// Creates or retrieves the lease associated with a durable operation UUID.
+    pub async fn spawn_keyed(&self, operation_id: String, spec: SandboxSpec) -> Result<SandboxLease, SandboxError> {
+        match self.rpc(ControlRequest::SpawnKeyed { operation_id, spec }).await? {
+            ControlResponse::Spawned(lease) => Ok(lease),
+            other => Err(unexpected_response("SpawnKeyed", &other)),
+        }
+    }
+
     /// Extends the lease TTL of an active sandbox by `ttl`.
     pub async fn renew_lease(&self, id: &SandboxId, ttl: Duration) -> Result<(), SandboxError> {
         if ttl.is_zero() {
             return Err(SandboxError::InvalidSpec(
                 "lease ttl must be greater than zero".to_owned(),
             ));
+        }
+        if ttl > sandbox_core::MAX_LEASE_TTL {
+            return Err(SandboxError::InvalidSpec(format!(
+                "lease ttl exceeds maximum allowed duration of {} seconds",
+                sandbox_core::MAX_LEASE_TTL.as_secs()
+            )));
         }
         let ttl_ms = u64::try_from(ttl.as_millis())
             .map_err(|_| SandboxError::InvalidSpec("lease ttl exceeds u64 milliseconds".to_owned()))?

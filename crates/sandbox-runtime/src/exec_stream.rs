@@ -226,6 +226,9 @@ impl ExecStream {
 
         let res = match rx.try_recv() {
             Ok(status) => self.merge_host_exit(status),
+            Err(oneshot::error::TryRecvError::Closed) if self.host_tripped() => {
+                Ok(self.synthesized_host_exit())
+            }
             Err(oneshot::error::TryRecvError::Closed) => Err(SandboxError::Transport(
                 "execution stream terminated before reporting exit status".to_owned(),
             )),
@@ -623,5 +626,23 @@ mod tests {
         assert!(timed_out.exit.timed_out);
         assert_eq!(timed_out.exit.code, None);
         silent_task.abort();
+
+        // 3. Budget trip followed by immediate producer drop (TryRecvError::Closed before wait_exit).
+        let (stream_closed, handle_closed) = ExecStream::channel(StreamId(34));
+        let mut stream_closed = stream_closed.with_limits(Duration::from_secs(5), 4, 4);
+        let _ = handle_closed
+            .send_output(ExecOutputChunk {
+                stream: OutputStreamKind::Stdout,
+                data: b"123456".to_vec(),
+            })
+            .await;
+        drop(handle_closed);
+
+        let first = stream_closed.next_output().await.expect("capped chunk expected");
+        assert_eq!(first.data, b"1234");
+        assert!(stream_closed.next_output().await.is_none());
+        let closed_exit = stream_closed.wait_exit().await.unwrap();
+        assert!(closed_exit.stdout_truncated);
+        assert_eq!(closed_exit.code, None);
     }
 }

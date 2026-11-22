@@ -1272,6 +1272,15 @@ fn parse_http_headers(
             if host_count > 1 {
                 return Err("duplicate Host headers");
             }
+        } else if name.eq_ignore_ascii_case("connection") {
+            for tok in val.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                if tok.eq_ignore_ascii_case("content-length")
+                    || tok.eq_ignore_ascii_case("transfer-encoding")
+                    || tok.eq_ignore_ascii_case("host")
+                {
+                    return Err("Connection header must not nominate framing or Host headers");
+                }
+            }
         }
         headers.push((name.to_owned(), val.to_owned()));
     }
@@ -1546,7 +1555,11 @@ fn collect_connection_tokens(headers: &[(String, String)]) -> Vec<String> {
         if name.eq_ignore_ascii_case("connection") {
             for item in val.split(',') {
                 let tok = item.trim();
-                if !tok.is_empty() {
+                if !tok.is_empty()
+                    && !tok.eq_ignore_ascii_case("content-length")
+                    && !tok.eq_ignore_ascii_case("transfer-encoding")
+                    && !tok.eq_ignore_ascii_case("host")
+                {
                     tokens.push(tok.to_ascii_lowercase());
                 }
             }
@@ -2714,5 +2727,22 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8_lossy(&r_bad_trailer).starts_with("HTTP/1.1 400"));
+
+        // 4. Connection header nominating framing/Host headers must be rejected with 400.
+        for smuggle_hdr in [
+            "Connection: Content-Length",
+            "Connection: keep-alive, Transfer-Encoding",
+            "Connection: Host",
+        ] {
+            let req = format!(
+                "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\n{smuggle_hdr}\r\nContent-Length: 0\r\n\r\n"
+            );
+            let resp = run_proxy_once(&proxy, req.as_bytes()).await;
+            assert!(
+                String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 400"),
+                "expected 400 for {smuggle_hdr}, got {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
     }
 }

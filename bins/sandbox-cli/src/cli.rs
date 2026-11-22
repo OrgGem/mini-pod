@@ -37,6 +37,7 @@ SUBCOMMANDS:
     list
     tui [--refresh-ms <N>]
     spawn [OPTIONS]
+        --operation-id <UUID> (idempotent request)
         --isolation <vm|shared-kernel>
         --accel <required|preferred|software>
         --network <isolated|internet|allow:<domain>:<port>|unrestricted> (repeatable for allow:)
@@ -105,6 +106,7 @@ pub enum CliCommand {
         refresh_interval: Duration,
     },
     Spawn(SandboxSpec),
+    SpawnKeyed { operation_id: String, spec: SandboxSpec },
     Run(Box<RunSpec>),
     Exec {
         id: SandboxId,
@@ -237,7 +239,12 @@ where
             if check_help_in_rest(rest) {
                 return Ok(CliOutcome::Help(USAGE_TEXT));
             }
-            CliCommand::Spawn(parse_spawn(rest, &mut endpoint_raw, &mut json_output)?)
+            let (spec, operation_id) =
+                parse_spawn_with_operation_id(rest, &mut endpoint_raw, &mut json_output, true)?;
+            match operation_id {
+                Some(operation_id) => CliCommand::SpawnKeyed { operation_id, spec },
+                None => CliCommand::Spawn(spec),
+            }
         }
         "run" => {
             if check_help_before_double_dash(rest) {
@@ -459,6 +466,16 @@ fn parse_spawn(
     endpoint_raw: &mut Option<String>,
     json_output: &mut bool,
 ) -> Result<SandboxSpec, SandboxError> {
+    let (spec, _) = parse_spawn_with_operation_id(rest, endpoint_raw, json_output, false)?;
+    Ok(spec)
+}
+
+fn parse_spawn_with_operation_id(
+    rest: &[String],
+    endpoint_raw: &mut Option<String>,
+    json_output: &mut bool,
+    allow_operation_id: bool,
+) -> Result<(SandboxSpec, Option<String>), SandboxError> {
     let mut isolation = IsolationMode::VmRequired;
     let mut acceleration = AccelerationPolicy::Preferred;
     let mut simple_network: Option<NetworkPolicy> = None;
@@ -470,6 +487,7 @@ fn parse_spawn(
     let mut disk_mb: u32 = 512;
     let mut storage_mb: u32 = 1024;
     let mut ttl_secs: u64 = 300;
+    let mut operation_id: Option<String> = None;
 
     let mut i = 0usize;
     while i < rest.len() {
@@ -481,6 +499,12 @@ fn parse_spawn(
         let arg = rest[i].as_str();
         let (flag, inline_val) = split_flag(arg);
         match flag {
+            "--operation-id" if allow_operation_id => {
+                if operation_id.is_some() {
+                    return Err(SandboxError::InvalidSpec("duplicate --operation-id".to_owned()));
+                }
+                operation_id = Some(take_flag_value(rest, &mut i, flag, inline_val)?);
+            }
             "--isolation" => {
                 let val = take_flag_value(rest, &mut i, flag, inline_val)?;
                 isolation = match val.as_str() {
@@ -576,6 +600,12 @@ fn parse_spawn(
             "--ttl-secs must be greater than zero".to_owned(),
         ));
     }
+    if Duration::from_secs(ttl_secs) > sandbox_core::MAX_LEASE_TTL {
+        return Err(SandboxError::InvalidSpec(format!(
+            "--ttl-secs exceeds maximum allowed duration of {} seconds",
+            sandbox_core::MAX_LEASE_TTL.as_secs()
+        )));
+    }
 
     let network = if !allow_rules.is_empty() {
         NetworkPolicy::DomainAllowList { rules: allow_rules }
@@ -598,7 +628,7 @@ fn parse_spawn(
         lease_ttl: Duration::from_secs(ttl_secs),
     };
     spec.validate_for_host_os(std::env::consts::OS)?;
-    Ok(spec)
+    Ok((spec, operation_id))
 }
 
 fn parse_allow_rule(raw: &str) -> Result<EgressRule, SandboxError> {
@@ -717,6 +747,12 @@ fn parse_exec(
         return Err(SandboxError::InvalidSpec(
             "--deadline-secs must be greater than zero".to_owned(),
         ));
+    }
+    if Duration::from_secs(deadline_secs) > sandbox_core::MAX_LEASE_TTL {
+        return Err(SandboxError::InvalidSpec(format!(
+            "--deadline-secs exceeds maximum allowed duration of {} seconds",
+            sandbox_core::MAX_LEASE_TTL.as_secs()
+        )));
     }
     if stdout_budget_bytes == 0 || stderr_budget_bytes == 0 {
         return Err(SandboxError::InvalidSpec(
@@ -874,6 +910,12 @@ fn parse_renew(
         return Err(SandboxError::InvalidSpec(
             "--ttl-secs must be greater than zero".to_owned(),
         ));
+    }
+    if Duration::from_secs(secs) > sandbox_core::MAX_LEASE_TTL {
+        return Err(SandboxError::InvalidSpec(format!(
+            "--ttl-secs exceeds maximum allowed duration of {} seconds",
+            sandbox_core::MAX_LEASE_TTL.as_secs()
+        )));
     }
     Ok((id, Duration::from_secs(secs)))
 }
@@ -1502,8 +1544,12 @@ pub async fn execute_with_client(
             Box::pin(crate::tui::run_tui(client, refresh_interval)).await
         }
         CliCommand::Run(spec) => Box::pin(execute_run(client, json_mode, *spec)).await,
-        CliCommand::Spawn(spec) => {
-            let lease = client.spawn(spec).await?;
+        command @ (CliCommand::Spawn(_) | CliCommand::SpawnKeyed { .. }) => {
+            let lease = match command {
+                CliCommand::Spawn(spec) => client.spawn(spec).await?,
+                CliCommand::SpawnKeyed { operation_id, spec } => client.spawn_keyed(operation_id, spec).await?,
+                _ => unreachable!(),
+            };
             if json_mode {
                 print_json(&json!({
                     "id": lease.id.as_str(),
@@ -1891,6 +1937,29 @@ mod tests {
         ));
         assert!(matches!(
             parse_args_with(&args(&["spawn", "--network", "allow:example.com:0"]), no_env),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        // --operation-id parsed in context without breaking global flags or invalid subcommand args.
+        let CliOutcome::Run(keyed) = parse_args_with(
+            &args(&[
+                "spawn",
+                "--endpoint",
+                "unix:///tmp/custom.sock",
+                "--operation-id",
+                "00000000-0000-4000-8000-000000000001",
+            ]),
+            no_env,
+        )
+        .unwrap() else {
+            panic!("expected Run");
+        };
+        assert!(matches!(
+            keyed.command,
+            CliCommand::SpawnKeyed { .. }
+        ));
+        assert!(matches!(
+            parse_args_with(&args(&["spawn", "--ttl-secs", "99999999"]), no_env),
             Err(SandboxError::InvalidSpec(_))
         ));
 

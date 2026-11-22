@@ -111,6 +111,10 @@ impl JournalStore {
         &self.root_dir
     }
 
+    pub fn record_path(&self, id: &SandboxId) -> PathBuf {
+        self.root_dir.join(format!("{}{JOURNAL_EXT}", id.as_str()))
+    }
+
     /// Atomically persists `record` (`<id>.journal.tmp.<pid>.<seq>` -> `write_all` -> `sync_all`
     /// -> `rename` -> parent directory `sync_all` on Unix).
     pub fn write_record(&self, record: &JournalRecord) -> Result<(), SandboxError> {

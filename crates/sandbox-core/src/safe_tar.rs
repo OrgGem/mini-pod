@@ -192,6 +192,19 @@ impl Write for BoundedVecWriter {
     }
 }
 
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
 /// Returns `true` when `meta` represents a symlink or Windows reparse point/junction.
 pub fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
@@ -353,10 +366,19 @@ fn pack_host_path_to_tar_with_limits(
                     header.set_gid(0);
                     header.set_cksum();
 
-                    if let Err(err) =
-                        builder.append_data(&mut header, &rel, (&mut file).take(size))
-                    {
+                    let mut reader = CountingReader {
+                        inner: (&mut file).take(size),
+                        bytes_read: 0,
+                    };
+                    if let Err(err) = builder.append_data(&mut header, &rel, &mut reader) {
                         return Err(map_pack_write_err(&rel, err));
+                    }
+                    if reader.bytes_read != size {
+                        return Err(SandboxError::Internal(format!(
+                            "source file '{}' size changed while packing tar archive (expected {size} bytes, read {})",
+                            disk_path.display(),
+                            reader.bytes_read
+                        )));
                     }
                 }
             }
@@ -1061,14 +1083,18 @@ fn validate_host_path_components(path: &Path) -> Result<(), SandboxError> {
                     path.display()
                 )));
             }
-            Component::Prefix(prefix) => {
-                if matches!(prefix.kind(), Prefix::DeviceNS(_)) {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+                Prefix::DeviceNS(_)
+                | Prefix::UNC(..)
+                | Prefix::VerbatimUNC(..)
+                | Prefix::Verbatim(_) => {
                     return Err(SandboxError::PolicyViolation(format!(
-                        "refusing Windows device namespace path '{}'",
+                        "refusing unsafe Windows path prefix in '{}'",
                         path.display()
                     )));
                 }
-            }
+            },
             #[cfg(windows)]
             Component::Normal(part) => {
                 let Some(seg) = part.to_str() else {
@@ -2059,5 +2085,37 @@ mod tests {
             extract_tar_safely(&deep_tar, &dst, 64 * 1024, 16),
             Err(SandboxError::PolicyViolation(_))
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_host_path_components_rejects_verbatim_unc_and_device_prefixes() {
+        for bad in [
+            Path::new(r"\\.\NUL"),
+            Path::new(r"\\?\NUL"),
+            Path::new(r"\\?\foo.txt"),
+            Path::new(r"\\server\share\file.txt"),
+            Path::new(r"\\?\UNC\server\share\file.txt"),
+        ] {
+            assert!(
+                matches!(
+                    validate_host_path_components(bad),
+                    Err(SandboxError::PolicyViolation(_))
+                ),
+                "expected PolicyViolation for {}",
+                bad.display()
+            );
+        }
+
+        for ok in [
+            Path::new(r"C:\work\project"),
+            Path::new(r"\\?\C:\work\project"),
+        ] {
+            assert!(
+                validate_host_path_components(ok).is_ok(),
+                "local drive path {} should be allowed",
+                ok.display()
+            );
+        }
     }
 }

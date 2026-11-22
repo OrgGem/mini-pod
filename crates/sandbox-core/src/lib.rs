@@ -14,6 +14,7 @@ pub use error::SandboxError;
 pub use exec::{ExecExitStatus, ExecRequest, ExecTarget};
 pub use lifecycle::{
     CapabilityReport, DestroyStatus, SandboxId, SandboxLease, SandboxSpec, SandboxState,
+    MAX_LEASE_TTL,
 };
 pub use policy::{
     domain_matches_rule, normalize_egress_domain, AccelerationPolicy, EgressRule, EnforcementLevel,
@@ -88,6 +89,20 @@ mod tests {
         zero_ttl.lease_ttl = Duration::ZERO;
         assert!(matches!(
             zero_ttl.validate_for_host_os("linux"),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        let mut zero_cpu_quota = valid_spec();
+        zero_cpu_quota.budget.host_cpu_quota_Millicores = Some(0);
+        assert!(matches!(
+            zero_cpu_quota.validate_for_host_os("linux"),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        let mut huge_ttl = valid_spec();
+        huge_ttl.lease_ttl = MAX_LEASE_TTL + Duration::from_secs(1);
+        assert!(matches!(
+            huge_ttl.validate_for_host_os("linux"),
             Err(SandboxError::InvalidSpec(_))
         ));
     }

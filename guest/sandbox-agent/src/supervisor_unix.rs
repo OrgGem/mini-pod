@@ -32,8 +32,10 @@ use crate::supervisor::resolve_user_ids_from_tables;
 #[cfg(target_os = "linux")]
 use crate::supervisor::{
     expand_scoped_proc_closure, extract_conmon_exec_pidfile, is_trusted_conmon_exe,
-    parse_proc_stat_line, ProcStatEntry,
+    parse_proc_stat_line,
 };
+#[cfg(any(target_os = "linux", test))]
+use crate::supervisor::ProcStatEntry;
 
 #[cfg(target_os = "linux")]
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";

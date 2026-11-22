@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::ServeConfig;
 use crate::doctor::{self, DoctorInputs};
+use crate::spawn_registry::SpawnRegistry;
 
 const CONTAINER_EGRESS_PROXY_URL: &str = "http://10.88.0.1:3128";
 const EXEC_CLIENT_MSG_QUEUE_DEPTH: usize = 32;
@@ -91,6 +92,7 @@ impl Drop for CachedDockerCompat {
 /// Shared runtime and Docker compatibility state served by `sandboxd`.
 pub struct DaemonState {
     runtime: Arc<LocalRuntimeManager>,
+    spawn_registry: SpawnRegistry,
     docker_compat: Arc<Mutex<HashMap<SandboxId, CachedDockerCompat>>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     doctor_inputs: Option<DoctorInputs>,
@@ -130,6 +132,7 @@ impl DaemonState {
             }
         });
         Self {
+            spawn_registry: SpawnRegistry::new(Arc::clone(&runtime)),
             runtime,
             docker_compat,
             shutdown_tx,
@@ -991,16 +994,31 @@ where
     }
 
     let is_shutdown = matches!(req, ControlRequest::Shutdown);
+    let spawned_unkeyed = matches!(req, ControlRequest::Spawn { .. });
     let resp = dispatch_unary_request(&state, req).await;
-    let bytes = resp.to_json_bytes()?;
-    tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &bytes))
-        .await
-        .map_err(|_| {
-            SandboxError::Transport(format!(
-                "timed out after {} ms writing control response",
-                io_timeout.as_millis()
-            ))
-        })??;
+    let unkeyed_spawned_id = match &resp {
+        ControlResponse::Spawned(lease) if spawned_unkeyed => Some(lease.id.clone()),
+        _ => None,
+    };
+    let send_res: Result<(), SandboxError> = async {
+        let bytes = resp.to_json_bytes()?;
+        tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &bytes))
+            .await
+            .map_err(|_| {
+                SandboxError::Transport(format!(
+                    "timed out after {} ms writing control response",
+                    io_timeout.as_millis()
+                ))
+            })??;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = send_res {
+        if let Some(id) = unkeyed_spawned_id {
+            let _ = state.destroy_sandbox(&id).await;
+        }
+        return Err(err);
+    }
     let _ = tokio::time::timeout(io_timeout, stream.shutdown()).await;
     if is_shutdown {
         state.request_shutdown();
@@ -1034,6 +1052,10 @@ async fn dispatch_unary_request(state: &DaemonState, req: ControlRequest) -> Con
             sandboxes: state.list_sandboxes(),
         },
         ControlRequest::Spawn { spec } => match state.runtime.spawn(spec).await {
+            Ok(lease) => ControlResponse::Spawned(lease),
+            Err(err) => ControlResponse::Error(WireError::from(err)),
+        },
+        ControlRequest::SpawnKeyed { operation_id, spec } => match state.spawn_registry.spawn(operation_id, spec).await {
             Ok(lease) => ControlResponse::Spawned(lease),
             Err(err) => ControlResponse::Error(WireError::from(err)),
         },
@@ -1272,7 +1294,7 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use std::sync::Mutex;
 
     use sandbox_client::{ClientOutputKind, SandboxClient};
@@ -1351,7 +1373,8 @@ mod tests {
         pid: u32,
         start_token: u64,
         artifacts: Vec<PathBuf>,
-        alive: AtomicBool,
+        alive: Arc<AtomicBool>,
+        exit_probe: Option<Arc<AtomicU8>>,
         copied_in: Mutex<Option<Vec<u8>>>,
         cancel_seen: Arc<AtomicBool>,
     }
@@ -1369,6 +1392,15 @@ mod tests {
         }
         fn is_alive(&self) -> bool {
             self.alive.load(Ordering::Acquire)
+        }
+        fn confirmed_exited(&self) -> Result<bool, SandboxError> {
+            match self.exit_probe.as_ref().map(|probe| probe.load(Ordering::Acquire)) {
+                Some(1) => Ok(false),
+                Some(2) => Ok(true),
+                Some(_) | None => Err(SandboxError::Internal(
+                    "stub process exit confirmation is unavailable".to_owned(),
+                )),
+            }
         }
         fn current_rss_bytes(&self) -> Option<u64> {
             Some(64 * 1024 * 1024)
@@ -1469,6 +1501,8 @@ mod tests {
     struct StubVmRuntime {
         next_pid: AtomicU64,
         cancel_seen: Arc<AtomicBool>,
+        alive_override: Option<Arc<AtomicBool>>,
+        exit_probe: Option<Arc<AtomicU8>>,
     }
 
     #[async_trait::async_trait]
@@ -1486,7 +1520,8 @@ mod tests {
                     pid,
                     start_token: 1,
                     artifacts: Vec::new(),
-                    alive: AtomicBool::new(true),
+                    alive: self.alive_override.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+                    exit_probe: self.exit_probe.as_ref().map(Arc::clone),
                     copied_in: Mutex::new(None),
                     cancel_seen: Arc::clone(&self.cancel_seen),
                 }),
@@ -1533,11 +1568,45 @@ mod tests {
                 Arc::new(StubVmRuntime {
                     next_pid: AtomicU64::new(100),
                     cancel_seen: Arc::clone(&cancel_seen),
+                    alive_override: None,
+                    exit_probe: None,
                 }),
             )
             .unwrap(),
         );
         (Arc::new(DaemonState::new(runtime)), cancel_seen)
+    }
+
+    fn build_exit_probe_test_state(
+        tmp: &TestTempDir,
+        alive: Arc<AtomicBool>,
+        exit_probe: Option<Arc<AtomicU8>>,
+    ) -> Arc<DaemonState> {
+        let rt_cfg = RuntimeManagerConfig {
+            state_dir: tmp.path().join("state"),
+            sweep_interval: Duration::from_secs(10),
+            graceful_shutdown_timeout: Duration::from_millis(50),
+            max_copy_bytes: 8 * 1024 * 1024,
+            max_copy_entries: 1024,
+            cleanup_max_attempts: 3,
+            cleanup_initial_delay: Duration::from_millis(5),
+            admission: AdmissionLimits::default(),
+            warm_pool: WarmPoolConfig::default(),
+        };
+        let runtime = Arc::new(
+            LocalRuntimeManager::new(
+                rt_cfg,
+                Arc::new(StubOverlay),
+                Arc::new(StubVmRuntime {
+                    next_pid: AtomicU64::new(300),
+                    cancel_seen: Arc::new(AtomicBool::new(false)),
+                    alive_override: Some(alive),
+                    exit_probe,
+                }),
+            )
+            .unwrap(),
+        );
+        Arc::new(DaemonState::new(runtime))
     }
 
     fn test_client(state: Arc<DaemonState>) -> SandboxClient {
@@ -1901,5 +1970,446 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         server_task.await.unwrap().unwrap();
+    }
+
+    struct PausedVmRuntime {
+        inner: StubVmRuntime,
+        boot_started: Arc<tokio::sync::Semaphore>,
+        allow_boot: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl VmRuntimePort for PausedVmRuntime {
+        async fn boot_vm(&self, config: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+            self.boot_started.add_permits(1);
+            self.allow_boot
+                .acquire()
+                .await
+                .map_err(|error| SandboxError::Internal(error.to_string()))?
+                .forget();
+            <StubVmRuntime as VmRuntimePort>::boot_vm(&self.inner, config).await
+        }
+
+        async fn kill_orphan_process(
+            &self,
+            pid: u32,
+            expected_start_token: u64,
+        ) -> Result<bool, SandboxError> {
+            <StubVmRuntime as VmRuntimePort>::kill_orphan_process(
+                &self.inner,
+                pid,
+                expected_start_token,
+            )
+            .await
+        }
+    }
+
+    fn build_paused_test_state(
+        tmp: &TestTempDir,
+        boot_started: Arc<tokio::sync::Semaphore>,
+        allow_boot: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<DaemonState> {
+        let rt_cfg = RuntimeManagerConfig {
+            state_dir: tmp.path().join("state"),
+            sweep_interval: Duration::from_secs(10),
+            graceful_shutdown_timeout: Duration::from_millis(50),
+            max_copy_bytes: 8 * 1024 * 1024,
+            max_copy_entries: 1024,
+            cleanup_max_attempts: 3,
+            cleanup_initial_delay: Duration::from_millis(5),
+            admission: AdmissionLimits::default(),
+            warm_pool: WarmPoolConfig::default(),
+        };
+        let runtime = Arc::new(
+            LocalRuntimeManager::new(
+                rt_cfg,
+                Arc::new(StubOverlay),
+                Arc::new(PausedVmRuntime {
+                    inner: StubVmRuntime {
+                        next_pid: AtomicU64::new(200),
+                        cancel_seen: Arc::new(AtomicBool::new(false)),
+                        alive_override: None,
+                        exit_probe: None,
+                    },
+                    boot_started,
+                    allow_boot,
+                }),
+            )
+            .unwrap(),
+        );
+        Arc::new(DaemonState::new(runtime))
+    }
+
+    fn test_client_with_connect_counter(
+        state: Arc<DaemonState>,
+        connections: Arc<AtomicU64>,
+    ) -> SandboxClient {
+        let ep = if cfg!(windows) {
+            ControlEndpoint::NamedPipe(r"\\.\pipe\test-keyed-spawn".to_owned())
+        } else {
+            ControlEndpoint::UnixSocket(PathBuf::from("/tmp/test-keyed-spawn.sock"))
+        };
+        SandboxClient::with_connector(ep, move |_| {
+            connections.fetch_add(1, Ordering::AcqRel);
+            let state = Arc::clone(&state);
+            async move {
+                let (client_end, server_end) = duplex(1024 * 1024);
+                tokio::spawn(async move {
+                    let _ = serve_connection(server_end, state).await;
+                });
+                Ok(client_end)
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_replay_after_lost_response_reuses_its_lease_and_preserves_foreign_lease() {
+        let tmp = TestTempDir::new("keyed-spawn-lost-response");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let foreign = client
+            .spawn(sample_spec(NetworkPolicy::InternetOnly))
+            .await
+            .unwrap();
+        let operation_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+        let request = ControlRequest::SpawnKeyed {
+            operation_id: operation_id.clone(),
+            spec: spec.clone(),
+        };
+        let payload = request.to_json_bytes().unwrap();
+        let (mut client_end, server_end) = duplex(1024 * 1024);
+        let server_state = Arc::clone(&state);
+        let server_task = tokio::spawn(async move { serve_connection(server_end, server_state).await });
+
+        write_control_frame(&mut client_end, &payload).await.unwrap();
+        drop(client_end); // The daemon completes creation, but the client no longer receives its lease.
+        let _ = server_task.await.unwrap();
+
+        assert_eq!(state.list_sandboxes().len(), 2);
+        let keyed = client.spawn_keyed(operation_id.clone(), spec.clone()).await.unwrap();
+        let replay = client.spawn_keyed(operation_id.clone(), spec).await.unwrap();
+        assert_eq!(replay.id, keyed.id);
+        assert_ne!(keyed.id, foreign.id);
+        assert_eq!(
+            state.runtime.active_sandbox_network(&foreign.id).unwrap(),
+            NetworkPolicy::InternetOnly,
+            "keyed replay must leave an unrelated live lease unchanged"
+        );
+        assert_eq!(state.list_sandboxes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_keyed_replays_wait_for_creation_and_share_one_lease() {
+        let tmp = TestTempDir::new("keyed-spawn-concurrent");
+        let boot_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let allow_boot = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = build_paused_test_state(&tmp, Arc::clone(&boot_started), Arc::clone(&allow_boot));
+        let connections = Arc::new(AtomicU64::new(0));
+        let client = test_client_with_connect_counter(Arc::clone(&state), Arc::clone(&connections));
+        let operation_id = "00000000-0000-4000-8000-000000000002".to_owned();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+
+        let first_client = client.clone();
+        let first_id = operation_id.clone();
+        let first_spec = spec.clone();
+        let first = tokio::spawn(async move { first_client.spawn_keyed(first_id, first_spec).await });
+        tokio::time::timeout(Duration::from_secs(2), boot_started.acquire())
+            .await
+            .expect("first keyed spawn did not begin VM creation")
+            .unwrap()
+            .forget();
+
+        let mut retries = Vec::new();
+        for _ in 0..7 {
+            let retry_client = client.clone();
+            let retry_id = operation_id.clone();
+            let retry_spec = spec.clone();
+            retries.push(tokio::spawn(async move {
+                retry_client.spawn_keyed(retry_id, retry_spec).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while connections.load(Ordering::Acquire) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all keyed retries did not connect while creation was in progress");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(state.list_sandboxes().is_empty());
+
+        allow_boot.add_permits(1);
+        let first_lease = first.await.unwrap().unwrap();
+        for retry in retries {
+            let retry_lease = retry.await.unwrap().unwrap();
+            assert_eq!(first_lease.id, retry_lease.id);
+        }
+        assert_eq!(state.list_sandboxes().len(), 1);
+        assert!(boot_started.try_acquire().is_err(), "the duplicate key must not boot another VM");
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_rejects_spec_conflict_without_adopting_an_existing_lease() {
+        let tmp = TestTempDir::new("keyed-spawn-spec-conflict");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let foreign = client.spawn(sample_spec(NetworkPolicy::InternetOnly)).await.unwrap();
+        let operation_id = "00000000-0000-4000-8000-000000000003".to_owned();
+        let original_spec = sample_spec(NetworkPolicy::Isolated);
+        let keyed = client
+            .spawn_keyed(operation_id.clone(), original_spec.clone())
+            .await
+            .unwrap();
+        assert_ne!(keyed.id, foreign.id);
+
+        let mut changed_spec = original_spec;
+        changed_spec.network = NetworkPolicy::InternetOnly;
+        assert!(matches!(
+            client.spawn_keyed(operation_id, changed_spec).await,
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        assert_eq!(state.list_sandboxes().len(), 2);
+        assert!(state.runtime.active_sandbox_network(&foreign.id).is_ok());
+        assert!(state.runtime.active_sandbox_network(&keyed.id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_keeps_lease_when_transport_failure_is_not_confirmed_as_exit() {
+        let tmp = TestTempDir::new("keyed-spawn-transient-exit-probe");
+        let alive = Arc::new(AtomicBool::new(false));
+        let exit_probe = Arc::new(AtomicU8::new(1)); // Process query confirms it is still running.
+        let state = build_exit_probe_test_state(&tmp, Arc::clone(&alive), Some(exit_probe));
+        let client = test_client(Arc::clone(&state));
+        let operation_id = "00000000-0000-4000-8000-000000000008".to_owned();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+
+        assert!(matches!(
+            client.spawn_keyed(operation_id.clone(), spec.clone()).await,
+            Err(SandboxError::Transport(_))
+        ));
+        assert_eq!(state.list_sandboxes().len(), 1);
+        assert!(!state.list_sandboxes()[0].alive);
+        assert!(matches!(
+            client.spawn_keyed(operation_id, spec).await,
+            Err(SandboxError::Transport(_))
+        ));
+        assert_eq!(state.list_sandboxes().len(), 1, "retry must not create a second VM");
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_fails_closed_when_process_exit_cannot_be_confirmed() {
+        let tmp = TestTempDir::new("keyed-spawn-exit-probe-unavailable");
+        let alive = Arc::new(AtomicBool::new(false));
+        let state = build_exit_probe_test_state(&tmp, alive, None);
+        let client = test_client(Arc::clone(&state));
+        let operation_id = "00000000-0000-4000-8000-000000000009".to_owned();
+
+        assert!(matches!(
+            client.spawn_keyed(operation_id, sample_spec(NetworkPolicy::Isolated)).await,
+            Err(SandboxError::Internal(_))
+        ));
+        assert_eq!(state.list_sandboxes().len(), 1, "unknown process state must preserve the lease");
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_tombstone_survives_dead_on_spawn_and_daemon_restart() {
+        let tmp = TestTempDir::new("keyed-spawn-dead-on-spawn-restart");
+        let alive = Arc::new(AtomicBool::new(false));
+        let exit_probe = Arc::new(AtomicU8::new(2)); // Process exit is confirmed immediately after boot.
+        let state_before_restart =
+            build_exit_probe_test_state(&tmp, alive, Some(Arc::clone(&exit_probe)));
+        let client_before_restart = test_client(Arc::clone(&state_before_restart));
+        let operation_id = "00000000-0000-4000-8000-000000000010".to_owned();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+
+        assert!(matches!(
+            client_before_restart
+                .spawn_keyed(operation_id.clone(), spec.clone())
+                .await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+        let result_path = state_before_restart
+            .runtime
+            .config()
+            .state_dir
+            .join("spawn-operations")
+            .join(format!("{operation_id}.result"));
+        let result: serde_json::Value = serde_json::from_slice(&fs::read(result_path).unwrap()).unwrap();
+        let old_id = result["response"]["lease"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(result["response"]["type"], "Spawned");
+        assert_eq!(state_before_restart.list_sandboxes().len(), 0);
+        drop(client_before_restart);
+        drop(state_before_restart);
+
+        let (state_after_restart, _) = build_test_state(&tmp);
+        let client_after_restart = test_client(Arc::clone(&state_after_restart));
+        assert!(matches!(
+            client_after_restart
+                .spawn_keyed(operation_id.clone(), spec.clone())
+                .await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+        assert_eq!(state_after_restart.list_sandboxes().len(), 0);
+
+        let new_lease = client_after_restart
+            .spawn_keyed("00000000-0000-4000-8000-000000000011".to_owned(), spec)
+            .await
+            .unwrap();
+        assert_eq!(new_lease.id.as_str(), old_id, "the stub models PID-derived ID reuse");
+        assert!(matches!(
+            client_after_restart
+                .spawn_keyed(operation_id, sample_spec(NetworkPolicy::Isolated))
+                .await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+        assert_eq!(state_after_restart.list_sandboxes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_expiry_requires_a_new_operation_id_before_recreation() {
+        let tmp = TestTempDir::new("keyed-spawn-expiry");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let operation_id = "00000000-0000-4000-8000-000000000004".to_owned();
+        let mut spec = sample_spec(NetworkPolicy::Isolated);
+        spec.lease_ttl = Duration::from_millis(30);
+        let expired = client.spawn_keyed(operation_id.clone(), spec.clone()).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.runtime.sweep_expired_leases().await, 1);
+        assert!(state.list_sandboxes().is_empty());
+        assert!(matches!(
+            client.spawn_keyed(operation_id, spec.clone()).await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+
+        let replacement = client
+            .spawn_keyed("00000000-0000-4000-8000-000000000005".to_owned(), spec)
+            .await
+            .unwrap();
+        assert_ne!(replacement.id, expired.id);
+        assert_eq!(state.list_sandboxes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_result_survives_daemon_restart_and_reconciles_before_new_key() {
+        let tmp = TestTempDir::new("keyed-spawn-daemon-restart");
+        let (state_before_restart, _) = build_test_state(&tmp);
+        let client_before_restart = test_client(Arc::clone(&state_before_restart));
+        let operation_id = "00000000-0000-4000-8000-000000000006".to_owned();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+        let old_lease = client_before_restart
+            .spawn_keyed(operation_id.clone(), spec.clone())
+            .await
+            .unwrap();
+        drop(client_before_restart);
+        drop(state_before_restart); // Keep the active journal but drop daemon and registry memory.
+
+        let (state_after_restart, _) = build_test_state(&tmp);
+        let client_after_restart = test_client(Arc::clone(&state_after_restart));
+        assert_eq!(state_after_restart.status().active_sandboxes, 0);
+        assert!(matches!(
+            client_after_restart
+                .spawn_keyed(operation_id.clone(), spec.clone())
+                .await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+
+        let new_lease = client_after_restart
+            .spawn_keyed("00000000-0000-4000-8000-000000000007".to_owned(), spec)
+            .await
+            .unwrap();
+        // The stub runtime derives IDs from its PID counter, which is reset on
+        // daemon reconstruction. This models OS PID reuse: a fresh operation
+        // may get the same printable ID, but an old receipt must stay expired.
+        assert_eq!(new_lease.id, old_lease.id);
+        assert!(matches!(
+            client_after_restart
+                .spawn_keyed(operation_id, sample_spec(NetworkPolicy::Isolated))
+                .await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+        assert!(state_after_restart.runtime.active_sandbox_network(&new_lease.id).is_ok());
+        assert_eq!(state_after_restart.list_sandboxes().len(), 1);
+        let journal_dir = state_after_restart.runtime.config().state_dir.join("journals");
+        let journals = fs::read_dir(journal_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "journal"))
+            .count();
+        assert_eq!(journals, 1, "startup reconciliation must clean the old lease before spawning a new key");
+    }
+
+    #[tokio::test]
+    async fn unkeyed_spawn_destroys_leaked_vm_when_client_disconnects_before_reply() {
+        let tmp = TestTempDir::new("unkeyed-spawn-disconnect");
+        let (state, _) = build_test_state(&tmp);
+        let payload = ControlRequest::Spawn {
+            spec: sample_spec(NetworkPolicy::Isolated),
+        }
+        .to_json_bytes()
+        .unwrap();
+
+        let (mut client_end, server_end) = duplex(1024 * 1024);
+        write_control_frame(&mut client_end, &payload).await.unwrap();
+        // Drop client read half immediately so writing `Spawned` response hits BrokenPipe.
+        drop(client_end);
+
+        let err = serve_connection(server_end, Arc::clone(&state))
+            .await
+            .expect_err("disconnected client must fail response write");
+        assert!(matches!(err, SandboxError::Transport(_)));
+        assert_eq!(
+            state.list_sandboxes().len(),
+            0,
+            "unkeyed spawn must destroy VM if Spawned reply could not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_spawn_rejects_invalid_spec_before_writing_record_and_blocks_crashed_pending_retry() {
+        let tmp = TestTempDir::new("keyed-spawn-pending-recovery");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let op_bad = "00000000-0000-4000-8000-000000000091".to_owned();
+        let mut bad_spec = sample_spec(NetworkPolicy::Isolated);
+        bad_spec.lease_ttl = Duration::ZERO;
+        assert!(matches!(
+            client.spawn_keyed(op_bad.clone(), bad_spec).await,
+            Err(SandboxError::InvalidSpec(_))
+        ));
+        assert!(
+            !state
+                .runtime
+                .config()
+                .state_dir
+                .join("spawn-operations")
+                .join(format!("{op_bad}.spec"))
+                .exists(),
+            "invalid spec must be rejected before creating .spec on disk"
+        );
+
+        // Simulate a daemon crash between writing `<uuid>.pending` and writing `<uuid>.result`.
+        let op_crashed = "00000000-0000-4000-8000-000000000092".to_owned();
+        let dir = state.runtime.config().state_dir.join("spawn-operations");
+        fs::create_dir_all(&dir).unwrap();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+        fs::write(
+            dir.join(format!("{op_crashed}.spec")),
+            ControlRequest::Spawn { spec: spec.clone() }.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("{op_crashed}.pending")),
+            br#"{"incarnation":"previous-crashed-incarnation"}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.spawn_keyed(op_crashed, spec).await,
+            Err(SandboxError::LeaseExpired(_))
+        ));
+        assert_eq!(state.list_sandboxes().len(), 0);
     }
 }

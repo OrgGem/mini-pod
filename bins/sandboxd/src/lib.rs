@@ -5,3 +5,4 @@ pub mod config;
 mod doctor;
 pub mod mcp;
 pub mod server;
+mod spawn_registry;

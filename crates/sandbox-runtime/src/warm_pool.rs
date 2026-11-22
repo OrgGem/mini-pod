@@ -324,9 +324,15 @@ impl WarmPoolStore {
             return CheckoutPop::None;
         };
         if !entry.session.is_alive() || entry.booted_at.elapsed() >= max_idle_age {
+            Self::mark_transitioning_locked(&mut state, &entry);
             state.total_evictions = state.total_evictions.saturating_add(1);
             return CheckoutPop::ExpiredOrDead(entry);
         }
+        Self::mark_transitioning_locked(&mut state, &entry);
+        CheckoutPop::Candidate(entry)
+    }
+
+    fn mark_transitioning_locked(state: &mut WarmPoolState, entry: &WarmEntry) {
         state.transitioning.insert(
             entry.sandbox_id.clone(),
             TransitioningVm {
@@ -334,7 +340,6 @@ impl WarmPoolStore {
                 reserved_rss_mb: entry.reserved_rss_mb,
             },
         );
-        CheckoutPop::Candidate(entry)
     }
 
     pub(crate) fn commit_checkout(&self, sandbox_id: &SandboxId) {
@@ -349,9 +354,15 @@ impl WarmPoolStore {
         state.total_disposed_dirty = state.total_disposed_dirty.saturating_add(1);
     }
 
+    pub(crate) fn finish_eviction(&self, sandbox_id: &SandboxId) {
+        let mut state = lock_unpoisoned(&self.inner);
+        state.transitioning.remove(sandbox_id);
+    }
+
     pub(crate) fn pop_one_for_eviction(&self) -> Option<WarmEntry> {
         let mut state = lock_unpoisoned(&self.inner);
         let entry = state.ready.pop_front()?;
+        Self::mark_transitioning_locked(&mut state, &entry);
         state.total_evictions = state.total_evictions.saturating_add(1);
         Some(entry)
     }
@@ -363,6 +374,7 @@ impl WarmPoolStore {
         let mut expired = Vec::new();
         while let Some(entry) = state.ready.pop_front() {
             if !entry.session.is_alive() || entry.booted_at.elapsed() >= max_idle_age {
+                Self::mark_transitioning_locked(&mut state, &entry);
                 expired.push(entry);
             } else {
                 kept.push_back(entry);
@@ -375,7 +387,11 @@ impl WarmPoolStore {
 
     pub(crate) fn drain_ready(&self) -> Vec<WarmEntry> {
         let mut state = lock_unpoisoned(&self.inner);
-        state.ready.drain(..).collect()
+        let entries: Vec<WarmEntry> = state.ready.drain(..).collect();
+        for entry in &entries {
+            Self::mark_transitioning_locked(&mut state, entry);
+        }
+        entries
     }
 
     pub(crate) fn clear_ready_for_drop(&self) -> Vec<WarmEntry> {

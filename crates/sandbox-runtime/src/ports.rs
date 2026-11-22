@@ -118,6 +118,10 @@ pub trait VmSessionPort: Send + Sync {
     fn start_token(&self) -> u64;
     fn artifact_paths(&self) -> &[PathBuf];
     fn is_alive(&self) -> bool;
+    /// Confirms process exit without treating a failed process query as termination.
+    fn confirmed_exited(&self) -> Result<bool, SandboxError> {
+        Err(SandboxError::Internal("process exit confirmation is unavailable".to_owned()))
+    }
     fn current_rss_bytes(&self) -> Option<u64>;
     /// Returns the accelerator selected for this session when the driver exposes it.
     fn accelerator_name(&self) -> Option<&'static str> {
