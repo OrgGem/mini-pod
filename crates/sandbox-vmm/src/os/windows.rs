@@ -627,7 +627,7 @@ fn create_owner_only_named_pipe_raw(
 ) -> Result<(OwnedHandle, String), SandboxError> {
     validate_pipe_name(pipe_name)?;
     let user_sid = current_user_sid_string()?;
-    let sddl = owner_only_sddl(&user_sid, false);
+    let sddl = format!("O:{user_sid}{}", owner_only_sddl(&user_sid, false));
     let sd = sddl_to_security_descriptor(&sddl)?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,

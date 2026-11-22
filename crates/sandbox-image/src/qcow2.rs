@@ -344,11 +344,11 @@ fn reject_qemu_forbidden_chars(raw: &str) -> Result<(), SandboxError> {
 fn classify_qemu_img_error(qemu_img_bin: &Path, err: &io::Error) -> SandboxError {
     let path = qemu_img_bin.display();
     match err.raw_os_error() {
-        Some(1260) => SandboxError::BinaryExecutionBlocked(format!(
-            "qemu-img binary '{path}' was blocked by Windows AppLocker / software restriction policy (OS error 1260): {err}"
+        Some(code @ (1260 | 786)) => SandboxError::BinaryExecutionBlocked(format!(
+            "qemu-img binary '{path}' was blocked by Windows AppLocker / software restriction policy (OS error {code}): {err}"
         )),
-        Some(4551) => SandboxError::BinaryExecutionBlocked(format!(
-            "qemu-img binary '{path}' was blocked by Windows Defender Application Control / Smart App Control (OS error 4551): {err}"
+        Some(code @ (4551 | 4556..=4559 | 4580..=4582)) => SandboxError::BinaryExecutionBlocked(format!(
+            "qemu-img binary '{path}' was blocked by Windows Defender Application Control / Smart App Control (OS error {code}): {err}"
         )),
         Some(code @ (5 | 13 | 1)) => SandboxError::BinaryExecutionBlocked(format!(
             "qemu-img binary '{path}' execution was denied by OS security or permission policy (OS error {code}): {err}"
@@ -604,9 +604,13 @@ mod tests {
 
         let applocker = classify_qemu_img_error(bin, &io::Error::from_raw_os_error(1260));
         assert!(matches!(applocker, SandboxError::BinaryExecutionBlocked(_)));
+        let applocker_no_ui = classify_qemu_img_error(bin, &io::Error::from_raw_os_error(786));
+        assert!(matches!(applocker_no_ui, SandboxError::BinaryExecutionBlocked(_)));
 
         let wdac = classify_qemu_img_error(bin, &io::Error::from_raw_os_error(4551));
         assert!(matches!(wdac, SandboxError::BinaryExecutionBlocked(_)));
+        let sac = classify_qemu_img_error(bin, &io::Error::from_raw_os_error(4556));
+        assert!(matches!(sac, SandboxError::BinaryExecutionBlocked(_)));
 
         for code in [5, 13, 1] {
             let denied = classify_qemu_img_error(bin, &io::Error::from_raw_os_error(code));

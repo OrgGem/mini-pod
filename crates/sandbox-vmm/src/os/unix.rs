@@ -529,55 +529,10 @@ fn remove_stale_socket_if_safe(socket_path: &Path) -> Result<(), SandboxError> {
     })
 }
 
+#[allow(unsafe_code)]
 fn current_uid() -> Result<u32, SandboxError> {
-    #[cfg(target_os = "linux")]
-    if let Ok(meta) = fs::metadata("/proc/self") {
-        return Ok(meta.uid());
-    }
-
-    probe_uid_via_temp_file()
-}
-
-fn probe_uid_via_temp_file() -> Result<u32, SandboxError> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    struct ProbeCleanup(PathBuf);
-    impl Drop for ProbeCleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-
-    let tmp_dir = std::env::temp_dir();
-    for _ in 0..8 {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let probe_path = tmp_dir.join(format!("mp-uid-{}-{seq}", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&probe_path)
-        {
-            Ok(file) => {
-                let _cleanup = ProbeCleanup(probe_path);
-                let meta = file.metadata().map_err(|err| {
-                    SandboxError::Internal(format!("failed to read UID probe metadata: {err}"))
-                })?;
-                return Ok(meta.uid());
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(SandboxError::Internal(format!(
-                    "failed to determine current UID via temp probe '{}': {err}",
-                    probe_path.display()
-                )));
-            }
-        }
-    }
-
-    Err(SandboxError::Internal(
-        "exhausted retries while creating UID probe file".to_owned(),
-    ))
+    // SAFETY: `geteuid()` is always safe to call on POSIX systems and cannot fail.
+    Ok(unsafe { libc::geteuid() })
 }
 
 pub(crate) type PlatformConfinedProcess = UnixConfinedProcess;
@@ -921,6 +876,18 @@ pub fn kill_verified_orphan_process(
         return Ok(false);
     }
 
+    #[cfg(target_os = "linux")]
+    let minipod_cgroup_dir = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|raw| parse_proc_self_cgroup_v2(&raw))
+        .and_then(|rel| {
+            let trimmed = rel.trim_start_matches('/');
+            let last_seg = trimmed.rsplit('/').next().unwrap_or("");
+            last_seg
+                .starts_with("minipod-")
+                .then(|| Path::new("/sys/fs/cgroup").join(trimmed))
+        });
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut signaled = false;
@@ -938,6 +905,32 @@ pub fn kill_verified_orphan_process(
                     "failed to kill orphan process {raw_pid}: {err}"
                 )));
             }
+        }
+
+        if signaled {
+            let wait_deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < wait_deadline {
+                #[cfg(target_os = "linux")]
+                let still_alive = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Ok(stat) => parse_proc_stat_state_and_starttime(&stat)
+                        .is_some_and(|(st, tok)| st != 'Z' && tok == expected_start_token),
+                    Err(_) => false,
+                };
+                #[cfg(target_os = "macos")]
+                let still_alive = query_macos_proc_bsd_start_token(pid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(z, tok)| !z && tok == expected_start_token);
+                if !still_alive {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(cg_dir) = minipod_cgroup_dir {
+            let _ = fs::remove_dir(&cg_dir);
         }
 
         Ok(signaled)
@@ -1144,6 +1137,67 @@ fn attach_linux_cgroup_v2(
     (None, fallback_caps)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn enable_cgroup_subtree_controllers_with_evacuate<F>(
+    parent_cg: &Path,
+    subtree_path: &Path,
+    procs_path: &Path,
+    need_enable_cpu: bool,
+    need_enable_mem: bool,
+    mut write_fn: F,
+) where
+    F: FnMut(&Path, &str) -> io::Result<()>,
+{
+    let mut enable_controller = |token: &str| -> bool {
+        match write_fn(subtree_path, token) {
+            Ok(()) => true,
+            Err(err)
+                if err.kind() == io::ErrorKind::ResourceBusy
+                    || err.raw_os_error() == Some(libc::EBUSY) =>
+            {
+                let scope_dir = parent_cg.join("init.scope");
+                match fs::symlink_metadata(&scope_dir) {
+                    Ok(meta) if !meta.file_type().is_symlink() && meta.is_dir() => {}
+                    Ok(_) => return false,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        match fs::create_dir(&scope_dir) {
+                            Ok(()) => {}
+                            Err(ce) if ce.kind() == io::ErrorKind::AlreadyExists => {
+                                let Ok(meta) = fs::symlink_metadata(&scope_dir) else {
+                                    return false;
+                                };
+                                if meta.file_type().is_symlink() || !meta.is_dir() {
+                                    return false;
+                                }
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                    Err(_) => return false,
+                }
+                if let Ok(procs_raw) = fs::read_to_string(procs_path) {
+                    let scope_procs = scope_dir.join("cgroup.procs");
+                    for line in procs_raw.lines() {
+                        let pid_str = line.trim();
+                        if !pid_str.is_empty() {
+                            let _ = write_fn(&scope_procs, pid_str);
+                        }
+                    }
+                }
+                write_fn(subtree_path, token).is_ok()
+            }
+            Err(_) => false,
+        }
+    };
+
+    if need_enable_cpu {
+        let _ = enable_controller("+cpu");
+    }
+    if need_enable_mem {
+        let _ = enable_controller("+memory");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn try_attach_in_cgroup_parent(
     parent_cg: &Path,
@@ -1166,17 +1220,19 @@ fn try_attach_in_cgroup_parent(
         return None;
     }
 
+    enable_cgroup_subtree_controllers_with_evacuate(
+        parent_cg,
+        &subtree_path,
+        &procs_path,
+        need_enable_cpu,
+        need_enable_mem,
+        |path, val| fs::write(path, val),
+    );
+
     let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
     let child_cg = parent_cg.join(format!("minipod-{}-{pid}-{seq}", std::process::id()));
     if fs::create_dir(&child_cg).is_err() {
         return None;
-    }
-
-    if need_enable_cpu {
-        let _ = fs::write(&subtree_path, "+cpu");
-    }
-    if need_enable_mem {
-        let _ = fs::write(&subtree_path, "+memory");
     }
 
     let mut cpu_level = if cpu_req.is_some() {
@@ -1626,5 +1682,46 @@ mod tests {
                 cg_dir.display()
             );
         }
+    }
+
+    #[test]
+    fn cgroup_subtree_control_evacuates_internal_procs_to_init_scope_on_ebusy() {
+        let dir = CleanupDir::unique("cgroup-ebusy");
+        fs::create_dir_all(&dir.0).unwrap();
+        let subtree_path = dir.0.join("cgroup.subtree_control");
+        let procs_path = dir.0.join("cgroup.procs");
+        fs::write(&procs_path, "1234\n5678\n").unwrap();
+
+        let mut moved = Vec::new();
+        let mut enabled = Vec::new();
+        enable_cgroup_subtree_controllers_with_evacuate(
+            &dir.0,
+            &subtree_path,
+            &procs_path,
+            true,
+            true,
+            |path, val| {
+                if path == subtree_path {
+                    if moved.len() < 2 {
+                        return Err(io::Error::from_raw_os_error(libc::EBUSY));
+                    }
+                    enabled.push(val.to_owned());
+                    Ok(())
+                } else {
+                    moved.push((path.to_path_buf(), val.to_owned()));
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(dir.0.join("init.scope").is_dir());
+        assert_eq!(
+            moved,
+            vec![
+                (dir.0.join("init.scope").join("cgroup.procs"), "1234".to_owned()),
+                (dir.0.join("init.scope").join("cgroup.procs"), "5678".to_owned()),
+            ]
+        );
+        assert_eq!(enabled, vec!["+cpu", "+memory"]);
     }
 }

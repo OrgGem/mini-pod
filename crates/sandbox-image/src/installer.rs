@@ -717,12 +717,21 @@ fn sweep_stale_backup_dirs(parent: &Path, bundle_id: &str) {
     }
 }
 
-fn bundle_lock_and_intent_paths(target_dir: &Path) -> Option<(PathBuf, PathBuf)> {
-    let parent = target_dir.parent().filter(|p| !p.as_os_str().is_empty())?;
+fn bundle_parent_and_name(target_dir: &Path) -> Option<(PathBuf, &str)> {
     let name = target_dir.file_name()?.to_str()?;
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return None;
     }
+    let parent = match target_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        Some(_) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        None => return None,
+    };
+    Some((parent, name))
+}
+
+fn bundle_lock_and_intent_paths(target_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (parent, name) = bundle_parent_and_name(target_dir)?;
     Some((
         parent.join(format!(".lock-{name}")),
         parent.join(format!(".promote-{name}.v1")),
@@ -927,7 +936,7 @@ fn recover_promotion_under_exclusive_lock(
         }
     }
 
-    let Some(parent) = target_dir.parent() else {
+    let Some((parent, _)) = bundle_parent_and_name(target_dir) else {
         return Err(SandboxError::Internal(
             "target bundle directory has no parent during recovery".to_owned(),
         ));
@@ -1844,5 +1853,10 @@ mod tests {
         drop(guard);
         open_bundle_lock_exclusive_timeout(&lock_path, Duration::from_millis(100))
             .expect("exclusive lock succeeds after read guard drops");
+
+        let (rel_lock, rel_intent) = bundle_lock_and_intent_paths(Path::new("my-bundle"))
+            .expect("single-component relative bundle path must resolve lock and intent paths");
+        assert!(rel_lock.ends_with(".lock-my-bundle"));
+        assert!(rel_intent.ends_with(".promote-my-bundle.v1"));
     }
 }

@@ -236,15 +236,15 @@ impl SpawnRegistry {
                         SandboxError::Internal(format!("journal probe task failed: {err}"))
                     })??
                     .is_some();
-                if has_journal {
-                    if matches!(
+                if has_journal
+                    && matches!(
                         self.runtime.destroy(&lease.id).await?,
                         DestroyStatus::ProcessExited { .. }
-                    ) {
-                        return Err(SandboxError::AdmissionRejected(
-                            "keyed sandbox cleanup is still in progress".to_owned(),
-                        ));
-                    }
+                    )
+                {
+                    return Err(SandboxError::AdmissionRejected(
+                        "keyed sandbox cleanup is still in progress".to_owned(),
+                    ));
                 }
                 return Err(SandboxError::LeaseExpired(
                     "keyed spawn's sandbox is no longer active".to_owned(),

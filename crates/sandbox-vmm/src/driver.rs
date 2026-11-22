@@ -42,6 +42,17 @@ use crate::spike::{
 };
 
 const MAX_HOST_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+/// Minimum per-frame heap accounting charged per inbound `StreamData` item so 1-byte
+/// frame floods cannot multiply host queued memory beyond `MAX_STREAM_INBOUND_BUFFER_BYTES`.
+const STREAM_FRAME_OVERHEAD_BYTES: usize = 64;
+
+fn inbound_frame_cost(payload_len: usize) -> usize {
+    if payload_len == 0 {
+        0
+    } else {
+        payload_len.saturating_add(STREAM_FRAME_OVERHEAD_BYTES)
+    }
+}
 // shortcut: fixed 4096-frame / 4 MiB host->guest control lane cap closes session on overflow, add async caller backpressure on control enqueue if legit burst exceeds 4096 queued control frames
 const MAX_OUTBOUND_CONTROL_FRAMES: usize = 4096;
 const MAX_OUTBOUND_CONTROL_QUEUE_BYTES: usize = 4 * 1024 * 1024;
@@ -1335,6 +1346,7 @@ impl VmSessionPort for QemuVmSession {
         }
         let mut stream_guard = CopyStreamGuard::new(stream_id, &self.ops, &self.outbound);
 
+        let mut all_sent = false;
         if tar_bytes.is_empty() {
             match tokio::time::timeout(
                 self.io_timeout,
@@ -1349,7 +1361,7 @@ impl VmSessionPort for QemuVmSession {
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => all_sent = true,
                 Ok(Err(err)) => return Err(err),
                 Err(_) => {
                     return Err(SandboxError::Transport(format!(
@@ -1402,13 +1414,23 @@ impl VmSessionPort for QemuVmSession {
                     }
                 }
                 offset = end;
+                if eof {
+                    all_sent = true;
+                }
             }
         }
 
         match tokio::time::timeout(self.io_timeout, reply_rx).await {
             Ok(Ok(outcome)) => {
                 stream_guard.disarm();
-                outcome
+                let bytes_transferred = outcome?;
+                if !all_sent || bytes_transferred != tar_bytes.len() as u64 {
+                    return Err(SandboxError::Transport(format!(
+                        "copy_in byte count mismatch (sent {} bytes, all_sent={all_sent}, guest reported {bytes_transferred})",
+                        tar_bytes.len()
+                    )));
+                }
+                Ok(bytes_transferred)
             }
             Ok(Err(_)) => Err(SandboxError::Transport(
                 "copy_in interrupted before guest CopyDone".to_owned(),
@@ -1689,11 +1711,12 @@ async fn pump_exec_output(
         match item {
             ExecInbound::Output { channel, chunk } => {
                 let len = chunk.data.len();
+                let cost = inbound_frame_cost(len);
                 if let Some(tx) = output_tx.as_ref() {
                     let send_res = tokio::select! {
                         biased;
                         changed = session_closed_rx.changed() => {
-                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                             let reason = changed
                                 .ok()
                                 .and_then(|()| session_closed_rx.borrow().clone())
@@ -1709,7 +1732,7 @@ async fn pump_exec_output(
                                 None => std::future::pending::<()>().await,
                             }
                         } => {
-                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                             cancel_and_cleanup_abandoned_exec(stream_id, &ops, &outbound);
                             return;
                         }
@@ -1719,7 +1742,7 @@ async fn pump_exec_output(
                         output_tx = None;
                     }
                 }
-                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                 send_stream_credit(&outbound, stream_id, channel, len);
             }
             ExecInbound::Exit(status) => {
@@ -1836,15 +1859,16 @@ async fn pump_tunnel_inbound(
             TunnelInbound::Data { data, eof } => {
                 let len = data.len();
                 if len > 0 {
+                    let cost = inbound_frame_cost(len);
                     let write_res = tokio::select! {
                         biased;
                         _ = session_closed_rx.changed() => {
-                            queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                             break;
                         }
                         res = write_half.write_all(&data) => res,
                     };
-                    queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                    queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                     if write_res.is_err() {
                         break;
                     }
@@ -2153,9 +2177,10 @@ fn run_reader_loop(
                         };
                         if let Some(stream_kind) = kind.filter(|_| !data.is_empty()) {
                             let len = data.len();
-                            let prev = queued_bytes.fetch_add(len, Ordering::AcqRel);
-                            if prev.saturating_add(len) > MAX_STREAM_INBOUND_BUFFER_BYTES {
-                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            let cost = inbound_frame_cost(len);
+                            let prev = queued_bytes.fetch_add(cost, Ordering::AcqRel);
+                            if prev.saturating_add(cost) > MAX_STREAM_INBOUND_BUFFER_BYTES {
+                                queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                                 if let Some(StreamHandler::Exec {
                                     inbound_tx,
                                     stdin_credits,
@@ -2189,7 +2214,7 @@ fn run_reader_loop(
                                 })
                                 .is_err()
                             {
-                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                                queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                             }
                         }
                     }
@@ -2220,9 +2245,13 @@ fn run_reader_loop(
                             }
                         } else {
                             buffer.extend_from_slice(&data);
-                            let notify = Arc::clone(activity);
-                            drop(map);
-                            notify.notify_one();
+                            if !data.is_empty() || eof {
+                                let notify = Arc::clone(activity);
+                                drop(map);
+                                notify.notify_one();
+                            } else {
+                                drop(map);
+                            }
                             send_stream_credit(
                                 &outbound,
                                 stream_id,
@@ -2260,9 +2289,10 @@ fn run_reader_loop(
                                 *stdout_eof_seen = true;
                             }
                             let len = data.len();
-                            let prev = queued_bytes.fetch_add(len, Ordering::AcqRel);
-                            if prev.saturating_add(len) > MAX_STREAM_INBOUND_BUFFER_BYTES {
-                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                            let cost = inbound_frame_cost(len);
+                            let prev = queued_bytes.fetch_add(cost, Ordering::AcqRel);
+                            if prev.saturating_add(cost) > MAX_STREAM_INBOUND_BUFFER_BYTES {
+                                queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                                 if let Some(StreamHandler::Tunnel {
                                     inbound_tx,
                                     stdin_credits,
@@ -2284,7 +2314,7 @@ fn run_reader_loop(
                                 .send(TunnelInbound::Data { data, eof })
                                 .is_err()
                             {
-                                queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                                queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                             }
                         }
                     }
@@ -4548,6 +4578,132 @@ mod tests {
             .expect("guest must observe StreamClose for both stalled copy operations")
             .unwrap();
         assert_ne!(in_sid, out_sid);
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_in_rejects_mismatched_copy_done_and_empty_copy_out_frames_do_not_prevent_timeout() {
+        let listener = AgentIpcEndpoint::bind_temp("drv-copy-hardening").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            // 1. CopyIn receives 3 bytes + EOF, guest lies and replies CopyDone(1).
+            let in_start = read_frame(&mut client).unwrap();
+            let in_sid = in_start.header.stream_id;
+            loop {
+                let frame = read_frame(&mut client).unwrap();
+                if frame.header.stream_id == in_sid {
+                    if let Message::StreamData { eof: true, .. } = frame.decode_message().unwrap() {
+                        break;
+                    }
+                }
+            }
+            write_frame(
+                &mut client,
+                &Frame::from_message(in_sid, &Message::CopyDone { bytes_transferred: 1 }).unwrap(),
+            )
+            .unwrap();
+
+            // 2. CopyOut receives CopyOutStart, guest spams 0-byte non-EOF heartbeats.
+            let out_start = read_frame(&mut client).unwrap();
+            let out_sid = out_start.header.stream_id;
+            for _ in 0..4 {
+                thread::sleep(Duration::from_millis(25));
+                if write_frame(
+                    &mut client,
+                    &Frame::from_message(
+                        out_sid,
+                        &Message::StreamData {
+                            channel: StreamChannel::Stdout,
+                            eof: false,
+                            data: Vec::new(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session =
+            QemuVmSession::from_test_stream(host_stream, Duration::from_millis(75)).unwrap();
+
+        let err_in = session
+            .copy_in_tar("/workspace", b"abc".to_vec(), 4096)
+            .await
+            .expect_err("copy_in with mismatched CopyDone count must fail");
+        assert!(matches!(err_in, SandboxError::Transport(_)), "got {err_in:?}");
+
+        let err_out = session
+            .copy_out_tar("/workspace", 4096)
+            .await
+            .expect_err("0-byte CopyOut heartbeats must not defeat io_timeout");
+        assert!(matches!(err_out, SandboxError::Transport(_)), "got {err_out:?}");
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_byte_exec_stream_frames_are_bounded_by_per_frame_overhead() {
+        let listener = AgentIpcEndpoint::bind_temp("drv-small-frame-cap").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            let start = read_frame(&mut client).unwrap();
+            let sid = start.header.stream_id;
+            // Flood ~34,000 1-byte frames (~34 KiB payload, > 2 MiB with 64B overhead each).
+            for _ in 0..34_000 {
+                if write_frame(
+                    &mut client,
+                    &Frame::from_message(
+                        sid,
+                        &Message::StreamData {
+                            channel: StreamChannel::Stdout,
+                            eof: false,
+                            data: vec![b'x'],
+                        },
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::from_test_stream(host_stream, Duration::from_secs(2)).unwrap();
+        let mut exec = session
+            .exec_stream(ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec!["/bin/sh".into()],
+                env: Default::default(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(2),
+                stdout_budget_bytes: 16 * 1024 * 1024,
+                stderr_budget_bytes: 16 * 1024 * 1024,
+            })
+            .await
+            .unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(4), exec.wait_exit())
+            .await
+            .expect("small-frame flood must abort promptly");
+        assert!(status.is_err(), "expected Transport abort on small-frame flood, got {status:?}");
 
         session.force_kill().await.unwrap();
         guest_thread.join().unwrap();

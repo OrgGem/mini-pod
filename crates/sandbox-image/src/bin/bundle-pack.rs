@@ -580,7 +580,7 @@ mod win_owner_file {
 
     pub(super) fn create_owner_only_new_file(path: &Path) -> Result<File, SandboxError> {
         let user_sid = current_user_sid_string()?;
-        let sddl = format!("D:P(A;;GA;;;{user_sid})");
+        let sddl = format!("O:{user_sid}D:P(A;;GA;;;{user_sid})");
         let wide_sddl = to_wide_null(OsStr::new(&sddl))?;
 
         let mut raw_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();

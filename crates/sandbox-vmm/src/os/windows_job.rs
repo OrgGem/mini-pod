@@ -579,7 +579,21 @@ pub(crate) fn spawn_in_job_internal(
     })
 }
 
+fn is_forbidden_windows_script(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd")
+    })
+}
+
+fn is_single_bare_filename(path: &Path) -> bool {
+    let mut comps = path.components();
+    matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
+}
+
 fn resolve_windows_application_path(program: &Path) -> Result<std::path::PathBuf, SandboxError> {
+    if !is_single_bare_filename(program) {
+        return resolve_windows_application_path_in_dirs(program, &[]);
+    }
     let mut search_dirs = Vec::new();
     if let Some(sys_root) = std::env::var_os("SystemRoot") {
         let sys32 = std::path::PathBuf::from(sys_root).join("System32");
@@ -603,21 +617,21 @@ fn resolve_windows_application_path_in_dirs(
     program: &Path,
     search_dirs: &[std::path::PathBuf],
 ) -> Result<std::path::PathBuf, SandboxError> {
-    use std::os::windows::ffi::OsStrExt;
-
     if program.as_os_str().is_empty() {
         return Err(SandboxError::InvalidSpec(
             "process launch program path cannot be empty".to_owned(),
         ));
     }
+    if is_forbidden_windows_script(program) {
+        return Err(SandboxError::PolicyViolation(format!(
+            "refusing Windows batch/script launcher '{}'; native executables only",
+            program.display()
+        )));
+    }
     let has_exe_ext = program
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
-    let has_sep_or_drive = program
-        .as_os_str()
-        .encode_wide()
-        .any(|u| u == b'\\' as u16 || u == b'/' as u16 || u == b':' as u16);
-    if has_sep_or_drive {
+    if !is_single_bare_filename(program) {
         if !has_exe_ext && !program.is_file() {
             let mut with_exe = program.as_os_str().to_os_string();
             with_exe.push(".exe");
@@ -644,7 +658,7 @@ fn resolve_windows_application_path_in_dirs(
         }
         for leaf in &leaf_names {
             let candidate = dir.join(leaf);
-            if candidate.is_file() {
+            if candidate.is_file() && !is_forbidden_windows_script(&candidate) {
                 return Ok(candidate);
             }
         }
@@ -1635,6 +1649,28 @@ mod tests {
                 Path::new("qemu-system-x86_64"),
                 &[std::path::PathBuf::from(".")],
             ),
+            Err(SandboxError::NotFound(_))
+        ));
+
+        for bad_script in [
+            Path::new("qemu.bat"),
+            Path::new("qemu.CMD"),
+            Path::new(r"C:\tools\qemu.bat"),
+        ] {
+            assert!(
+                matches!(
+                    resolve_windows_application_path_in_dirs(bad_script, &dirs),
+                    Err(SandboxError::PolicyViolation(_))
+                ),
+                "batch launcher {} must be rejected",
+                bad_script.display()
+            );
+        }
+
+        // Batch files in search dirs must never satisfy bare-name lookup, even without a `.exe`.
+        fs::write(abs_dir.join("only-batch.cmd"), b"@echo off\r\n").unwrap();
+        assert!(matches!(
+            resolve_windows_application_path_in_dirs(Path::new("only-batch"), &dirs),
             Err(SandboxError::NotFound(_))
         ));
     }
