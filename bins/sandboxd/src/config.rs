@@ -1,9 +1,12 @@
 //! CLI configuration, environment defaults, and strict control-endpoint policy checks for `sandboxd`.
 
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sandbox_client::ControlEndpoint;
+use sandbox_client::{ControlEndpoint, DEFAULT_MAX_COPY_BYTES};
+use sandbox_core::safe_tar::{apply_open_no_follow, reject_symlink_or_reparse};
 use sandbox_core::{
     AccelerationPolicy, GuestArch, IsolationMode, NetworkPolicy, ResourceBudget, SandboxError,
     SandboxSpec,
@@ -71,7 +74,8 @@ impl PubKeySource {
                         path.display()
                     ))
                 })?;
-                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                reject_symlink_or_reparse(path, &meta)?;
+                if !meta.file_type().is_file() {
                     return Err(SandboxError::PolicyViolation(format!(
                         "pub-key-file '{}' must be a regular non-symlink file",
                         path.display()
@@ -84,9 +88,54 @@ impl PubKeySource {
                         MAX_PUB_KEY_FILE_BYTES
                     )));
                 }
-                let content = std::fs::read_to_string(path).map_err(|err| {
+                let mut opts = OpenOptions::new();
+                opts.read(true);
+                apply_open_no_follow(&mut opts);
+                let file = opts.open(path).map_err(|err| {
                     SandboxError::InvalidSpec(format!(
-                        "failed to read pub-key-file '{}': {err}",
+                        "failed to open pub-key-file '{}': {err}",
+                        path.display()
+                    ))
+                })?;
+                let open_meta = file.metadata().map_err(|err| {
+                    SandboxError::InvalidSpec(format!(
+                        "failed to inspect opened pub-key-file '{}': {err}",
+                        path.display()
+                    ))
+                })?;
+                reject_symlink_or_reparse(path, &open_meta)?;
+                if !open_meta.file_type().is_file() {
+                    return Err(SandboxError::PolicyViolation(format!(
+                        "pub-key-file '{}' must be a regular non-symlink file",
+                        path.display()
+                    )));
+                }
+                if open_meta.len() > MAX_PUB_KEY_FILE_BYTES {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "pub-key-file '{}' exceeds {} bytes",
+                        path.display(),
+                        MAX_PUB_KEY_FILE_BYTES
+                    )));
+                }
+                let mut raw = Vec::with_capacity(open_meta.len() as usize);
+                file.take(MAX_PUB_KEY_FILE_BYTES + 1)
+                    .read_to_end(&mut raw)
+                    .map_err(|err| {
+                        SandboxError::InvalidSpec(format!(
+                            "failed to read pub-key-file '{}': {err}",
+                            path.display()
+                        ))
+                    })?;
+                if (raw.len() as u64) > MAX_PUB_KEY_FILE_BYTES {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "pub-key-file '{}' exceeds {} bytes",
+                        path.display(),
+                        MAX_PUB_KEY_FILE_BYTES
+                    )));
+                }
+                let content = std::str::from_utf8(&raw).map_err(|err| {
+                    SandboxError::InvalidSpec(format!(
+                        "pub-key-file '{}' is not valid UTF-8: {err}",
                         path.display()
                     ))
                 })?;
@@ -129,6 +178,7 @@ impl ServeConfig {
 
         let cfg = RuntimeManagerConfig {
             state_dir: self.state_dir.clone(),
+            max_copy_bytes: DEFAULT_MAX_COPY_BYTES,
             admission: AdmissionLimits {
                 max_concurrent_sandboxes: self.max_sandboxes,
                 max_total_host_rss_mb: self.max_rss_mb,
@@ -864,5 +914,47 @@ mod tests {
             };
             assert!(path.to_str().unwrap().len() <= 103);
         }
+    }
+
+    #[test]
+    fn to_runtime_config_aligns_copy_budget_and_pubkey_file_rejects_symlinks_and_oversize() {
+        let Command::Serve(serve_cfg) = parse_args_with(
+            &args(&["serve", "--bundle-dir", "bundle", "--state-dir", "state"]),
+            no_env,
+        )
+        .unwrap() else {
+            panic!("expected Command::Serve");
+        };
+        let rt_cfg = serve_cfg.to_runtime_config().unwrap();
+        assert_eq!(rt_cfg.max_copy_bytes, DEFAULT_MAX_COPY_BYTES);
+
+        let dir = std::env::temp_dir().join(format!(
+            "mp-cfg-key-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let big_file = dir.join("big.pub");
+        std::fs::write(&big_file, vec![b'a'; (MAX_PUB_KEY_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(matches!(
+            PubKeySource::File(big_file).load_verifier(),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let real = dir.join("real.pub");
+            std::fs::write(&real, "00".repeat(32)).unwrap();
+            let sym = dir.join("sym.pub");
+            symlink(&real, &sym).unwrap();
+            assert!(matches!(
+                PubKeySource::File(sym).load_verifier(),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

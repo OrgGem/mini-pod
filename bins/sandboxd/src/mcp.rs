@@ -22,6 +22,7 @@ use crate::server::{build_runtime, daemon_status_info, wait_for_shutdown_signal}
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_EXEC_DEADLINE_SECS: u64 = 30;
 const DEFAULT_EXEC_OUTPUT_BUDGET_BYTES: u64 = 1024 * 1024;
+const MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum byte length of a single newline-delimited JSON-RPC 2.0 request line over MCP stdio.
 // shortcut: fixed 4 MiB JSON-RPC line cap over MCP stdio, add McpConfig override if larger inline payloads are needed
 pub const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -62,7 +63,11 @@ impl McpBackend {
             Self::Connected(client) => {
                 let stream = client.exec_stream(id, req).await?;
                 if let Some(data) = stdin {
-                    stream.write_stdin(data).await?;
+                    if let Err(err) = stream.write_stdin(data).await {
+                        if !matches!(err, SandboxError::Transport(_)) {
+                            return Err(err);
+                        }
+                    }
                 }
                 let out = stream.collect().await?;
                 Ok((out.stdout, out.stderr, out.exit))
@@ -70,7 +75,11 @@ impl McpBackend {
             Self::Standalone(runtime) => {
                 let stream = runtime.exec_stream(id, req).await?;
                 if let Some(data) = stdin {
-                    stream.write_stdin(data).await?;
+                    if let Err(err) = stream.write_stdin(data).await {
+                        if !matches!(err, SandboxError::Transport(_)) {
+                            return Err(err);
+                        }
+                    }
                 }
                 let out = stream.collect().await?;
                 Ok((out.stdout, out.stderr, out.exit))
@@ -798,6 +807,9 @@ fn parse_exec_args(
         let s = item
             .as_str()
             .ok_or_else(|| "Invalid params: every 'argv' element must be a string".to_owned())?;
+        if s.contains('\0') {
+            return Err("Invalid params: 'argv' elements must not contain NUL bytes".to_owned());
+        }
         argv.push(s.to_owned());
     }
 
@@ -805,14 +817,25 @@ fn parse_exec_args(
         Some("") => {
             return Err("Invalid params: 'container' must not be empty".to_owned());
         }
-        Some(name) => ExecTarget::Container {
-            id_or_name: name.to_owned(),
-        },
+        Some(name) => {
+            if name.contains('\0') {
+                return Err("Invalid params: 'container' must not contain NUL bytes".to_owned());
+            }
+            ExecTarget::Container {
+                id_or_name: name.to_owned(),
+            }
+        }
         None => ExecTarget::Guest,
     };
 
     let cwd = opt_str(args, "cwd")?.map(str::to_owned);
+    if cwd.as_deref().is_some_and(|s| s.contains('\0')) {
+        return Err("Invalid params: 'cwd' must not contain NUL bytes".to_owned());
+    }
     let user = opt_str(args, "user")?.map(str::to_owned);
+    if user.as_deref().is_some_and(|s| s.contains('\0')) {
+        return Err("Invalid params: 'user' must not contain NUL bytes".to_owned());
+    }
 
     let mut env = BTreeMap::new();
     if let Some(env_val) = args.get("env") {
@@ -821,9 +844,19 @@ fn parse_exec_args(
                 .as_object()
                 .ok_or_else(|| "Invalid params: 'env' must be an object".to_owned())?;
             for (k, v) in env_obj {
+                if k.is_empty() || k.contains('=') || k.contains('\0') {
+                    return Err(format!(
+                        "Invalid params: env key '{k}' must be non-empty and must not contain '=' or NUL"
+                    ));
+                }
                 let v_str = v.as_str().ok_or_else(|| {
                     format!("Invalid params: env['{k}'] must be a string")
                 })?;
+                if v_str.contains('\0') {
+                    return Err(format!(
+                        "Invalid params: env['{k}'] must not contain NUL bytes"
+                    ));
+                }
                 env.insert(k.clone(), v_str.to_owned());
             }
         }
@@ -846,6 +879,13 @@ fn parse_exec_args(
         opt_u64(args, "stderr_budget_bytes")?.unwrap_or(DEFAULT_EXEC_OUTPUT_BUDGET_BYTES);
     if stdout_budget_bytes == 0 || stderr_budget_bytes == 0 {
         return Err("Invalid params: output budgets must be greater than zero".to_owned());
+    }
+    if stdout_budget_bytes > MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES
+        || stderr_budget_bytes > MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES
+    {
+        return Err(format!(
+            "Invalid params: output budgets must not exceed {MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES} bytes"
+        ));
     }
 
     let req = ExecRequest {
@@ -1007,8 +1047,8 @@ fn tool_definitions() -> Value {
                     "env": { "type": "object", "additionalProperties": { "type": "string" } },
                     "stdin": { "type": "string" },
                     "deadline_secs": { "type": "integer", "minimum": 1 },
-                    "stdout_budget_bytes": { "type": "integer", "minimum": 1 },
-                    "stderr_budget_bytes": { "type": "integer", "minimum": 1 }
+                    "stdout_budget_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES },
+                    "stderr_budget_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES }
                 },
                 "required": ["sandbox_id", "argv"]
             }
@@ -1170,6 +1210,22 @@ mod tests {
 
         async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError> {
             let (stream, mut handle) = ExecStream::channel(StreamId(1));
+            if req.argv.first().map(String::as_str) == Some("early-exit") {
+                handle.stdin_rx.close();
+                let _ = handle
+                    .send_output(ExecOutputChunk {
+                        stream: OutputStreamKind::Stderr,
+                        data: b"fast-fail\n".to_vec(),
+                    })
+                    .await;
+                handle.finish(Ok(ExecExitStatus {
+                    code: Some(42),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                }));
+                return Ok(stream);
+            }
             tokio::spawn(async move {
                 let mut stdin_bytes = Vec::new();
                 while let Some(chunk) = handle.recv_stdin().await {
@@ -1492,5 +1548,56 @@ mod tests {
             rt.active_sandbox_ids().is_empty(),
             "standalone sandboxes must be destroyed on signal shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_exec_caps_budgets_validates_nul_and_env_and_preserves_early_exit_output() {
+        // 1. Validate parse_exec_args caps & NUL/env checks.
+        let oversized = json!({
+            "sandbox_id": "sbx-1",
+            "argv": ["echo"],
+            "stdout_budget_bytes": MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES + 1,
+        });
+        assert!(parse_exec_args(oversized.as_object().unwrap()).is_err());
+
+        for bad_args in [
+            json!({"sandbox_id": "sbx-1", "argv": ["a\0b"]}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "cwd": "/tmp/\0bad"}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "user": "root\0"}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "container": "c\0"}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "env": {"": "1"}}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "env": {"A=B": "1"}}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "env": {"K\0": "1"}}),
+            json!({"sandbox_id": "sbx-1", "argv": ["sh"], "env": {"K": "v\0"}}),
+        ] {
+            assert!(
+                parse_exec_args(bad_args.as_object().unwrap()).is_err(),
+                "must reject invalid exec args: {bad_args}"
+            );
+        }
+
+        // 2. Fast-exiting command with unread stdin still returns stderr + exit code instead of Transport error.
+        let tmp = TestTempDir::new("early-exit-stdin");
+        let rt = build_runtime_for_test(&tmp);
+        let backend = McpBackend::Standalone(Arc::clone(&rt));
+        let lease = backend
+            .spawn(parse_spawn_args(&Map::new()).unwrap())
+            .await
+            .unwrap();
+        let req = ExecRequest {
+            target: ExecTarget::Guest,
+            argv: vec!["early-exit".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+            user: None,
+            deadline: Duration::from_secs(5),
+            stdout_budget_bytes: 4096,
+            stderr_budget_bytes: 4096,
+        };
+        let out = execute_exec(&backend, &lease.id, req, Some(b"unread-stdin".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 42);
+        assert_eq!(out["stderr"], "fast-fail\n");
     }
 }

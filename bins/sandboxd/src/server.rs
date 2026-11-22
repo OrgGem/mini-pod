@@ -14,7 +14,9 @@ use std::time::Duration;
 use sandbox_client::{
     read_control_frame, write_control_frame, ControlEndpoint, ControlRequest, ControlResponse,
     DaemonStatusInfo, ExecWireClientMsg, ExecWireEvent, SandboxSummaryInfo, WireError,
+    MAX_CONTROL_FRAME_BYTES,
 };
+use sandbox_core::safe_tar::{apply_open_no_follow, ensure_safe_dir_path, reject_symlink_or_reparse};
 use sandbox_core::{DestroyStatus, NetworkPolicy, SandboxError, SandboxId};
 #[cfg(windows)]
 use sandbox_docker_compat::NamedPipeServerHandle;
@@ -46,6 +48,7 @@ const CONTROL_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 static NEXT_DOCKER_COMPAT_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_READY_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 enum DockerListenerHandle {
     #[cfg(windows)]
@@ -879,21 +882,31 @@ fn remove_stale_socket_if_safe(socket_path: &Path, verified_parent: &Path) -> Re
 }
 
 fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), SandboxError> {
+    struct TempFileGuard(Option<std::path::PathBuf>);
+    impl TempFileGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if let Some(p) = &self.0 {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|err| {
-        SandboxError::Transport(format!(
-            "failed to create ready-file parent directory '{}': {err}",
-            parent.display()
-        ))
-    })?;
+    ensure_safe_dir_path(parent, true)?;
 
     if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
+        reject_symlink_or_reparse(path, &meta)?;
+        if meta.is_dir() {
             return Err(SandboxError::PolicyViolation(format!(
-                "refusing symlink ready-file target '{}'",
+                "ready-file '{}' must not be a directory",
                 path.display()
             )));
         }
@@ -908,7 +921,10 @@ fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), Sandbo
                 path.display()
             ))
         })?;
-    let tmp_path = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let seq = NEXT_READY_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+    let mut guard = TempFileGuard(Some(tmp_path.clone()));
+
     let payload = serde_json::to_vec(&json!({
         "endpoint": endpoint_uri,
         "pid": std::process::id(),
@@ -916,26 +932,29 @@ fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), Sandbo
     }))
     .map_err(|err| SandboxError::Internal(format!("failed serializing ready-file JSON: {err}")))?;
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .map_err(|err| {
-            SandboxError::Transport(format!(
-                "failed to open temporary ready-file '{}': {err}",
-                tmp_path.display()
-            ))
-        })?;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    apply_open_no_follow(&mut opts);
+    let mut file = opts.open(&tmp_path).map_err(|err| {
+        SandboxError::Transport(format!(
+            "failed to open temporary ready-file '{}': {err}",
+            tmp_path.display()
+        ))
+    })?;
+    let open_meta = file.metadata().map_err(|err| {
+        SandboxError::Transport(format!(
+            "failed to inspect temporary ready-file '{}': {err}",
+            tmp_path.display()
+        ))
+    })?;
+    reject_symlink_or_reparse(&tmp_path, &open_meta)?;
     file.write_all(&payload).map_err(|err| {
-        let _ = fs::remove_file(&tmp_path);
         SandboxError::Transport(format!(
             "failed to write temporary ready-file '{}': {err}",
             tmp_path.display()
         ))
     })?;
     file.sync_all().map_err(|err| {
-        let _ = fs::remove_file(&tmp_path);
         SandboxError::Transport(format!(
             "failed to sync temporary ready-file '{}': {err}",
             tmp_path.display()
@@ -943,14 +962,24 @@ fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), Sandbo
     })?;
     drop(file);
 
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        reject_symlink_or_reparse(path, &meta)?;
+        if meta.is_dir() {
+            return Err(SandboxError::PolicyViolation(format!(
+                "ready-file '{}' must not be a directory",
+                path.display()
+            )));
+        }
+    }
+
     fs::rename(&tmp_path, path).map_err(|err| {
-        let _ = fs::remove_file(&tmp_path);
         SandboxError::Transport(format!(
             "failed to rename ready-file '{}' -> '{}': {err}",
             tmp_path.display(),
             path.display()
         ))
     })?;
+    guard.disarm();
     Ok(())
 }
 
@@ -1020,9 +1049,27 @@ where
         ControlResponse::Spawned(lease) if spawned_unkeyed => Some(lease.id.clone()),
         _ => None,
     };
+    let frame_bytes = match resp.to_json_bytes() {
+        Ok(bytes) if bytes.len() <= MAX_CONTROL_FRAME_BYTES => bytes,
+        Ok(bytes) => {
+            if let Some(id) = unkeyed_spawned_id.as_ref() {
+                let _ = state.destroy_sandbox(id).await;
+            }
+            ControlResponse::Error(WireError::from(SandboxError::BudgetExceeded(format!(
+                "control response frame {} bytes exceeds MAX_CONTROL_FRAME_BYTES ({MAX_CONTROL_FRAME_BYTES})",
+                bytes.len()
+            ))))
+            .to_json_bytes()?
+        }
+        Err(err) => {
+            if let Some(id) = unkeyed_spawned_id.as_ref() {
+                let _ = state.destroy_sandbox(id).await;
+            }
+            ControlResponse::Error(WireError::from(err)).to_json_bytes()?
+        }
+    };
     let send_res: Result<(), SandboxError> = async {
-        let bytes = resp.to_json_bytes()?;
-        tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &bytes))
+        tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &frame_bytes))
             .await
             .map_err(|_| {
                 SandboxError::Transport(format!(
@@ -1177,6 +1224,11 @@ async fn pump_exec_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    enum ExecClientCtrl {
+        Cancel,
+        Disconnected,
+    }
+
     struct AbortOnDrop(JoinHandle<()>);
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
@@ -1185,58 +1237,73 @@ where
     }
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
-    let (client_tx, mut client_rx) =
-        mpsc::channel::<Result<ExecWireClientMsg, ()>>(EXEC_CLIENT_MSG_QUEUE_DEPTH);
+    let mut stdin_writer = exec_stream.take_stdin_writer();
+    let (stdin_tx, mut stdin_rx) =
+        mpsc::channel::<Option<Vec<u8>>>(EXEC_CLIENT_MSG_QUEUE_DEPTH);
+    let (ctrl_tx, mut ctrl_rx) =
+        mpsc::channel::<ExecClientCtrl>(EXEC_CLIENT_MSG_QUEUE_DEPTH);
 
-    // Isolate `read_control_frame` inside a dedicated task so `tokio::select!` only polls
-    // cancellation-safe `mpsc::Receiver::recv()` branches.
+    let mut stdin_guard = Some(AbortOnDrop(tokio::spawn(async move {
+        while let Some(item) = stdin_rx.recv().await {
+            match item {
+                Some(data) => {
+                    if stdin_writer.write(data).await.is_err() {
+                        stdin_writer.close();
+                        break;
+                    }
+                }
+                None => {
+                    stdin_writer.close();
+                    break;
+                }
+            }
+        }
+        stdin_writer.close();
+    })));
+
+    // Isolate `read_control_frame` and `stdin` writes inside dedicated tasks so blocked guest stdin
+    // never starves cancellation, output draining, or host deadline enforcement.
     let _reader_guard = AbortOnDrop(tokio::spawn(async move {
         loop {
             match read_control_frame(&mut read_half).await {
                 Ok(Some(raw)) => match ExecWireClientMsg::from_json_bytes(&raw) {
-                    Ok(msg) => {
-                        if client_tx.send(Ok(msg)).await.is_err() {
+                    Ok(ExecWireClientMsg::Stdin { data }) => {
+                        if stdin_tx.send(Some(data)).await.is_err() {
                             break;
                         }
                     }
-                    Err(_) => {
-                        let _ = client_tx.send(Err(())).await;
+                    Ok(ExecWireClientMsg::StdinEof) => {
+                        let _ = stdin_tx.send(None).await;
+                    }
+                    Ok(ExecWireClientMsg::Cancel) | Err(_) => {
+                        let _ = ctrl_tx.send(ExecClientCtrl::Cancel).await;
                         break;
                     }
                 },
-                Ok(None) => break,
+                Ok(None) => {
+                    let _ = ctrl_tx.send(ExecClientCtrl::Disconnected).await;
+                    break;
+                }
                 Err(_) => {
-                    let _ = client_tx.send(Err(())).await;
+                    let _ = ctrl_tx.send(ExecClientCtrl::Cancel).await;
                     break;
                 }
             }
         }
     }));
 
-    let mut client_open = true;
+    let mut ctrl_open = true;
     let mut output_open = true;
 
     while output_open {
         tokio::select! {
             biased;
-            maybe_client = client_rx.recv(), if client_open => {
-                match maybe_client {
-                    Some(Ok(ExecWireClientMsg::Stdin { data })) => {
-                        let _ = exec_stream.write_stdin(data).await;
-                    }
-                    Some(Ok(ExecWireClientMsg::StdinEof)) => {
-                        exec_stream.close_stdin();
-                    }
-                    Some(Ok(ExecWireClientMsg::Cancel)) => {
+            maybe_ctrl = ctrl_rx.recv(), if ctrl_open => {
+                match maybe_ctrl {
+                    Some(ExecClientCtrl::Cancel) | Some(ExecClientCtrl::Disconnected) | None => {
+                        drop(stdin_guard.take());
                         let _ = exec_stream.cancel();
-                    }
-                    Some(Err(())) => {
-                        let _ = exec_stream.cancel();
-                        client_open = false;
-                    }
-                    None => {
-                        exec_stream.close_stdin();
-                        client_open = false;
+                        ctrl_open = false;
                     }
                 }
             }
@@ -1256,6 +1323,7 @@ where
                         {
                             Ok(Ok(())) => {}
                             Ok(Err(_)) | Err(_) => {
+                                drop(stdin_guard.take());
                                 let _ = exec_stream.cancel();
                                 return Ok(());
                             }
@@ -1269,6 +1337,7 @@ where
         }
     }
 
+    drop(stdin_guard.take());
     let terminal = match exec_stream.wait_exit().await {
         Ok(status) => ExecWireEvent::Exit(status),
         Err(err) => ExecWireEvent::Error(WireError::from(err)),
@@ -1430,6 +1499,24 @@ mod tests {
             let (stream, mut handle) = ExecStream::channel(StreamId(7));
             let cancel_seen = Arc::clone(&self.cancel_seen);
             tokio::spawn(async move {
+                if req.argv.first().map(String::as_str) == Some("block-stdin") {
+                    let _ = handle
+                        .send_output(ExecOutputChunk {
+                            stream: OutputStreamKind::Stdout,
+                            data: b"blocked-stdin-started\n".to_vec(),
+                        })
+                        .await;
+                    if handle.recv_cancel().await.is_some() {
+                        cancel_seen.store(true, Ordering::Release);
+                    }
+                    handle.finish(Ok(ExecExitStatus {
+                        code: None,
+                        timed_out: false,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    }));
+                    return;
+                }
                 if req.argv.first().map(String::as_str) == Some("sleep") {
                     if handle.recv_cancel().await.is_some() {
                         cancel_seen.store(true, Ordering::Release);
@@ -1501,9 +1588,12 @@ mod tests {
 
         async fn copy_out_tar(
             &self,
-            _src_guest: &str,
+            src_guest: &str,
             _max_bytes: u64,
         ) -> Result<Vec<u8>, SandboxError> {
+            if src_guest == "/oversized-frame" {
+                return Ok(vec![b'x'; MAX_CONTROL_FRAME_BYTES]);
+            }
             Ok(self.copied_in.lock().unwrap().clone().unwrap_or_default())
         }
 
@@ -2485,5 +2575,123 @@ mod tests {
 
         let _ = client.destroy(&lease.id).await.unwrap();
         assert!(state.docker_compat_locks.lock().unwrap().get(&lease.id).is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_exec_stream_decouples_blocked_stdin_and_cancels_on_client_disconnect() {
+        use tokio::sync::Notify;
+
+        let tmp = TestTempDir::new("exec-blocked-stdin");
+        let (state, cancel_seen) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let lease = client
+            .spawn(sample_spec(NetworkPolicy::Isolated))
+            .await
+            .unwrap();
+
+        // 1. Flood stdin against a guest that never reads stdin; host deadline must not starve.
+        let mut exec = client
+            .exec_stream(
+                &lease.id,
+                ExecRequest {
+                    target: ExecTarget::Guest,
+                    argv: vec!["block-stdin".to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    user: None,
+                    deadline: Duration::from_millis(150),
+                    stdout_budget_bytes: 64 * 1024,
+                    stderr_budget_bytes: 64 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..120 {
+            if exec.write_stdin(vec![b'x'; 256]).await.is_err() {
+                break;
+            }
+        }
+        let first_chunk = exec.next_output().await.expect("initial stdout");
+        assert_eq!(first_chunk.data, b"blocked-stdin-started\n");
+        let exit = exec.wait_exit().await.unwrap();
+        assert!(exit.timed_out);
+        assert!(cancel_seen.load(Ordering::Acquire));
+
+        // 2. Client raw disconnect while `sleep` runs must cancel execution immediately.
+        cancel_seen.store(false, Ordering::Release);
+        let req_bytes = ControlRequest::ExecStart {
+            id: lease.id.clone(),
+            req: ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec!["sleep".to_owned(), "60".to_owned()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(30),
+                stdout_budget_bytes: 64 * 1024,
+                stderr_budget_bytes: 64 * 1024,
+            },
+        }
+        .to_json_bytes()
+        .unwrap();
+        let (mut cli_end, srv_end) = duplex(64 * 1024);
+        let done = Arc::new(Notify::new());
+        let done_tx = Arc::clone(&done);
+        let st_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _ = serve_connection(srv_end, st_clone).await;
+            done_tx.notify_one();
+        });
+        write_control_frame(&mut cli_end, &req_bytes).await.unwrap();
+        let started_raw = read_control_frame(&mut cli_end).await.unwrap().unwrap();
+        assert!(matches!(
+            ControlResponse::from_json_bytes(&started_raw).unwrap(),
+            ControlResponse::ExecStarted { .. }
+        ));
+        drop(cli_end);
+        tokio::time::timeout(Duration::from_secs(2), done.notified())
+            .await
+            .expect("disconnect must cancel sleep exec promptly");
+        assert!(cancel_seen.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn oversized_control_response_returns_budget_exceeded_and_ready_file_rejects_symlinks() {
+        let tmp = TestTempDir::new("wire-budget-and-ready");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let lease = client
+            .spawn(sample_spec(NetworkPolicy::Isolated))
+            .await
+            .unwrap();
+
+        let err = client
+            .copy_out_tar_bytes(&lease.id, "/oversized-frame")
+            .await
+            .expect_err("response > MAX_CONTROL_FRAME_BYTES must fail cleanly");
+        assert!(
+            matches!(err, SandboxError::BudgetExceeded(_)),
+            "expected BudgetExceeded error instead of transport EOF, got {err:?}"
+        );
+
+        let dir_target = tmp.path().join("ready-dir");
+        fs::create_dir_all(&dir_target).unwrap();
+        assert!(matches!(
+            write_ready_file_atomic(&dir_target, "npipe://test"),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let real = tmp.path().join("real-ready.json");
+            fs::write(&real, b"{}").unwrap();
+            let sym = tmp.path().join("sym-ready.json");
+            symlink(&real, &sym).unwrap();
+            assert!(matches!(
+                write_ready_file_atomic(&sym, "unix:///tmp/test.sock"),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
     }
 }

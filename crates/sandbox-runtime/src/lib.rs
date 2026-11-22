@@ -26,7 +26,8 @@ pub use egress::{
 };
 
 pub use exec_stream::{
-    CollectedExecOutput, ExecOutputChunk, ExecStream, ExecStreamHandle, OutputStreamKind,
+    CollectedExecOutput, ExecOutputChunk, ExecStdinWriter, ExecStream, ExecStreamHandle,
+    OutputStreamKind,
 };
 pub use journal::{
     cleanup_artifacts_with_backoff, JournalLifecycleState, JournalRecord, JournalStore,

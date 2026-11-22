@@ -61,6 +61,32 @@ pub struct ExecStream {
     output_stopped: bool,
 }
 
+/// Standalone sender handle for writing execution `stdin` chunks or closing `stdin` independently
+/// of output/cancellation polling.
+#[derive(Clone, Debug)]
+pub struct ExecStdinWriter {
+    stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+impl ExecStdinWriter {
+    /// Sends a chunk of bytes to the execution's `stdin` stream.
+    pub async fn write(&self, data: Vec<u8>) -> Result<(), SandboxError> {
+        let Some(tx) = &self.stdin_tx else {
+            return Err(SandboxError::Transport(
+                "execution stdin stream is already closed".to_owned(),
+            ));
+        };
+        tx.send(data)
+            .await
+            .map_err(|_| SandboxError::Transport("execution stdin receiver closed".to_owned()))
+    }
+
+    /// Closes this `stdin` sender handle, signalling EOF if no other clones remain.
+    pub fn close(&mut self) {
+        self.stdin_tx = None;
+    }
+}
+
 /// Driver-side handle used by `VmSessionPort` implementations to pump stdin, output, cancel,
 /// and final exit status for a corresponding [`ExecStream`].
 #[derive(Debug)]
@@ -139,6 +165,14 @@ impl ExecStream {
     /// Closes the caller's `stdin` sender, signalling EOF to the VM session driver.
     pub fn close_stdin(&mut self) {
         self.stdin_tx = None;
+    }
+
+    /// Detaches ownership of the `stdin` sender into an [`ExecStdinWriter`] so a dedicated
+    /// task can forward `stdin` chunks without stalling cancellation or deadline polling.
+    pub fn take_stdin_writer(&mut self) -> ExecStdinWriter {
+        ExecStdinWriter {
+            stdin_tx: self.stdin_tx.take(),
+        }
     }
 
     /// Receives the next incremental `stdout` or `stderr` chunk, or `None` once output closes
