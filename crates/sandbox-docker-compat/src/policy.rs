@@ -1448,6 +1448,13 @@ fn sanitize_tmpfs_mount(obj: &mut Map<String, Value>) -> Result<(), PolicyReject
                 PolicyRejection::new("TmpfsOptions must be a JSON object")
             })?;
             canonicalize_struct_keys(opts_obj, KNOWN_TMPFS_OPTIONS_FIELDS, "TmpfsOptions")?;
+            for key in opts_obj.keys() {
+                if !KNOWN_TMPFS_OPTIONS_FIELDS.contains(&key.as_str()) {
+                    return Err(PolicyRejection::new(format!(
+                        "TmpfsOptions field '{key}' is forbidden inside sandbox isolation"
+                    )));
+                }
+            }
             if let Some(size_val) = opts_obj.get("SizeBytes") {
                 if !size_val.is_null() && !size_val.as_i64().is_some_and(|v| v >= 0) {
                     return Err(PolicyRejection::new(
@@ -1490,7 +1497,11 @@ fn sanitize_tmpfs_mount(obj: &mut Map<String, Value>) -> Result<(), PolicyReject
                             let v = pair[1].as_str().ok_or_else(|| {
                                 PolicyRejection::new("TmpfsOptions.Options entries must be strings")
                             })?;
-                            validate_tmpfs_option_token(k, "TmpfsOptions.Options")?;
+                            if k.contains([',', '=']) || v.contains([',', '=']) {
+                                return Err(PolicyRejection::new(
+                                    "TmpfsOptions.Options key/value pair must not contain ',' or '='",
+                                ));
+                            }
                             validate_tmpfs_option_token(
                                 &format!("{}={}", k.trim(), v.trim()),
                                 "TmpfsOptions.Options",

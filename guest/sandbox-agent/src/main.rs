@@ -1920,13 +1920,14 @@ mod tests {
     fn stream_credit_enforces_stdout_backpressure() {
         let (mut host_rx, mut host_tx, agent) = start_test_session();
 
-        // Opt into credit flow control for StreamId(30) Stdout with 10 bytes initially.
+        // Opt into credit flow control for StreamId(30) Stdout allowing one 10-byte chunk
+        // (`STREAM_FRAME_OVERHEAD_BYTES` + 10 payload bytes).
         send_message(
             &mut host_tx,
             StreamId(30),
             &Message::StreamCredit {
                 channel: StreamChannel::Stdout,
-                bytes: 10,
+                bytes: stream_frame_credit_cost(10) as u32,
             },
         )
         .unwrap();

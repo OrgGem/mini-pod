@@ -3487,7 +3487,7 @@ mod tests {
             addr,
             format!(
                 "POST /v1.45/containers/create HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                5 * 1024 * 1024
+                MAX_BUFFERED_BODY_BYTES + 1024 * 1024
             ),
             512 * 1024,
         )

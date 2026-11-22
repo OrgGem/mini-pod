@@ -1238,69 +1238,67 @@ impl<R: AsyncRead + Unpin> CancelSafeFrameReader<R> {
     }
 
     async fn next_frame(&mut self) -> Result<Option<Vec<u8>>, SandboxError> {
-        loop {
-            if self.expected_len.is_none() {
-                while self.header_read < 4 {
-                    let n = self
-                        .reader
-                        .read(&mut self.header[self.header_read..])
-                        .await
-                        .map_err(|err| {
-                            SandboxError::Transport(format!(
-                                "failed reading control frame header: {err}"
-                            ))
-                        })?;
-                    if n == 0 {
-                        if self.header_read == 0 {
-                            return Ok(None);
-                        }
-                        return Err(SandboxError::Transport(
-                            "unexpected EOF while reading control frame header".to_owned(),
-                        ));
-                    }
-                    self.header_read += n;
-                }
-                let len = u32::from_be_bytes(self.header) as usize;
-                if len == 0 {
-                    return Err(SandboxError::Transport(
-                        "control frame length must not be zero".to_owned(),
-                    ));
-                }
-                if len > MAX_CONTROL_FRAME_BYTES {
-                    return Err(SandboxError::Transport(format!(
-                        "incoming control frame length {len} exceeds MAX_CONTROL_FRAME_BYTES ({MAX_CONTROL_FRAME_BYTES})"
-                    )));
-                }
-                self.expected_len = Some(len);
-                self.payload.clear();
-                self.payload.reserve(len.min(64 * 1024));
-            }
-
-            let target_len = self.expected_len.expect("expected_len initialized above");
-            while self.payload.len() < target_len {
-                let mut chunk = [0u8; 8192];
-                let step = (target_len - self.payload.len()).min(chunk.len());
+        if self.expected_len.is_none() {
+            while self.header_read < 4 {
                 let n = self
                     .reader
-                    .read(&mut chunk[..step])
+                    .read(&mut self.header[self.header_read..])
                     .await
                     .map_err(|err| {
                         SandboxError::Transport(format!(
-                            "failed reading control frame payload: {err}"
+                            "failed reading control frame header: {err}"
                         ))
                     })?;
                 if n == 0 {
+                    if self.header_read == 0 {
+                        return Ok(None);
+                    }
                     return Err(SandboxError::Transport(
-                        "failed reading control frame payload: unexpected EOF".to_owned(),
+                        "unexpected EOF while reading control frame header".to_owned(),
                     ));
                 }
-                self.payload.extend_from_slice(&chunk[..n]);
+                self.header_read += n;
             }
-
-            self.header_read = 0;
-            self.expected_len = None;
-            return Ok(Some(std::mem::take(&mut self.payload)));
+            let len = u32::from_be_bytes(self.header) as usize;
+            if len == 0 {
+                return Err(SandboxError::Transport(
+                    "control frame length must not be zero".to_owned(),
+                ));
+            }
+            if len > MAX_CONTROL_FRAME_BYTES {
+                return Err(SandboxError::Transport(format!(
+                    "incoming control frame length {len} exceeds MAX_CONTROL_FRAME_BYTES ({MAX_CONTROL_FRAME_BYTES})"
+                )));
+            }
+            self.expected_len = Some(len);
+            self.payload.clear();
+            self.payload.reserve(len.min(64 * 1024));
         }
+
+        let target_len = self.expected_len.expect("expected_len initialized above");
+        while self.payload.len() < target_len {
+            let mut chunk = [0u8; 8192];
+            let step = (target_len - self.payload.len()).min(chunk.len());
+            let n = self
+                .reader
+                .read(&mut chunk[..step])
+                .await
+                .map_err(|err| {
+                    SandboxError::Transport(format!(
+                        "failed reading control frame payload: {err}"
+                    ))
+                })?;
+            if n == 0 {
+                return Err(SandboxError::Transport(
+                    "failed reading control frame payload: unexpected EOF".to_owned(),
+                ));
+            }
+            self.payload.extend_from_slice(&chunk[..n]);
+        }
+
+        self.header_read = 0;
+        self.expected_len = None;
+        Ok(Some(std::mem::take(&mut self.payload)))
     }
 }
 

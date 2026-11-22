@@ -4806,11 +4806,16 @@ mod tests {
                 }
             }
 
-            // 2. CopyOut #2: guest drips 1 byte every 20ms (< io_timeout=50ms) until total budget expires.
-            let second = read_frame(&mut client).unwrap();
-            let sid2 = second.header.stream_id;
-            for _ in 0..50 {
-                thread::sleep(Duration::from_millis(20));
+            // 2. CopyOut #2: skip `sid1` credit/close frames until the new `CopyOutStart` arrives,
+            // then drip 1 byte every 10ms (<< io_timeout=80ms) until total duration budget expires.
+            let sid2 = loop {
+                let frame = read_frame(&mut client).unwrap();
+                if matches!(frame.decode_message(), Ok(Message::CopyOutStart { .. })) {
+                    break frame.header.stream_id;
+                }
+            };
+            for _ in 0..200 {
+                thread::sleep(Duration::from_millis(10));
                 if write_frame(
                     &mut client,
                     &Frame::from_message(
@@ -4833,7 +4838,7 @@ mod tests {
 
         let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
         let session =
-            QemuVmSession::from_test_stream(host_stream, Duration::from_millis(50)).unwrap();
+            QemuVmSession::from_test_stream(host_stream, Duration::from_millis(80)).unwrap();
 
         let err_eof = session
             .copy_out_tar("/workspace", 4096)
