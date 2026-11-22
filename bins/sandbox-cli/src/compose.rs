@@ -1905,32 +1905,8 @@ fn build_container_create_payload(spec: &ComposeSpec, svc: &ServiceSpec) -> Valu
         }),
     );
 
-    let mut exposed_ports = Map::new();
-    for &p in &svc.expose {
-        exposed_ports.insert(format!("{p}/tcp"), json!({}));
-    }
-    let mut port_bindings: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for port in &svc.ports {
-        let key = format!("{}/tcp", port.container_port);
-        exposed_ports.insert(key.clone(), json!({}));
-        let host_port_str = port.host_port.map(|hp| hp.to_string()).unwrap_or_default();
-        port_bindings.entry(key).or_default().push(json!({
-            "HostIp": "127.0.0.1",
-            "HostPort": host_port_str,
-        }));
-    }
-    if !exposed_ports.is_empty() {
-        root.insert("ExposedPorts".to_owned(), Value::Object(exposed_ports));
-    }
-
     let mut hc = Map::new();
-    if !port_bindings.is_empty() {
-        let pb_map: Map<String, Value> = port_bindings
-            .into_iter()
-            .map(|(k, v)| (k, Value::Array(v)))
-            .collect();
-        hc.insert("PortBindings".to_owned(), Value::Object(pb_map));
-    }
+    insert_port_bindings_json(&mut root, &mut hc, &svc.ports, &svc.expose);
 
     if !svc.mounts.is_empty() {
         let mounts_json: Vec<Value> = svc
@@ -1988,6 +1964,38 @@ fn build_container_create_payload(spec: &ComposeSpec, svc: &ServiceSpec) -> Valu
 
     root.insert("HostConfig".to_owned(), Value::Object(hc));
     Value::Object(root)
+}
+
+pub(crate) fn insert_port_bindings_json(
+    root: &mut Map<String, Value>,
+    hc: &mut Map<String, Value>,
+    ports: &[ComposePort],
+    expose: &[u16],
+) {
+    let mut exposed_ports = Map::new();
+    for &p in expose {
+        exposed_ports.insert(format!("{p}/tcp"), json!({}));
+    }
+    let mut port_bindings: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for port in ports {
+        let key = format!("{}/tcp", port.container_port);
+        exposed_ports.insert(key.clone(), json!({}));
+        let host_port_str = port.host_port.map(|hp| hp.to_string()).unwrap_or_default();
+        port_bindings.entry(key).or_default().push(json!({
+            "HostIp": "127.0.0.1",
+            "HostPort": host_port_str,
+        }));
+    }
+    if !exposed_ports.is_empty() {
+        root.insert("ExposedPorts".to_owned(), Value::Object(exposed_ports));
+    }
+    if !port_bindings.is_empty() {
+        let pb_map: Map<String, Value> = port_bindings
+            .into_iter()
+            .map(|(k, v)| (k, Value::Array(v)))
+            .collect();
+        hc.insert("PortBindings".to_owned(), Value::Object(pb_map));
+    }
 }
 
 async fn guest_image_exists(

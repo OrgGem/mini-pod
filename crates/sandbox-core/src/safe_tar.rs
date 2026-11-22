@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 use crate::error::SandboxError;
 
 const COPY_IO_BUFFER_BYTES: usize = 64 * 1024;
+// shortcut: fixed 128-level depth and 65,536-entry pack cap, expose CopyOptions if deeper monorepo trees need packing
 pub const MAX_TAR_DIRECTORY_DEPTH: usize = 128;
 pub const MAX_PACK_ENTRIES: usize = 65_536;
 const MAX_MEASURE_ENTRIES: usize = 262_144;
@@ -131,6 +132,13 @@ fn apply_open_read_no_follow_nonblock(opts: &mut OpenOptions) {
         opts.custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let _ = opts;
+}
+
+#[derive(Clone, Copy)]
+struct PackWalkLimits {
+    max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
 }
 
 enum PlannedEntry {
@@ -286,15 +294,18 @@ fn pack_host_path_to_tar_with_limits(
             meta: root_meta,
         });
     } else if root_meta.file_type().is_dir() {
+        let limits = PackWalkLimits {
+            max_bytes,
+            max_entries,
+            max_depth,
+        };
         collect_dir_plan(
             src_host,
             "",
             1,
             &mut plan,
             &mut raw_bytes_total,
-            max_bytes,
-            max_entries,
-            max_depth,
+            limits,
         )?;
     } else {
         return Err(SandboxError::PolicyViolation(format!(
@@ -605,9 +616,7 @@ fn collect_dir_plan(
     segment_depth: usize,
     plan: &mut Vec<PlannedEntry>,
     raw_bytes_total: &mut u64,
-    max_bytes: u64,
-    max_entries: usize,
-    max_depth: usize,
+    limits: PackWalkLimits,
 ) -> Result<(), SandboxError> {
     let entries = fs::read_dir(disk_dir)
         .map_err(|err| map_fs_error(disk_dir, "read source directory", err))?;
@@ -616,10 +625,11 @@ fn collect_dir_plan(
     for entry_res in entries {
         let entry = entry_res
             .map_err(|err| map_fs_error(disk_dir, "iterate source directory", err))?;
-        if segment_depth > max_depth {
+        if segment_depth > limits.max_depth {
             return Err(SandboxError::PolicyViolation(format!(
-                "source directory nesting inside '{}' exceeds maximum depth ({max_depth})",
-                disk_dir.display()
+                "source directory nesting inside '{}' exceeds maximum depth ({})",
+                disk_dir.display(),
+                limits.max_depth
             )));
         }
         let raw_name = entry.file_name();
@@ -631,18 +641,20 @@ fn collect_dir_plan(
         })?;
         validate_archive_segment(name)?;
         children.push((name.to_owned(), entry.path()));
-        if plan.len().saturating_add(children.len()) > max_entries {
+        if plan.len().saturating_add(children.len()) > limits.max_entries {
             return Err(SandboxError::BudgetExceeded(format!(
-                "source entry count exceeds max_entries ({max_entries})"
+                "source entry count exceeds max_entries ({})",
+                limits.max_entries
             )));
         }
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (name, child_path) in children {
-        if plan.len() >= max_entries {
+        if plan.len() >= limits.max_entries {
             return Err(SandboxError::BudgetExceeded(format!(
-                "source entry count exceeds max_entries ({max_entries})"
+                "source entry count exceeds max_entries ({})",
+                limits.max_entries
             )));
         }
         let meta = fs::symlink_metadata(&child_path)
@@ -666,18 +678,16 @@ fn collect_dir_plan(
                 segment_depth + 1,
                 plan,
                 raw_bytes_total,
-                max_bytes,
-                max_entries,
-                max_depth,
+                limits,
             )?;
         } else if meta.file_type().is_file() {
             *raw_bytes_total = raw_bytes_total
                 .checked_add(meta.len())
                 .ok_or_else(|| SandboxError::BudgetExceeded("source byte count overflow".to_owned()))?;
-            if *raw_bytes_total > max_bytes {
+            if *raw_bytes_total > limits.max_bytes {
                 return Err(SandboxError::BudgetExceeded(format!(
-                    "source content size {} bytes exceeds max_bytes ({max_bytes})",
-                    *raw_bytes_total
+                    "source content size {} bytes exceeds max_bytes ({})",
+                    *raw_bytes_total, limits.max_bytes
                 )));
             }
             plan.push(PlannedEntry::File {

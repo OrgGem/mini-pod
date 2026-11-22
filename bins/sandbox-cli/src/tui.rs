@@ -32,8 +32,9 @@ use tokio::sync::mpsc;
 use crate::cli::format_network_short;
 use crate::compose::{
     compose_up_in_sandbox, docker_http_error, docker_json_request, extract_inspected_host_ports,
-    format_container_list_ports, load_compose_spec_from_path, parse_restart_policy_str,
-    parse_short_port, percent_encode_component, split_shell_words, validate_safe_identifier,
+    format_container_list_ports, insert_port_bindings_json, load_compose_spec_from_path,
+    parse_restart_policy_str, parse_short_port, percent_encode_component, split_shell_words,
+    validate_safe_identifier,
 };
 use crate::image_build::{build_image_in_sandbox, validate_image_tag, ImageBuildSpec};
 
@@ -1302,9 +1303,7 @@ pub fn sanitize_terminal_text(input: &str) -> String {
             }
             continue;
         }
-        if ch == '\n' || ch == '\t' {
-            out.push(ch);
-        } else if !ch.is_control() {
+        if ch == '\n' || ch == '\t' || !ch.is_control() {
             out.push(ch);
         }
     }
@@ -2730,6 +2729,7 @@ fn parse_docker_containers_json(body: &[u8]) -> Result<Vec<ContainerRow>, Sandbo
 
 /// Parses safe TUI `podman run` arguments into `(container_name, image, create_json_payload)`
 /// without ever invoking a shell, enforcing policy and forwarding `-p` ports via `DockerCompat`.
+// shortcut: parses core detached podman-run flags in TUI, use Compose or DOCKER_HOST for volumes/multi-network configs
 pub fn parse_tui_run_container_spec(
     raw_args: &str,
 ) -> Result<(Option<String>, String, Value), SandboxError> {
@@ -2880,32 +2880,11 @@ pub fn parse_tui_run_container_spec(
         root.insert("Hostname".to_owned(), Value::String(hn));
     }
 
-    let mut exposed_ports = Map::new();
-    let mut port_bindings: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for port in &ports {
-        let key = format!("{}/tcp", port.container_port);
-        exposed_ports.insert(key.clone(), json!({}));
-        let host_port_str = port.host_port.map(|hp| hp.to_string()).unwrap_or_default();
-        port_bindings.entry(key).or_default().push(json!({
-            "HostIp": "127.0.0.1",
-            "HostPort": host_port_str,
-        }));
-    }
-    if !exposed_ports.is_empty() {
-        root.insert("ExposedPorts".to_owned(), Value::Object(exposed_ports));
-    }
-
     let mut hc = Map::new();
     if auto_remove {
         hc.insert("AutoRemove".to_owned(), Value::Bool(true));
     }
-    if !port_bindings.is_empty() {
-        let pb_map: Map<String, Value> = port_bindings
-            .into_iter()
-            .map(|(k, v)| (k, Value::Array(v)))
-            .collect();
-        hc.insert("PortBindings".to_owned(), Value::Object(pb_map));
-    }
+    insert_port_bindings_json(&mut root, &mut hc, &ports, &[]);
     if let Some(net) = network {
         hc.insert("NetworkMode".to_owned(), Value::String(net));
     }

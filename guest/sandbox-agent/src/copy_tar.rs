@@ -371,6 +371,13 @@ impl Read for CopyInReader<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GuestWalkLimits {
+    max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
+}
+
 enum PlannedEntry {
     Dir {
         rel: PathBuf,
@@ -440,15 +447,18 @@ fn execute_copy_out_with_limits(
             lstat_meta: root_meta,
         });
     } else if root_meta.is_dir() {
+        let limits = GuestWalkLimits {
+            max_bytes,
+            max_entries,
+            max_depth,
+        };
         collect_dir_plan_with_limits(
             &src_path,
             Path::new(""),
             1,
             &mut plan,
             &mut min_tar_bytes,
-            max_bytes,
-            max_entries,
-            max_depth,
+            limits,
         )?;
     } else {
         return Err(format!(
@@ -526,9 +536,7 @@ fn collect_dir_plan_with_limits(
     segment_depth: usize,
     plan: &mut Vec<PlannedEntry>,
     min_tar_bytes: &mut u64,
-    max_bytes: u64,
-    max_entries: usize,
-    max_depth: usize,
+    limits: GuestWalkLimits,
 ) -> Result<(), String> {
     let mut children = Vec::new();
     for entry_res in fs::read_dir(disk_dir)
@@ -536,25 +544,28 @@ fn collect_dir_plan_with_limits(
     {
         let entry = entry_res
             .map_err(|err| format!("failed iterating directory '{}': {err}", disk_dir.display()))?;
-        if segment_depth > max_depth {
+        if segment_depth > limits.max_depth {
             return Err(format!(
-                "copy_out directory nesting inside '{}' exceeds maximum depth ({max_depth})",
-                disk_dir.display()
+                "copy_out directory nesting inside '{}' exceeds maximum depth ({})",
+                disk_dir.display(),
+                limits.max_depth
             ));
         }
         children.push(entry);
-        if plan.len().saturating_add(children.len()) > max_entries {
+        if plan.len().saturating_add(children.len()) > limits.max_entries {
             return Err(format!(
-                "copy_out entry count exceeds maximum ({max_entries})"
+                "copy_out entry count exceeds maximum ({})",
+                limits.max_entries
             ));
         }
     }
     children.sort_by_key(|entry| entry.file_name());
 
     for child in children {
-        if plan.len() >= max_entries {
+        if plan.len() >= limits.max_entries {
             return Err(format!(
-                "copy_out entry count exceeds maximum ({max_entries})"
+                "copy_out entry count exceeds maximum ({})",
+                limits.max_entries
             ));
         }
         let name = child.file_name();
@@ -578,9 +589,10 @@ fn collect_dir_plan_with_limits(
             *min_tar_bytes = min_tar_bytes
                 .checked_add(TAR_BLOCK_BYTES)
                 .ok_or_else(|| "copy_out archive size overflow".to_owned())?;
-            if *min_tar_bytes > max_bytes {
+            if *min_tar_bytes > limits.max_bytes {
                 return Err(format!(
-                    "copy_out archive size ({min_tar_bytes} bytes minimum) exceeds max_bytes ({max_bytes})"
+                    "copy_out archive size ({min_tar_bytes} bytes minimum) exceeds max_bytes ({})",
+                    limits.max_bytes
                 ));
             }
             plan.push(PlannedEntry::Dir {
@@ -593,9 +605,7 @@ fn collect_dir_plan_with_limits(
                 segment_depth + 1,
                 plan,
                 min_tar_bytes,
-                max_bytes,
-                max_entries,
-                max_depth,
+                limits,
             )?;
         } else if meta.is_file() {
             let file_blocks = padded_tar_blocks(meta.len())?;
@@ -603,9 +613,10 @@ fn collect_dir_plan_with_limits(
                 .checked_add(TAR_BLOCK_BYTES)
                 .and_then(|v| v.checked_add(file_blocks))
                 .ok_or_else(|| "copy_out archive size overflow".to_owned())?;
-            if *min_tar_bytes > max_bytes {
+            if *min_tar_bytes > limits.max_bytes {
                 return Err(format!(
-                    "copy_out archive size ({min_tar_bytes} bytes minimum) exceeds max_bytes ({max_bytes})"
+                    "copy_out archive size ({min_tar_bytes} bytes minimum) exceeds max_bytes ({})",
+                    limits.max_bytes
                 ));
             }
             plan.push(PlannedEntry::File {
