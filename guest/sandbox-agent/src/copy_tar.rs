@@ -7,7 +7,7 @@
 //!   traversing existing symlinks (`O_NOFOLLOW` on Unix file opens).
 //! - Enforces `max_bytes` on both wire tar stream length and extracted/emitted content.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -79,7 +79,11 @@ pub(crate) fn run_copy_in(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&stream_id);
+    let was_aborted = outbound.is_stream_aborted(stream_id);
     outbound.clear_stream(stream_id);
+    if was_aborted {
+        return;
+    }
 
     let reply = match result {
         Ok(bytes_transferred) => Message::CopyDone { bytes_transferred },
@@ -95,9 +99,18 @@ pub(crate) fn run_copy_out(
     src_guest: String,
     max_bytes: u64,
     outbound: Arc<OutboundQueue>,
+    active_copy_outs: Arc<Mutex<HashSet<StreamId>>>,
 ) {
     let result = execute_copy_out(stream_id, &src_guest, max_bytes, &outbound);
+    active_copy_outs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&stream_id);
+    let was_aborted = outbound.is_stream_aborted(stream_id);
     outbound.clear_stream(stream_id);
+    if was_aborted {
+        return;
+    }
 
     let reply = match result {
         Ok(bytes_transferred) => Message::CopyDone { bytes_transferred },
@@ -149,6 +162,9 @@ fn execute_copy_in_with_limits(
         let mut copy_buf = vec![0u8; MAX_COPY_IO_BUF];
 
         for (entry_count, entry_res) in entries.enumerate() {
+            if outbound.is_stream_aborted(stream_id) {
+                return Err("copy_in stream closed by host".to_owned());
+            }
             if entry_count >= max_entries {
                 return Err(format!(
                     "copy_in tar entry count exceeds maximum ({max_entries})"
@@ -477,6 +493,9 @@ fn execute_copy_out_with_limits(
     {
         let mut builder = tar::Builder::new(&mut writer);
         for item in plan {
+            if outbound.is_stream_aborted(stream_id) {
+                return Err("copy_out stream closed by host".to_owned());
+            }
             match item {
                 PlannedEntry::Dir { rel, meta } => {
                     if is_symlink_or_reparse(&meta) || !meta.is_dir() {
@@ -654,15 +673,27 @@ impl<'a> TarChunkWriter<'a> {
     }
 
     fn finish(self) -> Result<u64, String> {
+        if self.outbound.is_stream_aborted(self.stream_id) {
+            return Err("copy_out stream closed by host".to_owned());
+        }
         self.outbound
             .send_stream_data_final(self.stream_id, StreamChannel::Stdout, &self.buf)
             .map_err(|err| format!("failed streaming final copy_out chunk: {err}"))?;
+        if self.outbound.is_stream_aborted(self.stream_id) {
+            return Err("copy_out stream closed by host".to_owned());
+        }
         Ok(self.total_bytes)
     }
 }
 
 impl Write for TarChunkWriter<'_> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.outbound.is_stream_aborted(self.stream_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "copy_out stream closed by host",
+            ));
+        }
         let next = self
             .total_bytes
             .checked_add(data.len() as u64)
@@ -682,6 +713,12 @@ impl Write for TarChunkWriter<'_> {
             self.outbound
                 .send_stream_data(self.stream_id, StreamChannel::Stdout, &chunk)
                 .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))?;
+            if self.outbound.is_stream_aborted(self.stream_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "copy_out stream closed by host",
+                ));
+            }
         }
         Ok(data.len())
     }

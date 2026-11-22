@@ -19,6 +19,9 @@ use crate::manifest::{
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_BUNDLE_TREE_DEPTH: usize = 32;
 const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+// shortcut: 5s try_lock polling deadline rejects concurrent bundle swap when live VMs hold read guards, add explicit drain-and-upgrade command if zero-downtime hot bundle swap is needed post-MVP
+const BUNDLE_EXCLUSIVE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const BUNDLE_EXCLUSIVE_LOCK_POLL: Duration = Duration::from_millis(5);
 
 static NEXT_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -757,15 +760,45 @@ fn open_bundle_lock_file(lock_path: &Path, create_if_missing: bool) -> Result<Op
 }
 
 fn open_bundle_lock_exclusive(lock_path: &Path) -> Result<File, SandboxError> {
+    open_bundle_lock_exclusive_timeout(lock_path, BUNDLE_EXCLUSIVE_LOCK_TIMEOUT)
+}
+
+fn open_bundle_lock_exclusive_timeout(
+    lock_path: &Path,
+    timeout: Duration,
+) -> Result<File, SandboxError> {
     let file = open_bundle_lock_file(lock_path, true)?.ok_or_else(|| {
         SandboxError::Internal(format!(
             "bundle lock file '{}' unexpectedly missing after create",
             lock_path.display()
         ))
     })?;
-    file.lock()
-        .map_err(|err| map_fs_error(lock_path, "acquire exclusive bundle swap lock", err))?;
-    Ok(file)
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(SandboxError::AdmissionRejected(format!(
+                        "timed out after {} ms waiting for exclusive bundle lock '{}' (active or warm VMs may still hold read guards)",
+                        timeout.as_millis(),
+                        lock_path.display()
+                    )));
+                }
+                let sleep_for =
+                    BUNDLE_EXCLUSIVE_LOCK_POLL.min(deadline.saturating_duration_since(now));
+                thread::sleep(sleep_for);
+            }
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(map_fs_error(
+                    lock_path,
+                    "acquire exclusive bundle swap lock",
+                    err,
+                ));
+            }
+        }
+    }
 }
 
 fn acquire_bundle_read_guard(
@@ -1538,6 +1571,7 @@ mod tests {
                 while !done_r.load(Ordering::Acquire) {
                     verify_installed_bundle(&dir_r, &ver_r)
                         .expect("concurrent reader must never observe missing or partial bundle");
+                    thread::sleep(Duration::from_millis(5));
                 }
             }));
         }
@@ -1773,5 +1807,42 @@ mod tests {
             install_bundle_atomic(&src, &install_root, &verifier),
             Err(SandboxError::InvalidSpec(_))
         ));
+    }
+
+    #[test]
+    fn exclusive_bundle_lock_times_out_when_read_guard_is_held() {
+        let tmp = TestTempDir::new("exclusive-lock-timeout");
+        let target_dir = tmp.path().join("bundles").join("locked-bundle");
+        fs::create_dir_all(target_dir.parent().unwrap()).unwrap();
+
+        let secret = [0x53u8; 32];
+        let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
+        write_signed_bundle(
+            &target_dir,
+            "locked-bundle",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"k"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"i"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"r"),
+            ],
+        );
+
+        let guard = with_verified_installed_bundle_read_locked(
+            &target_dir,
+            &verifier,
+            |_installed, read_guard| Ok(read_guard),
+        )
+        .unwrap()
+        .expect("read guard acquired");
+
+        let (lock_path, _) = bundle_lock_and_intent_paths(&target_dir).unwrap();
+        let err = open_bundle_lock_exclusive_timeout(&lock_path, Duration::from_millis(40))
+            .expect_err("exclusive lock must fail with bounded timeout while read guard is held");
+        assert!(matches!(err, SandboxError::AdmissionRejected(_)), "got {err:?}");
+
+        drop(guard);
+        open_bundle_lock_exclusive_timeout(&lock_path, Duration::from_millis(100))
+            .expect("exclusive lock succeeds after read guard drops");
     }
 }

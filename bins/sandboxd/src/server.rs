@@ -987,7 +987,7 @@ where
     };
 
     if let ControlRequest::ExecStart { id, req } = req {
-        return handle_exec_connection(stream, &state, &id, req).await;
+        return handle_exec_connection(stream, &state, &id, req, io_timeout).await;
     }
 
     let is_shutdown = matches!(req, ControlRequest::Shutdown);
@@ -1090,6 +1090,7 @@ async fn handle_exec_connection<S>(
     state: &DaemonState,
     id: &SandboxId,
     req: sandbox_core::ExecRequest,
+    io_timeout: Duration,
 ) -> Result<(), SandboxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1098,8 +1099,8 @@ where
         Ok(s) => s,
         Err(err) => {
             let bytes = ControlResponse::Error(WireError::from(err)).to_json_bytes()?;
-            let _ = write_control_frame(&mut stream, &bytes).await;
-            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &bytes)).await;
+            let _ = tokio::time::timeout(io_timeout, stream.shutdown()).await;
             return Ok(());
         }
     };
@@ -1108,17 +1109,28 @@ where
         stream_id: exec_stream.stream_id.0,
     }
     .to_json_bytes()?;
-    if let Err(err) = write_control_frame(&mut stream, &started).await {
-        let _ = exec_stream.cancel();
-        return Err(err);
+    match tokio::time::timeout(io_timeout, write_control_frame(&mut stream, &started)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let _ = exec_stream.cancel();
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = exec_stream.cancel();
+            return Err(SandboxError::Transport(format!(
+                "timed out after {} ms writing ExecStarted response",
+                io_timeout.as_millis()
+            )));
+        }
     }
 
-    pump_exec_stream(stream, &mut exec_stream).await
+    pump_exec_stream(stream, &mut exec_stream, io_timeout).await
 }
 
 async fn pump_exec_stream<S>(
     stream: S,
     exec_stream: &mut ExecStream,
+    io_timeout: Duration,
 ) -> Result<(), SandboxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1194,9 +1206,17 @@ where
                             OutputStreamKind::Stderr => ExecWireEvent::Stderr { data: chunk.data },
                         };
                         let bytes = event.to_json_bytes()?;
-                        if write_control_frame(&mut write_half, &bytes).await.is_err() {
-                            let _ = exec_stream.cancel();
-                            return Ok(());
+                        match tokio::time::timeout(
+                            io_timeout,
+                            write_control_frame(&mut write_half, &bytes),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => {
+                                let _ = exec_stream.cancel();
+                                return Ok(());
+                            }
                         }
                     }
                     None => {
@@ -1212,8 +1232,8 @@ where
         Err(err) => ExecWireEvent::Error(WireError::from(err)),
     };
     let bytes = terminal.to_json_bytes()?;
-    let _ = write_control_frame(&mut write_half, &bytes).await;
-    let _ = write_half.shutdown().await;
+    let _ = tokio::time::timeout(io_timeout, write_control_frame(&mut write_half, &bytes)).await;
+    let _ = tokio::time::timeout(io_timeout, write_half.shutdown()).await;
     Ok(())
 }
 

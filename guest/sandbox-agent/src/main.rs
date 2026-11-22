@@ -214,6 +214,14 @@ impl OutboundQueue {
         self.cv.notify_all();
     }
 
+    pub(crate) fn is_stream_aborted(&self, stream_id: StreamId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aborted_streams
+            .contains(&stream_id)
+    }
+
     pub(crate) fn clear_stream(&self, stream_id: StreamId) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         clear_stream_locked(&mut state, stream_id);
@@ -407,6 +415,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
         Arc::new(Mutex::new(HashMap::new()));
     let active_copy_ins: Arc<Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let active_copy_outs: Arc<Mutex<HashSet<StreamId>>> = Arc::new(Mutex::new(HashSet::new()));
     let active_tunnels: Arc<Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let egress_proxy = Arc::new(EgressProxyManager::new(
@@ -471,6 +480,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         || is_stream_active(
                             &active_execs,
                             &active_copy_ins,
+                            &active_copy_outs,
                             &active_tunnels,
                             stream_id,
                         )
@@ -546,15 +556,11 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     if let Some(exec_handle) = exec_target {
                         exec_handle.send_stdin(data, eof);
                     } else {
-                        let copy_target = {
-                            let mut guard =
-                                active_copy_ins.lock().unwrap_or_else(|e| e.into_inner());
-                            let entry = guard.get(&stream_id).cloned();
-                            if eof {
-                                guard.remove(&stream_id);
-                            }
-                            entry
-                        };
+                        let copy_target = active_copy_ins
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&stream_id)
+                            .cloned();
                         if let Some(copy_handle) = copy_target {
                             copy_handle.push_chunk(data, eof);
                         } else {
@@ -586,6 +592,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         || is_stream_active(
                             &active_execs,
                             &active_copy_ins,
+                            &active_copy_outs,
                             &active_tunnels,
                             stream_id,
                         )
@@ -622,6 +629,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         || is_stream_active(
                             &active_execs,
                             &active_copy_ins,
+                            &active_copy_outs,
                             &active_tunnels,
                             stream_id,
                         )
@@ -631,14 +639,25 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         )));
                         break;
                     }
+                    active_copy_outs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(stream_id);
                     outbound.seed_default_credit(
                         stream_id,
                         StreamChannel::Stdout,
                         INITIAL_STREAM_CREDIT_BYTES,
                     );
                     let worker_outbound = outbound.clone();
+                    let worker_copy_outs = active_copy_outs.clone();
                     workers.push(scope.spawn(move || {
-                        run_copy_out(stream_id, src_guest, max_bytes, worker_outbound);
+                        run_copy_out(
+                            stream_id,
+                            src_guest,
+                            max_bytes,
+                            worker_outbound,
+                            worker_copy_outs,
+                        );
                     }));
                 }
                 Message::Shutdown => {
@@ -649,6 +668,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     let in_use = is_stream_active(
                         &active_execs,
                         &active_copy_ins,
+                        &active_copy_outs,
                         &active_tunnels,
                         stream_id,
                     );
@@ -694,6 +714,23 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                         .remove(&stream_id);
                     if let Some(handle) = tunnel {
                         handle.close(&outbound);
+                    }
+                    let copy_in = {
+                        let guard = active_copy_ins.lock().unwrap_or_else(|e| e.into_inner());
+                        let handle = guard.get(&stream_id).cloned();
+                        if handle.is_some() {
+                            outbound.abort_stream(stream_id);
+                        }
+                        handle
+                    };
+                    if let Some(handle) = copy_in {
+                        handle.abort();
+                    }
+                    {
+                        let guard = active_copy_outs.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.contains(&stream_id) {
+                            outbound.abort_stream(stream_id);
+                        }
                     }
                 }
                 Message::ConfigureNetwork {
@@ -758,7 +795,13 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
         egress_proxy.shutdown();
 
         if shutdown_requested || session_res.is_err() || outbound.is_closed() {
-            cancel_all_active(&active_execs, &active_copy_ins, &active_tunnels, &outbound);
+            cancel_all_active(
+                &active_execs,
+                &active_copy_ins,
+                &active_copy_outs,
+                &active_tunnels,
+                &outbound,
+            );
         }
 
         for handle in workers {
@@ -790,6 +833,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
 fn is_stream_active(
     active_execs: &Mutex<HashMap<StreamId, Arc<ActiveExec>>>,
     active_copy_ins: &Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>,
+    active_copy_outs: &Mutex<HashSet<StreamId>>,
     active_tunnels: &Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>,
     stream_id: StreamId,
 ) -> bool {
@@ -801,6 +845,10 @@ fn is_stream_active(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&stream_id)
+        || active_copy_outs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&stream_id)
         || active_tunnels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -810,6 +858,7 @@ fn is_stream_active(
 fn cancel_all_active(
     active_execs: &Mutex<HashMap<StreamId, Arc<ActiveExec>>>,
     active_copy_ins: &Mutex<HashMap<StreamId, Arc<ActiveCopyIn>>>,
+    active_copy_outs: &Mutex<HashSet<StreamId>>,
     active_tunnels: &Mutex<HashMap<StreamId, Arc<ActiveTunnel>>>,
     outbound: &OutboundQueue,
 ) {
@@ -823,14 +872,22 @@ fn cancel_all_active(
         handle.cancel(outbound);
     }
 
-    let copy_ins: Vec<_> = active_copy_ins
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .cloned()
-        .collect();
+    let copy_ins: Vec<_> = {
+        let guard = active_copy_ins.lock().unwrap_or_else(|e| e.into_inner());
+        for &sid in guard.keys() {
+            outbound.abort_stream(sid);
+        }
+        guard.values().cloned().collect()
+    };
     for handle in copy_ins {
         handle.abort();
+    }
+
+    {
+        let guard = active_copy_outs.lock().unwrap_or_else(|e| e.into_inner());
+        for &sid in guard.iter() {
+            outbound.abort_stream(sid);
+        }
     }
 
     let tunnels: Vec<_> = active_tunnels
@@ -2573,6 +2630,71 @@ mod tests {
             Message::ConfigureNetworkAck { proxy_port: 0 }
         );
 
+        shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn stream_close_aborts_inflight_copy_in_and_copy_out_cleanly() {
+        let tmp = TestTempDir::new("copy-stream-close");
+        let dst = tmp.path().join("copy-in-dst");
+        let big_file = tmp.path().join("large.bin");
+        std::fs::write(
+            &big_file,
+            vec![0xABu8; (INITIAL_STREAM_CREDIT_BYTES as usize) * 2 + 65_536],
+        )
+        .unwrap();
+
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        // 1. Start CopyIn without ever sending EOF, then abort via StreamClose.
+        send_message(
+            &mut host_tx,
+            StreamId(21),
+            &Message::CopyInStart {
+                dst_guest: dst.to_string_lossy().into_owned(),
+                max_bytes: 1_048_576,
+            },
+        )
+        .unwrap();
+        send_message(&mut host_tx, StreamId(21), &Message::StreamClose).unwrap();
+
+        // 2. Start CopyOut larger than initial credit so worker blocks on StreamCredit, then abort via StreamClose.
+        send_message(
+            &mut host_tx,
+            StreamId(22),
+            &Message::CopyOutStart {
+                src_guest: big_file.to_string_lossy().into_owned(),
+                max_bytes: 4 * 1_048_576,
+            },
+        )
+        .unwrap();
+
+        // Read first data chunk so we know CopyOut is actively streaming/waiting on credit.
+        let first_frame = read_frame(&mut host_rx).unwrap();
+        assert_eq!(first_frame.header.stream_id, StreamId(22));
+        assert!(matches!(
+            first_frame.decode_message().unwrap(),
+            Message::StreamData {
+                channel: StreamChannel::Stdout,
+                eof: false,
+                ..
+            }
+        ));
+
+        send_message(&mut host_tx, StreamId(22), &Message::StreamClose).unwrap();
+
+        // Drain any frames already queued before StreamClose took effect using Ping barrier.
+        send_message(&mut host_tx, StreamId(0), &Message::Ping { seq: 901 }).unwrap();
+        loop {
+            let f = read_frame(&mut host_rx).unwrap();
+            if f.header.stream_id == StreamId(0)
+                && f.decode_message().unwrap() == (Message::Pong { seq: 901 })
+            {
+                break;
+            }
+        }
+
+        // Shutdown joins all worker threads; would hang if CopyIn or CopyOut remained stuck.
         shutdown_test_session(host_rx, host_tx, agent);
     }
 }

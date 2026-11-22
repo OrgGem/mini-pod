@@ -693,6 +693,7 @@ enum StreamHandler {
     CopyOut {
         max_bytes: u64,
         buffer: Vec<u8>,
+        activity: Arc<Notify>,
         reply_tx: Option<oneshot::Sender<Result<Vec<u8>, SandboxError>>>,
     },
     Tunnel {
@@ -703,6 +704,49 @@ enum StreamHandler {
         stdout_eof_seen: bool,
         _egress_permit: Option<Arc<GuestEgressPermit>>,
     },
+}
+
+struct CopyStreamGuard<'a> {
+    stream_id: StreamId,
+    ops: &'a Mutex<HashMap<StreamId, StreamHandler>>,
+    outbound: &'a OutboundQueue,
+    armed: bool,
+}
+
+impl<'a> CopyStreamGuard<'a> {
+    fn new(
+        stream_id: StreamId,
+        ops: &'a Mutex<HashMap<StreamId, StreamHandler>>,
+        outbound: &'a OutboundQueue,
+    ) -> Self {
+        Self {
+            stream_id,
+            ops,
+            outbound,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CopyStreamGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let removed = lock_unpoisoned(self.ops).remove(&self.stream_id);
+        if let Some(StreamHandler::CopyIn { stdin_credits, .. }) = removed {
+            stdin_credits.close();
+        }
+        if !self.outbound.is_closed() {
+            if let Ok(frame) = Frame::from_message(self.stream_id, &Message::StreamClose) {
+                let _ = self.outbound.enqueue_control(frame);
+            }
+        }
+    }
 }
 
 type NetworkAckSlot = Mutex<Option<oneshot::Sender<Result<u16, SandboxError>>>>;
@@ -1281,58 +1325,91 @@ impl VmSessionPort for QemuVmSession {
             lock_unpoisoned(&self.ops).remove(&stream_id);
             return Err(err);
         }
+        let mut stream_guard = CopyStreamGuard::new(stream_id, &self.ops, &self.outbound);
 
         if tar_bytes.is_empty() {
-            if let Err(err) = self
-                .enqueue_data_message(
+            match tokio::time::timeout(
+                self.io_timeout,
+                self.enqueue_data_message(
                     stream_id,
                     &Message::StreamData {
                         channel: StreamChannel::Stdin,
                         eof: true,
                         data: Vec::new(),
                     },
-                )
-                .await
+                ),
+            )
+            .await
             {
-                lock_unpoisoned(&self.ops).remove(&stream_id);
-                return Err(err);
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(SandboxError::Transport(format!(
+                        "copy_in stalled for {} ms writing empty tar EOF",
+                        self.io_timeout.as_millis()
+                    )));
+                }
             }
         } else {
             let mut offset = 0usize;
             while offset < tar_bytes.len() {
-                let Some(allowance) = stdin_credits
-                    .wait_available(MAX_HOST_STREAM_CHUNK_BYTES)
-                    .await
-                else {
+                let maybe_allowance = tokio::time::timeout(
+                    self.io_timeout,
+                    stdin_credits.wait_available(MAX_HOST_STREAM_CHUNK_BYTES),
+                )
+                .await
+                .map_err(|_| {
+                    SandboxError::Transport(format!(
+                        "copy_in stalled for {} ms waiting for guest stream credit",
+                        self.io_timeout.as_millis()
+                    ))
+                })?;
+                let Some(allowance) = maybe_allowance else {
                     break;
                 };
                 let take = (tar_bytes.len() - offset).min(allowance);
                 stdin_credits.consume(take);
                 let end = offset + take;
                 let eof = end == tar_bytes.len();
-                if let Err(err) = self
-                    .enqueue_data_message(
+                match tokio::time::timeout(
+                    self.io_timeout,
+                    self.enqueue_data_message(
                         stream_id,
                         &Message::StreamData {
                             channel: StreamChannel::Stdin,
                             eof,
                             data: tar_bytes[offset..end].to_vec(),
                         },
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
-                    lock_unpoisoned(&self.ops).remove(&stream_id);
-                    return Err(err);
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(SandboxError::Transport(format!(
+                            "copy_in stalled for {} ms writing tar chunk",
+                            self.io_timeout.as_millis()
+                        )));
+                    }
                 }
                 offset = end;
             }
         }
 
-        reply_rx.await.unwrap_or_else(|_| {
-            Err(SandboxError::Transport(
+        match tokio::time::timeout(self.io_timeout, reply_rx).await {
+            Ok(Ok(outcome)) => {
+                stream_guard.disarm();
+                outcome
+            }
+            Ok(Err(_)) => Err(SandboxError::Transport(
                 "copy_in interrupted before guest CopyDone".to_owned(),
-            ))
-        })
+            )),
+            Err(_) => Err(SandboxError::Transport(format!(
+                "copy_in timed out after {} ms waiting for guest CopyDone",
+                self.io_timeout.as_millis()
+            ))),
+        }
     }
 
     async fn copy_out_tar(
@@ -1349,7 +1426,8 @@ impl VmSessionPort for QemuVmSession {
         self.ensure_transport_ready()?;
 
         let stream_id = self.allocate_stream_id()?;
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let activity = Arc::new(Notify::new());
+        let (reply_tx, mut reply_rx) = oneshot::channel();
         {
             let mut ops = lock_unpoisoned(&self.ops);
             ops.insert(
@@ -1357,6 +1435,7 @@ impl VmSessionPort for QemuVmSession {
                 StreamHandler::CopyOut {
                     max_bytes,
                     buffer: Vec::new(),
+                    activity: Arc::clone(&activity),
                     reply_tx: Some(reply_tx),
                 },
             );
@@ -1372,12 +1451,31 @@ impl VmSessionPort for QemuVmSession {
             lock_unpoisoned(&self.ops).remove(&stream_id);
             return Err(err);
         }
+        let mut stream_guard = CopyStreamGuard::new(stream_id, &self.ops, &self.outbound);
 
-        reply_rx.await.unwrap_or_else(|_| {
-            Err(SandboxError::Transport(
-                "copy_out interrupted before guest CopyDone".to_owned(),
-            ))
-        })
+        loop {
+            tokio::select! {
+                biased;
+                res = &mut reply_rx => {
+                    return match res {
+                        Ok(outcome) => {
+                            stream_guard.disarm();
+                            outcome
+                        }
+                        Err(_) => Err(SandboxError::Transport(
+                            "copy_out interrupted before guest CopyDone".to_owned(),
+                        )),
+                    };
+                }
+                _ = activity.notified() => {}
+                _ = tokio::time::sleep(self.io_timeout) => {
+                    return Err(SandboxError::Transport(format!(
+                        "copy_out timed out after {} ms without guest progress",
+                        self.io_timeout.as_millis()
+                    )));
+                }
+            }
+        }
     }
 
     async fn graceful_shutdown(&self, timeout: Duration) -> Result<bool, SandboxError> {
@@ -2086,6 +2184,7 @@ fn run_reader_loop(
                     Some(StreamHandler::CopyOut {
                         max_bytes,
                         buffer,
+                        activity,
                         ..
                     }) if channel == StreamChannel::Stdout => {
                         let limit = *max_bytes;
@@ -2101,9 +2200,17 @@ fn run_reader_loop(
                                     ))));
                                 }
                             }
+                            drop(map);
+                            if let Ok(close_frame) =
+                                Frame::from_message(stream_id, &Message::StreamClose)
+                            {
+                                let _ = outbound.enqueue_control(close_frame);
+                            }
                         } else {
                             buffer.extend_from_slice(&data);
+                            let notify = Arc::clone(activity);
                             drop(map);
+                            notify.notify_one();
                             send_stream_credit(
                                 &outbound,
                                 stream_id,
@@ -2210,6 +2317,7 @@ fn run_reader_loop(
                         max_bytes,
                         buffer,
                         mut reply_tx,
+                        ..
                     }) => {
                         if let Some(tx) = reply_tx.take() {
                             if bytes_transferred != buffer.len() as u64
@@ -4342,5 +4450,84 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let err = res.expect_err("guest_arch mismatch must fail before launching QEMU");
         assert!(matches!(err, SandboxError::InvalidSpec(_)));
+    }
+
+    #[tokio::test]
+    async fn stalled_copy_in_and_copy_out_time_out_reap_ops_and_emit_stream_close() {
+        let listener = AgentIpcEndpoint::bind_temp("drv-stalled-copy").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let (closed_sids_tx, closed_sids_rx) = oneshot::channel::<(StreamId, StreamId)>();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            // 1. CopyInStart arrives, followed by Stdin EOF; guest stalls without sending CopyDone.
+            let in_start = read_frame(&mut client).unwrap();
+            let in_sid = in_start.header.stream_id;
+            assert!(matches!(
+                in_start.decode_message().unwrap(),
+                Message::CopyInStart { .. }
+            ));
+            let in_close = loop {
+                let frame = read_frame(&mut client).unwrap();
+                if frame.header.stream_id == in_sid
+                    && matches!(frame.decode_message().unwrap(), Message::StreamClose)
+                {
+                    break in_sid;
+                }
+            };
+
+            // 2. CopyOutStart arrives; guest stalls without sending any StreamData or CopyDone.
+            let out_start = read_frame(&mut client).unwrap();
+            let out_sid = out_start.header.stream_id;
+            assert!(matches!(
+                out_start.decode_message().unwrap(),
+                Message::CopyOutStart { .. }
+            ));
+            let out_close = loop {
+                let frame = read_frame(&mut client).unwrap();
+                if frame.header.stream_id == out_sid
+                    && matches!(frame.decode_message().unwrap(), Message::StreamClose)
+                {
+                    break out_sid;
+                }
+            };
+
+            let _ = closed_sids_tx.send((in_close, out_close));
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session =
+            QemuVmSession::from_test_stream(host_stream, Duration::from_millis(80)).unwrap();
+
+        let in_err = session
+            .copy_in_tar("/workspace", b"tar".to_vec(), 4096)
+            .await
+            .expect_err("stalled copy_in must time out");
+        assert!(matches!(in_err, SandboxError::Transport(_)), "got {in_err:?}");
+        assert!(
+            lock_unpoisoned(&session.ops).is_empty(),
+            "timed-out copy_in must remove stream from session.ops"
+        );
+
+        let out_err = session
+            .copy_out_tar("/workspace", 4096)
+            .await
+            .expect_err("stalled copy_out must time out");
+        assert!(matches!(out_err, SandboxError::Transport(_)), "got {out_err:?}");
+        assert!(
+            lock_unpoisoned(&session.ops).is_empty(),
+            "timed-out copy_out must remove stream from session.ops"
+        );
+
+        let (in_sid, out_sid) = tokio::time::timeout(Duration::from_secs(2), closed_sids_rx)
+            .await
+            .expect("guest must observe StreamClose for both stalled copy operations")
+            .unwrap();
+        assert_ne!(in_sid, out_sid);
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
     }
 }
