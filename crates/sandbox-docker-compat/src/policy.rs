@@ -45,7 +45,14 @@ const KNOWN_HOST_CONFIG_FIELDS: &[&str] = &[
     "Cgroup",
     "Runtime",
     "Sysctls",
+    "ContainerIDFile",
+    "LogConfig",
+    "OomKillDisable",
+    "OomScoreAdj",
+    "StorageOpt",
+    "Tmpfs",
 ];
+const KNOWN_LOG_CONFIG_FIELDS: &[&str] = &["Type", "Config"];
 const KNOWN_MOUNT_FIELDS: &[&str] = &[
     "Type",
     "Source",
@@ -153,6 +160,190 @@ impl fmt::Display for PolicyRejection {
 }
 
 impl std::error::Error for PolicyRejection {}
+
+/// Validates query parameters on Docker `POST /images/create`.
+///
+/// Rejects local archive transports, non-URL local paths in `fromSrc` (allowing `"-"` for tarball
+/// upload or public `http`/`https` URLs without internal/SSRF hosts), control characters, and
+/// smuggled container/build privilege parameters.
+pub fn validate_image_create_query(params: &[(String, String)]) -> Result<(), PolicyRejection> {
+    for (raw_key, val) in params {
+        if !raw_key.is_ascii()
+            || raw_key.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || val.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            return Err(PolicyRejection::new(format!(
+                "invalid control or non-ASCII characters in POST /images/create parameter '{raw_key}'"
+            )));
+        }
+
+        let key = raw_key.to_ascii_lowercase();
+        match key.as_str() {
+            "fromsrc" => validate_image_create_from_src(val)?,
+            "fromimage" => validate_image_create_from_image(val)?,
+            "securityopt" | "capadd" | "cgroupparent" | "privileged" | "networkmode" | "volume"
+            | "volumesfrom" | "outputs" | "remote" | "storageopt" | "devices" => {
+                return Err(PolicyRejection::new(format!(
+                    "POST /images/create parameter '{raw_key}' is forbidden by security policy"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_create_from_src(val: &str) -> Result<(), PolicyRejection> {
+    if val.is_empty() || val == "-" {
+        return Ok(());
+    }
+    let lower = val.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("http://") {
+        &val["http://".len()..val.len().min("http://".len() + r.len())]
+    } else if let Some(r) = lower.strip_prefix("https://") {
+        &val["https://".len()..val.len().min("https://".len() + r.len())]
+    } else {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' must be '-' or a public http(s) URL"
+        )));
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' has an invalid authority"
+        )));
+    }
+
+    let host = if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return Err(PolicyRejection::new(format!(
+                "POST /images/create fromSrc '{val}' has an invalid IPv6 host"
+            )));
+        };
+        let suffix = &authority[end + 1..];
+        if !suffix.is_empty()
+            && suffix
+                .strip_prefix(':')
+                .is_none_or(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(PolicyRejection::new(format!(
+                "POST /images/create fromSrc '{val}' has an invalid host port"
+            )));
+        }
+        &authority[1..end]
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    } else {
+        authority
+    };
+
+    let host_trimmed = host.trim_end_matches('.');
+    let host_lower = host_trimmed.to_ascii_lowercase();
+    if host_lower.is_empty()
+        || host_lower.contains('%')
+        || host_lower == "localhost"
+        || host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+        || host_lower.ends_with(".internal")
+        || host_lower.ends_with(".localdomain")
+        || matches!(host_lower.as_str(), "ip6-localhost" | "ip6-loopback")
+    {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromSrc '{val}' targets a forbidden local/internal host"
+        )));
+    }
+
+    if let Ok(ip) = host_trimmed.parse::<std::net::IpAddr>() {
+        if is_non_public_image_src_ip(ip) {
+            return Err(PolicyRejection::new(format!(
+                "POST /images/create fromSrc '{val}' targets a non-public IP address"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_non_public_image_src_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || a == 0 // 0.0.0.0/8 "this host"
+                || (a == 100 && (64..=127).contains(&b)) // RFC 6598 CGNAT 100.64.0.0/10
+                || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+                || (a == 192 && b == 0 && c == 2) // TEST-NET-1
+                || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
+                || (a == 198 && b == 51 && c == 100) // TEST-NET-2
+                || (a == 203 && b == 0 && c == 113) // TEST-NET-3
+                || a >= 240
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_non_public_image_src_ip(std::net::IpAddr::V4(mapped));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+                || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0)
+                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0)
+                || seg[0] == 0x2002
+                || (seg[0] == 0x2001 && seg[1] == 0)
+        }
+    }
+}
+
+fn validate_image_create_from_image(val: &str) -> Result<(), PolicyRejection> {
+    if val.is_empty() {
+        return Ok(());
+    }
+    if val.starts_with('/') || val.starts_with('\\') || val.contains('\\') || val.contains("..") {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromImage '{val}' contains a forbidden filesystem path"
+        )));
+    }
+    let lower = val.to_ascii_lowercase();
+    if lower.contains("://") && !lower.starts_with("docker://") {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create fromImage '{val}' uses a forbidden URL scheme"
+        )));
+    }
+    let head = lower.split('/').next().unwrap_or("");
+    for transport in [
+        "dir:",
+        "oci:",
+        "oci-archive:",
+        "docker-archive:",
+        "docker-daemon:",
+        "containers-storage:",
+        "ostree:",
+        "sif:",
+        "file:",
+        "http:",
+        "https:",
+    ] {
+        if head.starts_with(transport) {
+            return Err(PolicyRejection::new(format!(
+                "POST /images/create fromImage '{val}' uses forbidden local/non-registry transport '{transport}'"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Validates and rewrites a Docker `POST /containers/create` JSON body under `policy`.
 ///
@@ -817,7 +1008,7 @@ fn validate_host_config_security(
         }
     }
 
-    for map_field in ["Annotations", "Sysctls"] {
+    for map_field in ["Annotations", "Sysctls", "StorageOpt"] {
         if let Some(val) = hc.get(map_field) {
             if !val.is_null() {
                 let obj = val.as_object().ok_or_else(|| {
@@ -832,7 +1023,13 @@ fn validate_host_config_security(
         }
     }
 
-    for str_field in ["VolumeDriver", "CgroupParent", "Cgroup", "Runtime"] {
+    for str_field in [
+        "VolumeDriver",
+        "CgroupParent",
+        "Cgroup",
+        "Runtime",
+        "ContainerIDFile",
+    ] {
         if let Some(val) = hc.get(str_field) {
             if !val.is_null() {
                 let s = val.as_str().ok_or_else(|| {
@@ -842,6 +1039,126 @@ fn validate_host_config_security(
                     return Err(PolicyRejection::new(format!(
                         "HostConfig.{str_field}='{s}' is forbidden inside sandbox isolation"
                     )));
+                }
+            }
+        }
+    }
+
+    if let Some(oom_kill_disable) = hc.get("OomKillDisable") {
+        if !oom_kill_disable.is_null() {
+            let disabled = oom_kill_disable.as_bool().ok_or_else(|| {
+                PolicyRejection::new("HostConfig.OomKillDisable must be a boolean")
+            })?;
+            if disabled {
+                return Err(PolicyRejection::new(
+                    "HostConfig.OomKillDisable=true is forbidden inside sandbox isolation",
+                ));
+            }
+        }
+    }
+
+    if let Some(oom_score) = hc.get("OomScoreAdj") {
+        if !oom_score.is_null() {
+            let score = oom_score.as_i64().ok_or_else(|| {
+                PolicyRejection::new("HostConfig.OomScoreAdj must be an integer")
+            })?;
+            if !(0..=1000).contains(&score) {
+                return Err(PolicyRejection::new(format!(
+                    "HostConfig.OomScoreAdj={score} is outside permitted range 0..=1000"
+                )));
+            }
+        }
+    }
+
+    if let Some(log_cfg) = hc.get_mut("LogConfig") {
+        if !log_cfg.is_null() {
+            let log_obj = log_cfg.as_object_mut().ok_or_else(|| {
+                PolicyRejection::new("HostConfig.LogConfig must be a JSON object")
+            })?;
+            canonicalize_struct_keys(log_obj, KNOWN_LOG_CONFIG_FIELDS, "HostConfig.LogConfig")?;
+            if let Some(driver_val) = log_obj.get("Type") {
+                if !driver_val.is_null() {
+                    let driver = driver_val.as_str().ok_or_else(|| {
+                        PolicyRejection::new("HostConfig.LogConfig.Type must be a string")
+                    })?;
+                    let norm = driver.trim().to_ascii_lowercase();
+                    if !matches!(
+                        norm.as_str(),
+                        "" | "json-file" | "k8s-file" | "journald" | "none" | "local"
+                    ) {
+                        return Err(PolicyRejection::new(format!(
+                            "HostConfig.LogConfig.Type='{driver}' is forbidden inside sandbox isolation"
+                        )));
+                    }
+                }
+            }
+            if let Some(cfg_val) = log_obj.get("Config") {
+                if !cfg_val.is_null() {
+                    let cfg_map = cfg_val.as_object().ok_or_else(|| {
+                        PolicyRejection::new("HostConfig.LogConfig.Config must be a JSON object")
+                    })?;
+                    for (k, v) in cfg_map {
+                        let vs = v.as_str().ok_or_else(|| {
+                            PolicyRejection::new(format!(
+                                "HostConfig.LogConfig.Config['{k}'] must be a string"
+                            ))
+                        })?;
+                        if k.contains('\0') || vs.contains('\0') {
+                            return Err(PolicyRejection::new(
+                                "HostConfig.LogConfig.Config contains forbidden NUL byte",
+                            ));
+                        }
+                        let k_lower = k.trim().to_ascii_lowercase();
+                        if !matches!(
+                            k_lower.as_str(),
+                            "max-size"
+                                | "max-file"
+                                | "compress"
+                                | "mode"
+                                | "max-buffer-size"
+                                | "labels"
+                                | "labels-regex"
+                                | "env"
+                                | "env-regex"
+                        ) {
+                            return Err(PolicyRejection::new(format!(
+                                "HostConfig.LogConfig.Config key '{k}' is forbidden inside sandbox isolation"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(tmpfs) = hc.get("Tmpfs") {
+        if !tmpfs.is_null() {
+            let tmpfs_map = tmpfs.as_object().ok_or_else(|| {
+                PolicyRejection::new("HostConfig.Tmpfs must be a JSON object")
+            })?;
+            for (path_key, opts_val) in tmpfs_map {
+                if path_key.contains(':')
+                    || path_key.contains('\\')
+                    || !is_safe_container_path(path_key)
+                {
+                    return Err(PolicyRejection::new(format!(
+                        "unsafe HostConfig.Tmpfs path '{path_key}' is forbidden"
+                    )));
+                }
+                let opts = opts_val.as_str().ok_or_else(|| {
+                    PolicyRejection::new("HostConfig.Tmpfs option values must be strings")
+                })?;
+                if opts.contains('\0') {
+                    return Err(PolicyRejection::new(
+                        "HostConfig.Tmpfs option contains NUL byte",
+                    ));
+                }
+                for opt in opts.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+                    if opt.eq_ignore_ascii_case("suid") || opt.eq_ignore_ascii_case("dev") {
+                        return Err(PolicyRejection::new(format!(
+                            "HostConfig.Tmpfs mount option '{opt}' is forbidden"
+                        )));
+                    }
                 }
             }
         }
@@ -1872,5 +2189,46 @@ mod tests {
                 forbidden_param
             );
         }
+
+        // Additional HostConfig hardening (#8) and POST /images/create fromSrc checks.
+        for forbidden_hc in [
+            json!({"Image":"alpine","HostConfig":{"ContainerIDFile":"/host/cid"}}),
+            json!({"Image":"alpine","HostConfig":{"OomKillDisable":true}}),
+            json!({"Image":"alpine","HostConfig":{"OomScoreAdj":-500}}),
+            json!({"Image":"alpine","HostConfig":{"StorageOpt":{"size":"10G"}}}),
+            json!({"Image":"alpine","HostConfig":{"LogConfig":{"Type":"syslog"}}}),
+            json!({"Image":"alpine","HostConfig":{"LogConfig":{"Type":"json-file","Config":{"path":"/tmp/x"}}}}),
+            json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"rw,suid"}}}),
+            json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"rw,dev"}}}),
+        ] {
+            let raw = serde_json::to_vec(&forbidden_hc).unwrap();
+            assert!(
+                sanitize_container_create(&raw, &policy).is_err(),
+                "expected HostConfig rejection for {forbidden_hc}"
+            );
+        }
+        assert!(sanitize_container_create(
+            &serde_json::to_vec(&json!({
+                "Image": "alpine",
+                "HostConfig": {
+                    "ContainerIDFile": "",
+                    "OomKillDisable": false,
+                    "OomScoreAdj": 0,
+                    "LogConfig": {"Type": "json-file", "Config": {"max-size": "10m"}},
+                    "Tmpfs": {"/tmp": "rw,noexec,nosuid,size=16m"}
+                }
+            }))
+            .unwrap(),
+            &policy
+        )
+        .is_ok());
+
+        assert!(validate_image_create_query(&[("fromImage".into(), "alpine:latest".into())]).is_ok());
+        assert!(validate_image_create_query(&[("fromSrc".into(), "-".into())]).is_ok());
+        assert!(validate_image_create_query(&[("fromSrc".into(), "/etc/passwd".into())]).is_err());
+        assert!(
+            validate_image_create_query(&[("fromSrc".into(), "http://127.0.0.1/img.tar".into())])
+                .is_err()
+        );
     }
 }

@@ -18,8 +18,8 @@ pub use http1::{
 pub use policy::{
     sanitize_container_create, sanitize_exec_create, sanitize_network_connect,
     sanitize_network_create, sanitize_volume_create, validate_image_build_query,
-    DockerCompatPolicy, PolicyRejection, ReaperSocketPolicy, RequestedPortBinding,
-    SanitizedCreatePlan,
+    validate_image_create_query, DockerCompatPolicy, PolicyRejection, ReaperSocketPolicy,
+    RequestedPortBinding, SanitizedCreatePlan,
 };
 pub use ports::{ActivePortForward, PortForwardRegistry};
 pub use rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json, RewriteError};

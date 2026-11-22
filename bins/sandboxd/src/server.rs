@@ -94,6 +94,7 @@ pub struct DaemonState {
     runtime: Arc<LocalRuntimeManager>,
     spawn_registry: SpawnRegistry,
     docker_compat: Arc<Mutex<HashMap<SandboxId, CachedDockerCompat>>>,
+    docker_compat_locks: Arc<Mutex<HashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     doctor_inputs: Option<DoctorInputs>,
 }
@@ -117,9 +118,18 @@ impl DaemonState {
         shutdown_tx: Option<watch::Sender<bool>>,
     ) -> Self {
         let docker_compat = Arc::new(Mutex::new(HashMap::<SandboxId, CachedDockerCompat>::new()));
+        let docker_compat_locks = Arc::new(Mutex::new(HashMap::<
+            SandboxId,
+            Arc<tokio::sync::Mutex<()>>,
+        >::new()));
         let listener_map = Arc::clone(&docker_compat);
+        let lock_map = Arc::clone(&docker_compat_locks);
         runtime.register_destroy_listener(move |sandbox_id| {
             let removed = listener_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(sandbox_id);
+            lock_map
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(sandbox_id);
@@ -135,6 +145,7 @@ impl DaemonState {
             spawn_registry: SpawnRegistry::new(Arc::clone(&runtime)),
             runtime,
             docker_compat,
+            docker_compat_locks,
             shutdown_tx,
             doctor_inputs: None,
         }
@@ -196,22 +207,36 @@ impl DaemonState {
         id: &SandboxId,
         allow_reaper_socket: bool,
     ) -> Result<String, SandboxError> {
+        let _network_initial = self.runtime.active_sandbox_network(id)?;
+        let per_sandbox_lock = {
+            let mut locks = self
+                .docker_compat_locks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                locks
+                    .entry(id.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _enable_guard = per_sandbox_lock.lock().await;
         let network = self.runtime.active_sandbox_network(id)?;
+        let reaper_socket = if allow_reaper_socket {
+            ReaperSocketPolicy::MapGuestPodmanSocket
+        } else {
+            ReaperSocketPolicy::Deny
+        };
 
-        let previous = {
+        {
             let mut map = self
                 .docker_compat
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = map.get(id) {
-                if existing.allow_reaper_socket == allow_reaper_socket {
-                    return Ok(existing.uri.clone());
-                }
+            if let Some(existing) = map.get_mut(id) {
+                existing.allow_reaper_socket = allow_reaper_socket;
+                existing.compat.set_reaper_socket_policy(reaper_socket);
+                return Ok(existing.uri.clone());
             }
-            map.remove(id)
-        };
-        if let Some(prev) = previous {
-            prev.shutdown().await;
         }
 
         let container_proxy_http_url = match network {
@@ -219,11 +244,6 @@ impl DaemonState {
             NetworkPolicy::InternetOnly
             | NetworkPolicy::DomainAllowList { .. }
             | NetworkPolicy::Unrestricted => Some(CONTAINER_EGRESS_PROXY_URL.to_owned()),
-        };
-        let reaper_socket = if allow_reaper_socket {
-            ReaperSocketPolicy::MapGuestPodmanSocket
-        } else {
-            ReaperSocketPolicy::Deny
         };
 
         let compat = Arc::new(DockerCompatServer::new(
@@ -2411,5 +2431,59 @@ mod tests {
             Err(SandboxError::LeaseExpired(_))
         ));
         assert_eq!(state.list_sandboxes().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn enable_docker_compat_updates_reaper_policy_in_place_and_serializes_concurrent_calls() {
+        let tmp = TestTempDir::new("docker-compat-in-place");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let lease = client
+            .spawn(sample_spec(NetworkPolicy::Isolated))
+            .await
+            .unwrap();
+
+        let (uri_a, uri_b) = tokio::join!(
+            state.enable_docker_compat(&lease.id, false),
+            state.enable_docker_compat(&lease.id, false),
+        );
+        let uri1 = uri_a.unwrap();
+        assert_eq!(uri1, uri_b.unwrap());
+
+        let server_ptr_1 = {
+            let map = state.docker_compat.lock().unwrap();
+            let entry = &map[&lease.id];
+            assert_eq!(
+                entry.compat.policy().reaper_socket,
+                ReaperSocketPolicy::Deny
+            );
+            Arc::clone(&entry.compat)
+        };
+
+        let uri2 = state.enable_docker_compat(&lease.id, true).await.unwrap();
+        assert_eq!(uri1, uri2, "toggling reaper policy must preserve the bound URI");
+        {
+            let map = state.docker_compat.lock().unwrap();
+            let entry = &map[&lease.id];
+            assert!(
+                Arc::ptr_eq(&server_ptr_1, &entry.compat),
+                "toggling reaper policy must update DockerCompatServer in-place without listener teardown"
+            );
+            assert_eq!(
+                entry.compat.policy().reaper_socket,
+                ReaperSocketPolicy::MapGuestPodmanSocket
+            );
+            assert!(entry.allow_reaper_socket);
+        }
+
+        let uri3 = state.enable_docker_compat(&lease.id, false).await.unwrap();
+        assert_eq!(uri1, uri3);
+        assert_eq!(
+            server_ptr_1.policy().reaper_socket,
+            ReaperSocketPolicy::Deny
+        );
+
+        let _ = client.destroy(&lease.id).await.unwrap();
+        assert!(state.docker_compat_locks.lock().unwrap().get(&lease.id).is_none());
     }
 }

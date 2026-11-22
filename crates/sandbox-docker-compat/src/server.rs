@@ -5,6 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -30,7 +31,7 @@ use crate::http1::{
 use crate::policy::{
     sanitize_container_create, sanitize_exec_create, sanitize_network_connect,
     sanitize_network_create, sanitize_volume_create, validate_image_build_query,
-    DockerCompatPolicy, PolicyRejection,
+    validate_image_create_query, DockerCompatPolicy, PolicyRejection, ReaperSocketPolicy,
 };
 use crate::ports::PortForwardRegistry;
 use crate::rewrite::{rewrite_container_inspect_json, rewrite_containers_list_json};
@@ -44,7 +45,8 @@ const DOCKER_ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 pub struct DockerCompatServer {
     tunnel_port: Arc<dyn SandboxTunnelPort>,
     sandbox_id: SandboxId,
-    policy: DockerCompatPolicy,
+    reaper_socket_enabled: AtomicBool,
+    container_proxy_http_url: Option<String>,
     registry: Arc<PortForwardRegistry>,
 }
 
@@ -174,6 +176,7 @@ enum DockerRoute<'a> {
         id: String,
     },
     ImageBuild,
+    ImageCreate,
     ContainerStart {
         version_prefix: Option<&'a str>,
         raw_id: &'a str,
@@ -211,7 +214,10 @@ impl DockerCompatServer {
         Self {
             tunnel_port,
             sandbox_id,
-            policy,
+            reaper_socket_enabled: AtomicBool::new(
+                policy.reaper_socket == ReaperSocketPolicy::MapGuestPodmanSocket,
+            ),
+            container_proxy_http_url: policy.container_proxy_http_url,
             registry: Arc::new(PortForwardRegistry::new()),
         }
     }
@@ -222,8 +228,23 @@ impl DockerCompatServer {
     }
 
     /// Returns the active Docker compatibility security policy.
-    pub fn policy(&self) -> &DockerCompatPolicy {
-        &self.policy
+    pub fn policy(&self) -> DockerCompatPolicy {
+        DockerCompatPolicy {
+            reaper_socket: if self.reaper_socket_enabled.load(Ordering::Acquire) {
+                ReaperSocketPolicy::MapGuestPodmanSocket
+            } else {
+                ReaperSocketPolicy::Deny
+            },
+            container_proxy_http_url: self.container_proxy_http_url.clone(),
+        }
+    }
+
+    /// Updates the reaper socket mapping policy dynamically without disrupting active listeners or port forwards.
+    pub fn set_reaper_socket_policy(&self, policy: ReaperSocketPolicy) {
+        self.reaper_socket_enabled.store(
+            policy == ReaperSocketPolicy::MapGuestPodmanSocket,
+            Ordering::Release,
+        );
     }
 
     /// Returns the sandbox identifier bound to this server.
@@ -665,6 +686,21 @@ impl DockerCompatServer {
                 }
                 RouteDispatch::Pass
             }
+            DockerRoute::ImageCreate => {
+                let params = decode_all_query_params(req.query.as_deref());
+                if let Err(rejection) = validate_image_create_query(&params) {
+                    let close = should_close_rejected_request(&req, false);
+                    write_json_error(client, 400, "Bad Request", rejection.reason(), close)
+                        .await
+                        .map_err(http_to_io)?;
+                    return Ok(if close {
+                        StreamNext::Close
+                    } else {
+                        StreamNext::Continue
+                    });
+                }
+                RouteDispatch::Pass
+            }
             DockerRoute::ContainerStart {
                 version_prefix,
                 raw_id,
@@ -799,10 +835,9 @@ impl DockerCompatServer {
         F: FnOnce(&[u8], &DockerCompatPolicy) -> Result<(Vec<u8>, M), PolicyRejection>,
         C: FnOnce(&HttpRequestHead, &HttpResponseHead, &[u8], M),
     {
-        if expects_100_continue(&req) && !matches!(req.body_mode(), BodyMode::Empty) {
-            client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-            client.flush().await?;
-        }
+        let Some(mut up_req) = prepare_expect_header(client, &req).await? else {
+            return Ok(StreamNext::Close);
+        };
 
         let raw_body = match read_body_bytes(client, req.body_mode(), MAX_BUFFERED_BODY_BYTES).await
         {
@@ -825,7 +860,8 @@ impl DockerCompatServer {
             }
         };
 
-        let (rewritten, meta) = match sanitize(&raw_body, &self.policy) {
+        let policy = self.policy();
+        let (rewritten, meta) = match sanitize(&raw_body, &policy) {
             Ok(pair) => pair,
             Err(rejection) => {
                 let close = should_close_rejected_request(&req, true);
@@ -840,9 +876,6 @@ impl DockerCompatServer {
             }
         };
 
-        let mut up_req = req.clone();
-        up_req.version = "HTTP/1.1".to_owned();
-        strip_headers(&mut up_req.headers, &["expect"]);
         set_buffered_body_headers(&mut up_req.headers, rewritten.len(), true);
 
         let mut upstream = match self
@@ -1246,7 +1279,13 @@ impl DockerCompatServer {
             }
         };
 
-        if let Err(err) = write_request_head(&mut upstream, req).await {
+        let up_req = match prepare_expect_header(client, req).await {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Err(Ok(StreamNext::Close)),
+            Err(err) => return Err(Err(err)),
+        };
+
+        if let Err(err) = write_request_head(&mut upstream, &up_req).await {
             let close = should_close_rejected_request(req, false);
             let res = write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                 .await
@@ -1261,13 +1300,68 @@ impl DockerCompatServer {
         }
 
         if let Err(err) = forward_body(client, &mut upstream, body_mode).await {
-            let (status, reason) = match err {
-                HttpError::InvalidChunk(_) | HttpError::MalformedHead(_) => (400, "Bad Request"),
-                HttpError::Io(io_err) => return Err(Err(io_err)),
-                _ => (502, "Bad Gateway"),
-            };
-            let _ = write_json_error(client, status, reason, &err.to_string(), true).await;
-            return Err(Ok(StreamNext::Close));
+            match err {
+                HttpError::InvalidChunk(_) | HttpError::MalformedHead(_) => {
+                    let _ = write_json_error(client, 400, "Bad Request", &err.to_string(), true)
+                        .await;
+                    return Err(Ok(StreamNext::Close));
+                }
+                HttpError::Io(io_err) => {
+                    let mut up_reader = PrefixedReader::new(upstream);
+                    if let Ok(Ok(mut resp_head)) = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        read_non_1xx_response_head::<tokio::io::Sink>(&mut up_reader, None),
+                    )
+                    .await
+                    {
+                        let allow_body = response_allows_body(&req.method, resp_head.status);
+                        let resp_body = if allow_body {
+                            match tokio::time::timeout(
+                                Duration::from_secs(2),
+                                read_body_bytes(
+                                    &mut up_reader,
+                                    resp_head.body_mode(&req.method),
+                                    MAX_BUFFERED_BODY_BYTES,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(body)) => body,
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        set_buffered_body_headers(
+                            &mut resp_head.headers,
+                            resp_body.len(),
+                            allow_body,
+                        );
+                        ensure_connection_close_if(true, &mut resp_head);
+                        if write_response_head(client, &resp_head).await.is_ok() {
+                            if allow_body && !resp_body.is_empty() {
+                                let _ = client.write_all(&resp_body).await;
+                            }
+                            let _ = client.flush().await;
+                        }
+                        return Err(Ok(StreamNext::Close));
+                    }
+                    let _ = write_json_error(
+                        client,
+                        502,
+                        "Bad Gateway",
+                        &io_err.to_string(),
+                        true,
+                    )
+                    .await;
+                    return Err(Ok(StreamNext::Close));
+                }
+                _ => {
+                    let _ = write_json_error(client, 502, "Bad Gateway", &err.to_string(), true)
+                        .await;
+                    return Err(Ok(StreamNext::Close));
+                }
+            }
         }
 
         Ok(PrefixedReader::new(upstream))
@@ -1609,6 +1703,11 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
             [b] if b.eq_ignore_ascii_case("build") => {
                 return DockerRoute::ImageBuild;
             }
+            [images, create]
+                if images.eq_ignore_ascii_case("images") && create.eq_ignore_ascii_case("create") =>
+            {
+                return DockerRoute::ImageCreate;
+            }
             [c, raw_id, action]
                 if c.eq_ignore_ascii_case("containers")
                     && action.eq_ignore_ascii_case("start") =>
@@ -1836,9 +1935,46 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn expects_100_continue(req: &HttpRequestHead) -> bool {
-    req.header("expect")
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("100-continue"))
+async fn prepare_expect_header<S>(
+    client: &mut PrefixedReader<S>,
+    req: &HttpRequestHead,
+) -> io::Result<Option<HttpRequestHead>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut has_100_continue = false;
+    for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case("expect") {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("100-continue") {
+                has_100_continue = true;
+            } else if !trimmed.is_empty() {
+                write_json_error(
+                    client,
+                    417,
+                    "Expectation Failed",
+                    &format!("unsupported Expect header value '{trimmed}'"),
+                    true,
+                )
+                .await
+                .map_err(http_to_io)?;
+                return Ok(None);
+            }
+        }
+    }
+
+    if has_100_continue
+        && req.version == "HTTP/1.1"
+        && !matches!(req.body_mode(), BodyMode::Empty)
+    {
+        client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        client.flush().await?;
+    }
+
+    let mut up_req = req.clone();
+    up_req.version = "HTTP/1.1".to_owned();
+    strip_headers(&mut up_req.headers, &["expect"]);
+    Ok(Some(up_req))
 }
 
 fn response_allows_body(request_method: &str, status: u16) -> bool {
@@ -2943,5 +3079,248 @@ mod tests {
         }
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expect_headers_early_upstream_rejection_and_images_create_fromsrc_policy() {
+        struct ScriptedTunnelPort {
+            next_id: AtomicU32,
+            captured_expect_headers: Arc<Mutex<Vec<Option<String>>>>,
+            early_reject_large_uploads: bool,
+        }
+
+        impl ScriptedTunnelPort {
+            fn new(early_reject_large_uploads: bool) -> Self {
+                Self {
+                    next_id: AtomicU32::new(1),
+                    captured_expect_headers: Arc::new(Mutex::new(Vec::new())),
+                    early_reject_large_uploads,
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RuntimeManager for ScriptedTunnelPort {
+            async fn spawn(&self, _spec: SandboxSpec) -> Result<SandboxLease, SandboxError> {
+                unreachable!()
+            }
+            async fn renew_lease(
+                &self,
+                _id: &SandboxId,
+                _ttl: Duration,
+            ) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+            async fn exec_stream(
+                &self,
+                _id: &SandboxId,
+                _req: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                unreachable!()
+            }
+            async fn copy_in(
+                &self,
+                _id: &SandboxId,
+                _src_host: PathBuf,
+                _dst_guest: String,
+            ) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+            async fn copy_out(
+                &self,
+                _id: &SandboxId,
+                _src_guest: String,
+                _dst_host: PathBuf,
+            ) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+            async fn destroy(&self, _id: &SandboxId) -> Result<DestroyStatus, SandboxError> {
+                unreachable!()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SandboxTunnelPort for ScriptedTunnelPort {
+            async fn open_guest_tcp_stream(
+                &self,
+                _id: &SandboxId,
+                _guest_port: u16,
+            ) -> Result<TunnelStream, SandboxError> {
+                unreachable!()
+            }
+
+            async fn open_podman_unix_stream(
+                &self,
+                _id: &SandboxId,
+            ) -> Result<TunnelStream, SandboxError> {
+                let id = StreamId(self.next_id.fetch_add(1, Ordering::Relaxed));
+                let (stream, handle): (TunnelStream, TunnelStreamHandle) = TunnelStream::channel(id);
+                let captured = Arc::clone(&self.captured_expect_headers);
+                let early_reject = self.early_reject_large_uploads;
+                tokio::spawn(async move {
+                    let mut reader = PrefixedReader::new(handle.read_half);
+                    let mut writer = handle.write_half;
+                    let _drop_rx = handle.drop_rx;
+
+                    let Some(req) = read_request_head(&mut reader).await.unwrap_or(None) else {
+                        return;
+                    };
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(req.header("expect").map(str::to_owned));
+
+                    if early_reject {
+                        // Read only a small prefix, then reply HTTP 400 and close upstream early.
+                        let mut small = [0u8; 64];
+                        let _ = reader.read(&mut small).await;
+                        let body = br#"{"message":"early upstream rejection"}"#;
+                        let head = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = writer.write_all(head.as_bytes()).await;
+                        let _ = writer.write_all(body).await;
+                        let _ = writer.flush().await;
+                        let _ = writer.shutdown().await;
+                        return;
+                    }
+
+                    let _ = read_body_bytes(&mut reader, req.body_mode(), MAX_BUFFERED_BODY_BYTES)
+                        .await
+                        .unwrap_or_default();
+                    let body = br#"{"Id":"ctr-ok","Warnings":[]}"#;
+                    let _ = write_simple_resp(&mut writer, 200, "OK", "application/json", body).await;
+                });
+                Ok(stream)
+            }
+        }
+
+        // Part A: `Expect: 100-continue` on sanitized JSON and passthrough, plus `Expect: bad` -> 417
+        // and `POST /images/create?fromSrc=/etc/passwd` -> 400.
+        let tunnel_impl = Arc::new(ScriptedTunnelPort::new(false));
+        let server = Arc::new(DockerCompatServer::new(
+            Arc::clone(&tunnel_impl) as Arc<dyn SandboxTunnelPort>,
+            SandboxId::new("sbx-expect"),
+            DockerCompatPolicy::default(),
+        ));
+        let handle = server
+            .bind_loopback_http("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = handle.local_addr();
+
+        // 1. Unsupported Expect token returns 417 without reaching upstream.
+        let mut bad_expect_conn = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+        bad_expect_conn
+            .write_all(
+                b"POST /v1.45/images/create?fromSrc=- HTTP/1.1\r\nHost: localhost\r\nExpect: weird\r\nContent-Length: 4\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        bad_expect_conn.flush().await.unwrap();
+        let head_417 = read_response_head(&mut bad_expect_conn).await.unwrap();
+        assert_eq!(head_417.status, 417);
+        assert!(head_417.wants_close());
+
+        // 2. `POST /images/create?fromSrc=/etc/passwd` is rejected 400 before opening upstream.
+        let mut from_src_conn = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+        let (head_from_src, _) = send_http(
+            &mut from_src_conn,
+            "POST",
+            "/v1.45/images/create?fromSrc=/etc/passwd",
+            None,
+        )
+        .await;
+        assert_eq!(head_from_src.status, 400);
+        assert!(tunnel_impl.captured_expect_headers.lock().unwrap().is_empty());
+
+        // 3. `Expect: 100-continue` on sanitized JSON `POST /containers/create`: sends 100 Continue
+        // and strips Expect before upstream receives request.
+        let mut json_100 = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+        let json_body = br#"{"Image":"alpine"}"#;
+        let json_head = format!(
+            "POST /v1.45/containers/create HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+            json_body.len()
+        );
+        json_100.write_all(json_head.as_bytes()).await.unwrap();
+        json_100.flush().await.unwrap();
+        let interim = read_response_head(&mut json_100).await.unwrap();
+        assert_eq!(interim.status, 100);
+        json_100.write_all(json_body).await.unwrap();
+        json_100.flush().await.unwrap();
+        let final_head = read_response_head(&mut json_100).await.unwrap();
+        assert_eq!(final_head.status, 200);
+        let _ = read_body_bytes(&mut json_100, final_head.body_mode("POST"), 4096)
+            .await
+            .unwrap();
+
+        // 4. `Expect: 100-continue` on passthrough streaming `POST /images/create?fromSrc=-`.
+        let mut pass_100 = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+        pass_100
+            .write_all(
+                b"POST /v1.45/images/create?fromSrc=- HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        pass_100.flush().await.unwrap();
+        let pass_interim = read_response_head(&mut pass_100).await.unwrap();
+        assert_eq!(pass_interim.status, 100);
+        pass_100.write_all(b"hello").await.unwrap();
+        pass_100.flush().await.unwrap();
+        let pass_final = read_response_head(&mut pass_100).await.unwrap();
+        assert_eq!(pass_final.status, 200);
+        let _ = read_body_bytes(&mut pass_100, pass_final.body_mode("POST"), 4096)
+            .await
+            .unwrap();
+
+        {
+            let recorded = tunnel_impl.captured_expect_headers.lock().unwrap();
+            assert_eq!(recorded.as_slice(), &[None, None]);
+        }
+        handle.shutdown().await;
+
+        // Part B: early upstream 400 response during a >64 KiB upload is forwarded to the client.
+        let early_tunnel = Arc::new(ScriptedTunnelPort::new(true));
+        let early_server = Arc::new(DockerCompatServer::new(
+            Arc::clone(&early_tunnel) as Arc<dyn SandboxTunnelPort>,
+            SandboxId::new("sbx-early-reject"),
+            DockerCompatPolicy::default(),
+        ));
+        let early_handle = early_server
+            .bind_loopback_http("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let mut upload_conn =
+            PrefixedReader::new(TcpStream::connect(early_handle.local_addr()).await.unwrap());
+        let big_len = 256 * 1024;
+        let head = format!(
+            "POST /v1.45/images/create?fromSrc=- HTTP/1.1\r\nHost: localhost\r\nContent-Length: {big_len}\r\n\r\n"
+        );
+        upload_conn.write_all(head.as_bytes()).await.unwrap();
+        upload_conn.flush().await.unwrap();
+        let writer_handle = tokio::spawn(async move {
+            let chunk = vec![b'a'; 16 * 1024];
+            let mut written = 0usize;
+            while written < big_len {
+                if upload_conn.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                written += chunk.len();
+                tokio::task::yield_now().await;
+            }
+            let _ = upload_conn.flush().await;
+            let resp_head = read_response_head(&mut upload_conn).await.unwrap();
+            let resp_body = read_body_bytes(&mut upload_conn, resp_head.body_mode("POST"), 4096)
+                .await
+                .unwrap();
+            (resp_head, resp_body)
+        });
+        let (early_head, early_body) = writer_handle.await.unwrap();
+        assert_eq!(early_head.status, 400);
+        assert!(early_head.wants_close());
+        assert!(String::from_utf8_lossy(&early_body).contains("early upstream rejection"));
+        early_handle.shutdown().await;
     }
 }
