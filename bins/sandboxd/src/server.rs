@@ -1217,14 +1217,18 @@ where
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() {
+pub(crate) async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+        if let (Ok(mut sigterm), Ok(mut sighup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}
+                _ = sighup.recv() => {}
             }
             return;
         }

@@ -2,6 +2,7 @@
 //! in-process standalone (`LocalRuntimeManager`) backends.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +17,13 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::config::{McpConfig, McpMode};
-use crate::server::{build_runtime, daemon_status_info};
+use crate::server::{build_runtime, daemon_status_info, wait_for_shutdown_signal};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_EXEC_DEADLINE_SECS: u64 = 30;
 const DEFAULT_EXEC_OUTPUT_BUDGET_BYTES: u64 = 1024 * 1024;
+/// Maximum byte length of a single newline-delimited JSON-RPC 2.0 request line over MCP stdio.
+pub const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -145,7 +148,27 @@ pub async fn run_mcp(cfg: McpConfig) -> Result<(), SandboxError> {
 
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
-    let res = serve_mcp_stdio(stdin, stdout, &backend).await;
+    run_mcp_with_shutdown(stdin, stdout, &backend, wait_for_shutdown_signal()).await
+}
+
+/// Runs `serve_mcp_stdio` raced against `shutdown`, guaranteeing standalone VM teardown even when
+/// terminated by an OS signal (`SIGINT`/`SIGTERM`/`SIGHUP`) while blocked waiting on `stdin`.
+pub async fn run_mcp_with_shutdown<R, W, F>(
+    reader: R,
+    writer: W,
+    backend: &McpBackend,
+    shutdown: F,
+) -> Result<(), SandboxError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Future<Output = ()>,
+{
+    let res = tokio::select! {
+        biased;
+        _ = shutdown => Ok(()),
+        r = serve_mcp_stdio(reader, writer, backend) => r,
+    };
     backend.shutdown_if_standalone().await;
     res
 }
@@ -157,45 +180,138 @@ fn connect_client(endpoint: ControlEndpoint) -> Result<SandboxClient, SandboxErr
 
 /// Processes newline-delimited JSON-RPC 2.0 requests from `reader` and writes responses to `writer`.
 pub async fn serve_mcp_stdio<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     backend: &McpBackend,
 ) -> Result<(), SandboxError>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = String::new();
+    serve_mcp_stdio_bounded(reader, writer, backend, MAX_MCP_LINE_BYTES).await
+}
+
+async fn serve_mcp_stdio_bounded<R, W>(
+    mut reader: R,
+    mut writer: W,
+    backend: &McpBackend,
+    max_line_bytes: usize,
+) -> Result<(), SandboxError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut raw_line = Vec::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await.map_err(|err| {
-            SandboxError::Transport(format!("failed reading MCP stdin line: {err}"))
-        })?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(resp) = handle_json_rpc_line(trimmed, backend).await {
-            let serialized = serde_json::to_string(&resp).map_err(|err| {
-                SandboxError::Internal(format!("failed serializing MCP JSON-RPC response: {err}"))
-            })?;
-            writer
-                .write_all(serialized.as_bytes())
-                .await
-                .map_err(|err| {
-                    SandboxError::Transport(format!("failed writing MCP response: {err}"))
-                })?;
-            writer.write_all(b"\n").await.map_err(|err| {
-                SandboxError::Transport(format!("failed writing MCP response newline: {err}"))
-            })?;
-            writer.flush().await.map_err(|err| {
-                SandboxError::Transport(format!("failed flushing MCP stdout: {err}"))
-            })?;
+        let resp = match read_bounded_mcp_line(&mut reader, &mut raw_line, max_line_bytes).await? {
+            BoundedMcpLine::Eof => break,
+            BoundedMcpLine::TooLong => Some(jsonrpc_error(
+                Value::Null,
+                JSONRPC_INVALID_REQUEST,
+                format!(
+                    "Invalid Request: JSON-RPC line exceeds maximum length of {max_line_bytes} bytes"
+                ),
+            )),
+            BoundedMcpLine::Line => match std::str::from_utf8(&raw_line) {
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    handle_json_rpc_line(trimmed, backend).await
+                }
+                Err(err) => Some(jsonrpc_error(
+                    Value::Null,
+                    JSONRPC_PARSE_ERROR,
+                    format!("Parse error: invalid UTF-8 in JSON-RPC line: {err}"),
+                )),
+            },
+        };
+
+        if let Some(resp) = resp {
+            write_mcp_response_line(&mut writer, &resp).await?;
         }
     }
+    Ok(())
+}
+
+enum BoundedMcpLine {
+    Eof,
+    Line,
+    TooLong,
+}
+
+async fn read_bounded_mcp_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<BoundedMcpLine, SandboxError> {
+    buf.clear();
+    let mut over_limit = false;
+    loop {
+        let available = reader.fill_buf().await.map_err(|err| {
+            SandboxError::Transport(format!("failed reading MCP stdin line: {err}"))
+        })?;
+        if available.is_empty() {
+            return Ok(if over_limit {
+                BoundedMcpLine::TooLong
+            } else if buf.is_empty() {
+                BoundedMcpLine::Eof
+            } else {
+                BoundedMcpLine::Line
+            });
+        }
+        if let Some(nl_pos) = available.iter().position(|&b| b == b'\n') {
+            let slice = &available[..nl_pos];
+            if !over_limit {
+                if buf.len().saturating_add(slice.len()) > max_bytes {
+                    over_limit = true;
+                    buf.clear();
+                } else {
+                    buf.extend_from_slice(slice);
+                }
+            }
+            reader.consume(nl_pos + 1);
+            return Ok(if over_limit {
+                BoundedMcpLine::TooLong
+            } else {
+                BoundedMcpLine::Line
+            });
+        }
+        let n = available.len();
+        if !over_limit {
+            if buf.len().saturating_add(n) > max_bytes {
+                over_limit = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(available);
+            }
+        }
+        reader.consume(n);
+    }
+}
+
+async fn write_mcp_response_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    resp: &Value,
+) -> Result<(), SandboxError> {
+    let serialized = serde_json::to_string(resp).map_err(|err| {
+        SandboxError::Internal(format!("failed serializing MCP JSON-RPC response: {err}"))
+    })?;
+    writer
+        .write_all(serialized.as_bytes())
+        .await
+        .map_err(|err| SandboxError::Transport(format!("failed writing MCP response: {err}")))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|err| {
+            SandboxError::Transport(format!("failed writing MCP response newline: {err}"))
+        })?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| SandboxError::Transport(format!("failed flushing MCP stdout: {err}")))?;
     Ok(())
 }
 
@@ -1289,5 +1405,72 @@ mod tests {
             }
         });
         run_full_mcp_script(&McpBackend::Connected(client), &tmp_connected).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_oversized_line_without_aborting_and_cleans_up_standalone_on_shutdown() {
+        let tmp = TestTempDir::new("bounded-and-shutdown");
+        let rt = build_runtime_for_test(&tmp);
+        let backend = McpBackend::Standalone(Arc::clone(&rt));
+
+        // 1. Oversized line drains up to `\n`, returns `-32600`, and serves subsequent `ping`.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"pad\":\"");
+        input.extend(std::iter::repeat_n(b'x', 1024));
+        input.extend_from_slice(b"\"}\n");
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+
+        let mut out = Vec::new();
+        serve_mcp_stdio_bounded(BufReader::new(&input[..]), &mut out, &backend, 256)
+            .await
+            .unwrap();
+        let responses: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["result"], json!({}));
+
+        // 2. Shutdown signal while blocked on open `stdin` destroys active standalone sandboxes.
+        let (mut stdin_tx, stdin_rx) = duplex(4096);
+        let (stdout_tx, mut stdout_rx) = duplex(4096);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let spawn_req = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": { "name": "sandbox_spawn", "arguments": {} }
+        });
+        stdin_tx
+            .write_all(format!("{spawn_req}\n").as_bytes())
+            .await
+            .unwrap();
+        stdin_tx.flush().await.unwrap();
+
+        let server_task = tokio::spawn(async move {
+            run_mcp_with_shutdown(BufReader::new(stdin_rx), stdout_tx, &backend, async move {
+                let _ = stop_rx.await;
+            })
+            .await
+        });
+
+        let mut resp_reader = BufReader::new(&mut stdout_rx);
+        let mut line = String::new();
+        resp_reader.read_line(&mut line).await.unwrap();
+        let spawned: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(spawned["result"]["isError"], false);
+        assert_eq!(rt.active_sandbox_ids().len(), 1);
+
+        // Trigger simulated OS termination signal while `stdin_tx` remains open!
+        stop_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+        assert!(
+            rt.active_sandbox_ids().is_empty(),
+            "standalone sandboxes must be destroyed on signal shutdown"
+        );
     }
 }
