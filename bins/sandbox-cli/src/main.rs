@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         &parsed.command,
         CliCommand::Run(_) | CliCommand::Doctor { smoke: Some(_) }
     );
-    let result = rt.block_on(execute_cli(parsed));
+    let result = rt.block_on(Box::pin(execute_cli(parsed)));
     if bounded_shutdown {
         // A cancelled stdout/stderr write can still be blocked in Tokio's blocking pool.
         rt.shutdown_timeout(std::time::Duration::from_secs(2));

@@ -37,7 +37,7 @@ pub async fn execute_doctor(
     }
 
     let (smoke, smoke_ok) = match smoke_spec {
-        Some(spec) if daemon["status"] == "ok" => match execute_smoke(client, spec).await {
+        Some(spec) if daemon["status"] == "ok" => match Box::pin(execute_smoke(client, spec)).await {
             Ok(result) => result,
             Err(error) => (
                 json!({ "status": "error", "error": error.to_string() }),

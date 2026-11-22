@@ -35,8 +35,8 @@ fn main() -> ExitCode {
     let res = rt.block_on(async move {
         match cmd {
             Command::Help(_) => Ok(()),
-            Command::Serve(cfg) => server::run_serve(*cfg).await,
-            Command::Mcp(cfg) => mcp::run_mcp(cfg).await,
+            Command::Serve(cfg) => Box::pin(server::run_serve(*cfg)).await,
+            Command::Mcp(cfg) => Box::pin(mcp::run_mcp(cfg)).await,
         }
     });
 

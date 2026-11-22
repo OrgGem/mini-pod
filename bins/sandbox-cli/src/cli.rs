@@ -1431,7 +1431,7 @@ pub async fn execute_with_client(
     command: CliCommand,
 ) -> Result<u8, SandboxError> {
     match command {
-        CliCommand::Doctor { smoke } => execute_doctor(client, json_mode, smoke).await,
+        CliCommand::Doctor { smoke } => Box::pin(execute_doctor(client, json_mode, smoke)).await,
         CliCommand::Status => {
             let info = client.status().await?;
             if json_mode {
@@ -1499,9 +1499,9 @@ pub async fn execute_with_client(
             Ok(0)
         }
         CliCommand::Tui { refresh_interval } => {
-            crate::tui::run_tui(client, refresh_interval).await
+            Box::pin(crate::tui::run_tui(client, refresh_interval)).await
         }
-        CliCommand::Run(spec) => execute_run(client, json_mode, *spec).await,
+        CliCommand::Run(spec) => Box::pin(execute_run(client, json_mode, *spec)).await,
         CliCommand::Spawn(spec) => {
             let lease = client.spawn(spec).await?;
             if json_mode {
@@ -1632,7 +1632,7 @@ pub async fn execute_with_client(
             Ok(0)
         }
         CliCommand::Build { id, spec } => {
-            let res = build_image_in_sandbox(client, &id, *spec, !json_mode).await?;
+            let res = Box::pin(build_image_in_sandbox(client, &id, *spec, !json_mode)).await?;
             let code = exit_status_to_code(res.exit);
             if json_mode {
                 print_json(&json!({
@@ -1659,7 +1659,7 @@ pub async fn execute_with_client(
             Ok(code)
         }
         CliCommand::Compose { id, action } => {
-            execute_compose(client, &id, json_mode, action).await
+            Box::pin(execute_compose(client, &id, json_mode, action)).await
         }
         CliCommand::DockerEndpoint {
             id,
@@ -2374,5 +2374,138 @@ mod tests {
             }),
             124
         );
+    }
+
+    #[test]
+    fn doctor_smoke_fits_comfortably_within_constrained_512kib_stack() {
+        use sandbox_client::{
+            read_control_frame, write_control_frame, ControlRequest, ControlResponse,
+            DaemonStatusInfo, ExecWireEvent,
+        };
+        use sandbox_core::{CapabilityReport, SandboxLease};
+        use tokio::io::duplex;
+
+        let handle = std::thread::Builder::new()
+            .name("msvc-stack-budget-probe".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let ep = if cfg!(windows) {
+                    ControlEndpoint::NamedPipe(r"\\.\pipe\cli-stack-test".to_owned())
+                } else {
+                    ControlEndpoint::UnixSocket(PathBuf::from("/tmp/cli-stack-test.sock"))
+                };
+                let client = SandboxClient::with_connector(ep, |_| async move {
+                    let (c, mut s) = duplex(16 * 1024);
+                    tokio::spawn(async move {
+                        let raw = read_control_frame(&mut s).await.unwrap().unwrap();
+                        match ControlRequest::from_json_bytes(&raw).unwrap() {
+                            ControlRequest::Status => {
+                                let resp = ControlResponse::Status(DaemonStatusInfo {
+                                    active_sandboxes: 0,
+                                    warm_ready_vms: 0,
+                                    effective_host_rss_mb: 0,
+                                    reserved_host_storage_mb: 0,
+                                    version: "0.1.0".to_owned(),
+                                });
+                                write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                                    .await
+                                    .unwrap();
+                            }
+                            ControlRequest::Doctor => {
+                                let resp = ControlResponse::Doctor {
+                                    report: json!({
+                                        "guest_arch": "x86_64",
+                                        "qemu": { "status": "ok" },
+                                        "qemu_img": { "status": "ok" },
+                                        "bundle": { "status": "ok" },
+                                        "accelerators": { "status": "ok", "candidates": ["tcg"] }
+                                    }),
+                                };
+                                write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                                    .await
+                                    .unwrap();
+                            }
+                            ControlRequest::Spawn { spec } => {
+                                let resp = ControlResponse::Spawned(SandboxLease {
+                                    id: SandboxId::new("sb-smoke-stack"),
+                                    ttl: spec.lease_ttl,
+                                    capabilities: CapabilityReport {
+                                        cpu_quota: EnforcementLevel::BestEffort,
+                                        host_rss: EnforcementLevel::BestEffort,
+                                        host_storage: EnforcementLevel::HardLimit,
+                                        egress_filter: EnforcementLevel::HardLimit,
+                                    },
+                                });
+                                write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                                    .await
+                                    .unwrap();
+                            }
+                            ControlRequest::GetAccelerator { .. } => {
+                                let resp = ControlResponse::Accelerator {
+                                    name: Some("tcg".to_owned()),
+                                };
+                                write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                                    .await
+                                    .unwrap();
+                            }
+                            ControlRequest::ExecStart { .. } => {
+                                write_control_frame(
+                                    &mut s,
+                                    &ControlResponse::ExecStarted { stream_id: 1 }
+                                        .to_json_bytes()
+                                        .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                                write_control_frame(
+                                    &mut s,
+                                    &ExecWireEvent::Exit(ExecExitStatus {
+                                        code: Some(0),
+                                        timed_out: false,
+                                        stdout_truncated: false,
+                                        stderr_truncated: false,
+                                    })
+                                    .to_json_bytes()
+                                    .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            }
+                            ControlRequest::Destroy { .. } => {
+                                let resp =
+                                    ControlResponse::Destroyed(DestroyStatus::AllResourcesCleaned);
+                                write_control_frame(&mut s, &resp.to_json_bytes().unwrap())
+                                    .await
+                                    .unwrap();
+                            }
+                            other => panic!("unexpected request: {other:?}"),
+                        }
+                    });
+                    Ok(c)
+                });
+
+                let CliOutcome::Run(parsed_doc) =
+                    parse_args_with(&args(&["doctor", "--smoke"]), no_env).unwrap()
+                else {
+                    panic!("expected doctor --smoke");
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let code = rt
+                    .block_on(Box::pin(execute_with_client(
+                        &client,
+                        true,
+                        parsed_doc.command,
+                    )))
+                    .unwrap();
+                assert_eq!(code, 0);
+            })
+            .expect("spawn 512 KiB stack probe thread");
+
+        handle
+            .join()
+            .expect("doctor --smoke must complete cleanly within 512 KiB stack");
     }
 }

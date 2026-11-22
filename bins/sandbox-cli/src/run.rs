@@ -149,7 +149,7 @@ pub async fn execute_run(
     json_mode: bool,
     run: RunSpec,
 ) -> Result<u8, SandboxError> {
-    let report = run_once(client, json_mode, run, false).await?;
+    let report = Box::pin(run_once(client, json_mode, run, false)).await?;
     report.emit(json_mode);
     Ok(report.code())
 }
@@ -174,7 +174,7 @@ pub(crate) async fn execute_smoke(
         input: None,
         output: None,
     };
-    let report = run_once(client, true, run, true).await?;
+    let report = Box::pin(run_once(client, true, run, true)).await?;
     let accelerator = match &report.accelerator {
         Some(Ok(Some(name))) if !matches!(name.as_str(), "kvm" | "hvf" | "whpx" | "tcg") => {
             json!({ "status": "unknown", "used": name, "detail": "The driver reported an unrecognized accelerator." })
