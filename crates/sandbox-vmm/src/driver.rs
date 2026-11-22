@@ -14,9 +14,9 @@ use sandbox_core::{
     NetworkPolicy, SandboxError,
 };
 use sandbox_protocol::{
-    is_guest_stream_id, read_frame, write_frame, ExecTargetWire, Frame, Lane, Message,
-    PriorityFrameQueue, StreamChannel, StreamId, StreamTargetWire, HOST_STREAM_ID_MAX,
-    INITIAL_STREAM_CREDIT_BYTES,
+    is_guest_stream_id, read_frame, stream_frame_credit_cost, write_frame, ExecTargetWire, Frame,
+    Lane, Message, PriorityFrameQueue, StreamChannel, StreamId, StreamTargetWire,
+    HOST_STREAM_ID_MAX, INITIAL_STREAM_CREDIT_BYTES,
 };
 use sandbox_runtime::{
     validate_guest_path, ExecOutputChunk, ExecStream, OutputStreamKind, TunnelStream,
@@ -42,17 +42,6 @@ use crate::spike::{
 };
 
 const MAX_HOST_STREAM_CHUNK_BYTES: usize = 64 * 1024;
-/// Minimum per-frame heap accounting charged per inbound `StreamData` item so 1-byte
-/// frame floods cannot multiply host queued memory beyond `MAX_STREAM_INBOUND_BUFFER_BYTES`.
-const STREAM_FRAME_OVERHEAD_BYTES: usize = 64;
-
-fn inbound_frame_cost(payload_len: usize) -> usize {
-    if payload_len == 0 {
-        0
-    } else {
-        payload_len.saturating_add(STREAM_FRAME_OVERHEAD_BYTES)
-    }
-}
 // shortcut: fixed 4096-frame / 4 MiB host->guest control lane cap closes session on overflow, add async caller backpressure on control enqueue if legit burst exceeds 4096 queued control frames
 const MAX_OUTBOUND_CONTROL_FRAMES: usize = 4096;
 const MAX_OUTBOUND_CONTROL_QUEUE_BYTES: usize = 4 * 1024 * 1024;
@@ -704,6 +693,7 @@ enum StreamHandler {
     CopyOut {
         max_bytes: u64,
         buffer: Vec<u8>,
+        eof_seen: bool,
         activity: Arc<Notify>,
         reply_tx: Option<oneshot::Sender<Result<Vec<u8>, SandboxError>>>,
     },
@@ -965,6 +955,12 @@ impl QemuVmSession {
             ));
         }
         Ok(())
+    }
+
+    fn copy_total_timeout(&self) -> Duration {
+        self.io_timeout
+            .saturating_mul(10)
+            .min(Duration::from_secs(300))
     }
 
     fn teardown_ipc_and_threads(&self) {
@@ -1346,10 +1342,17 @@ impl VmSessionPort for QemuVmSession {
         }
         let mut stream_guard = CopyStreamGuard::new(stream_id, &self.ops, &self.outbound);
 
+        let total_deadline = tokio::time::Instant::now() + self.copy_total_timeout();
         let mut all_sent = false;
         if tar_bytes.is_empty() {
+            let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SandboxError::Transport(
+                    "copy_in exceeded total duration budget".to_owned(),
+                ));
+            }
             match tokio::time::timeout(
-                self.io_timeout,
+                self.io_timeout.min(remaining),
                 self.enqueue_data_message(
                     stream_id,
                     &Message::StreamData {
@@ -1373,8 +1376,14 @@ impl VmSessionPort for QemuVmSession {
         } else {
             let mut offset = 0usize;
             while offset < tar_bytes.len() {
+                let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(SandboxError::Transport(
+                        "copy_in exceeded total duration budget".to_owned(),
+                    ));
+                }
                 let maybe_allowance = tokio::time::timeout(
-                    self.io_timeout,
+                    self.io_timeout.min(remaining),
                     stdin_credits.wait_available(MAX_HOST_STREAM_CHUNK_BYTES),
                 )
                 .await
@@ -1391,8 +1400,14 @@ impl VmSessionPort for QemuVmSession {
                 stdin_credits.consume(take);
                 let end = offset + take;
                 let eof = end == tar_bytes.len();
+                let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(SandboxError::Transport(
+                        "copy_in exceeded total duration budget".to_owned(),
+                    ));
+                }
                 match tokio::time::timeout(
-                    self.io_timeout,
+                    self.io_timeout.min(remaining),
                     self.enqueue_data_message(
                         stream_id,
                         &Message::StreamData {
@@ -1420,7 +1435,13 @@ impl VmSessionPort for QemuVmSession {
             }
         }
 
-        match tokio::time::timeout(self.io_timeout, reply_rx).await {
+        let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(SandboxError::Transport(
+                "copy_in exceeded total duration budget".to_owned(),
+            ));
+        }
+        match tokio::time::timeout(self.io_timeout.min(remaining), reply_rx).await {
             Ok(Ok(outcome)) => {
                 stream_guard.disarm();
                 let bytes_transferred = outcome?;
@@ -1465,6 +1486,7 @@ impl VmSessionPort for QemuVmSession {
                 StreamHandler::CopyOut {
                     max_bytes,
                     buffer: Vec::new(),
+                    eof_seen: false,
                     activity: Arc::clone(&activity),
                     reply_tx: Some(reply_tx),
                 },
@@ -1482,8 +1504,15 @@ impl VmSessionPort for QemuVmSession {
             return Err(err);
         }
         let mut stream_guard = CopyStreamGuard::new(stream_id, &self.ops, &self.outbound);
+        let total_deadline = tokio::time::Instant::now() + self.copy_total_timeout();
 
         loop {
+            let remaining = total_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SandboxError::Transport(
+                    "copy_out exceeded total duration budget".to_owned(),
+                ));
+            }
             tokio::select! {
                 biased;
                 res = &mut reply_rx => {
@@ -1498,7 +1527,12 @@ impl VmSessionPort for QemuVmSession {
                     };
                 }
                 _ = activity.notified() => {}
-                _ = tokio::time::sleep(self.io_timeout) => {
+                _ = tokio::time::sleep(self.io_timeout.min(remaining)) => {
+                    if tokio::time::Instant::now() >= total_deadline {
+                        return Err(SandboxError::Transport(
+                            "copy_out exceeded total duration budget".to_owned(),
+                        ));
+                    }
                     return Err(SandboxError::Transport(format!(
                         "copy_out timed out after {} ms without guest progress",
                         self.io_timeout.as_millis()
@@ -1711,7 +1745,7 @@ async fn pump_exec_output(
         match item {
             ExecInbound::Output { channel, chunk } => {
                 let len = chunk.data.len();
-                let cost = inbound_frame_cost(len);
+                let cost = stream_frame_credit_cost(len);
                 if let Some(tx) = output_tx.as_ref() {
                     let send_res = tokio::select! {
                         biased;
@@ -1743,7 +1777,7 @@ async fn pump_exec_output(
                     }
                 }
                 queued_bytes.fetch_sub(cost, Ordering::AcqRel);
-                send_stream_credit(&outbound, stream_id, channel, len);
+                send_stream_credit(&outbound, stream_id, channel, cost);
             }
             ExecInbound::Exit(status) => {
                 drop(output_tx.take());
@@ -1859,7 +1893,7 @@ async fn pump_tunnel_inbound(
             TunnelInbound::Data { data, eof } => {
                 let len = data.len();
                 if len > 0 {
-                    let cost = inbound_frame_cost(len);
+                    let cost = stream_frame_credit_cost(len);
                     let write_res = tokio::select! {
                         biased;
                         _ = session_closed_rx.changed() => {
@@ -1872,7 +1906,7 @@ async fn pump_tunnel_inbound(
                     if write_res.is_err() {
                         break;
                     }
-                    send_stream_credit(&outbound, stream_id, StreamChannel::Stdout, len);
+                    send_stream_credit(&outbound, stream_id, StreamChannel::Stdout, cost);
                 }
                 if eof {
                     if let Some(tx) = remote_eof_tx.take() {
@@ -2177,7 +2211,7 @@ fn run_reader_loop(
                         };
                         if let Some(stream_kind) = kind.filter(|_| !data.is_empty()) {
                             let len = data.len();
-                            let cost = inbound_frame_cost(len);
+                            let cost = stream_frame_credit_cost(len);
                             let prev = queued_bytes.fetch_add(cost, Ordering::AcqRel);
                             if prev.saturating_add(cost) > MAX_STREAM_INBOUND_BUFFER_BYTES {
                                 queued_bytes.fetch_sub(cost, Ordering::AcqRel);
@@ -2221,20 +2255,18 @@ fn run_reader_loop(
                     Some(StreamHandler::CopyOut {
                         max_bytes,
                         buffer,
+                        eof_seen,
                         activity,
                         ..
                     }) if channel == StreamChannel::Stdout => {
-                        let limit = *max_bytes;
-                        let chunk_len = data.len();
-                        let new_len = (buffer.len() as u64).saturating_add(chunk_len as u64);
-                        if new_len > limit {
+                        if *eof_seen {
                             if let Some(StreamHandler::CopyOut { mut reply_tx, .. }) =
                                 map.remove(&stream_id)
                             {
                                 if let Some(tx) = reply_tx.take() {
-                                    let _ = tx.send(Err(SandboxError::BudgetExceeded(format!(
-                                        "copy_out payload exceeded max_bytes ({limit})"
-                                    ))));
+                                    let _ = tx.send(Err(SandboxError::Transport(
+                                        "guest sent CopyOut data after EOF".to_owned(),
+                                    )));
                                 }
                             }
                             drop(map);
@@ -2244,20 +2276,44 @@ fn run_reader_loop(
                                 let _ = outbound.enqueue_control(close_frame);
                             }
                         } else {
-                            buffer.extend_from_slice(&data);
-                            if !data.is_empty() || eof {
-                                let notify = Arc::clone(activity);
+                            let limit = *max_bytes;
+                            let chunk_len = data.len();
+                            let new_len = (buffer.len() as u64).saturating_add(chunk_len as u64);
+                            if new_len > limit {
+                                if let Some(StreamHandler::CopyOut { mut reply_tx, .. }) =
+                                    map.remove(&stream_id)
+                                {
+                                    if let Some(tx) = reply_tx.take() {
+                                        let _ = tx.send(Err(SandboxError::BudgetExceeded(format!(
+                                            "copy_out payload exceeded max_bytes ({limit})"
+                                        ))));
+                                    }
+                                }
                                 drop(map);
-                                notify.notify_one();
+                                if let Ok(close_frame) =
+                                    Frame::from_message(stream_id, &Message::StreamClose)
+                                {
+                                    let _ = outbound.enqueue_control(close_frame);
+                                }
                             } else {
-                                drop(map);
+                                if eof {
+                                    *eof_seen = true;
+                                }
+                                buffer.extend_from_slice(&data);
+                                if !data.is_empty() || eof {
+                                    let notify = Arc::clone(activity);
+                                    drop(map);
+                                    notify.notify_one();
+                                } else {
+                                    drop(map);
+                                }
+                                send_stream_credit(
+                                    &outbound,
+                                    stream_id,
+                                    StreamChannel::Stdout,
+                                    stream_frame_credit_cost(chunk_len),
+                                );
                             }
-                            send_stream_credit(
-                                &outbound,
-                                stream_id,
-                                StreamChannel::Stdout,
-                                chunk_len,
-                            );
                         }
                     }
                     Some(StreamHandler::Tunnel {
@@ -2289,7 +2345,7 @@ fn run_reader_loop(
                                 *stdout_eof_seen = true;
                             }
                             let len = data.len();
-                            let cost = inbound_frame_cost(len);
+                            let cost = stream_frame_credit_cost(len);
                             let prev = queued_bytes.fetch_add(cost, Ordering::AcqRel);
                             if prev.saturating_add(cost) > MAX_STREAM_INBOUND_BUFFER_BYTES {
                                 queued_bytes.fetch_sub(cost, Ordering::AcqRel);
@@ -4704,6 +4760,84 @@ mod tests {
             .await
             .expect("small-frame flood must abort promptly");
         assert!(status.is_err(), "expected Transport abort on small-frame flood, got {status:?}");
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_out_rejects_repeated_eof_and_enforces_total_duration_budget() {
+        let listener = AgentIpcEndpoint::bind_temp("drv-copy-out-cap").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            // 1. CopyOut #1: guest spams 0-byte `eof: true` frames. Second frame must abort immediately.
+            let first = read_frame(&mut client).unwrap();
+            let sid1 = first.header.stream_id;
+            for _ in 0..3 {
+                if write_frame(
+                    &mut client,
+                    &Frame::from_message(
+                        sid1,
+                        &Message::StreamData {
+                            channel: StreamChannel::Stdout,
+                            eof: true,
+                            data: Vec::new(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+
+            // 2. CopyOut #2: guest drips 1 byte every 20ms (< io_timeout=50ms) until total budget expires.
+            let second = read_frame(&mut client).unwrap();
+            let sid2 = second.header.stream_id;
+            for _ in 0..50 {
+                thread::sleep(Duration::from_millis(20));
+                if write_frame(
+                    &mut client,
+                    &Frame::from_message(
+                        sid2,
+                        &Message::StreamData {
+                            channel: StreamChannel::Stdout,
+                            eof: false,
+                            data: vec![b'a'],
+                        },
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session =
+            QemuVmSession::from_test_stream(host_stream, Duration::from_millis(50)).unwrap();
+
+        let err_eof = session
+            .copy_out_tar("/workspace", 4096)
+            .await
+            .expect_err("second CopyOut EOF frame must fail cleanly");
+        assert!(matches!(err_eof, SandboxError::Transport(_)), "got {err_eof:?}");
+
+        let err_total = session
+            .copy_out_tar("/workspace", 4096)
+            .await
+            .expect_err("1-byte CopyOut slow drip must hit total duration cap");
+        assert!(
+            matches!(err_total, SandboxError::Transport(ref msg) if msg.contains("total duration")),
+            "got {err_total:?}"
+        );
 
         session.force_kill().await.unwrap();
         guest_thread.join().unwrap();

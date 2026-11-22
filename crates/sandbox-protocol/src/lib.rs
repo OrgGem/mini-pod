@@ -15,8 +15,20 @@ pub const FRAME_HEADER_LEN: usize = 12;
 pub const MAX_FRAME_PAYLOAD_BYTES: u32 = 1024 * 1024;
 /// Default initial per-channel byte credit window (`256 KiB`) for `Data` streams.
 pub const INITIAL_STREAM_CREDIT_BYTES: u32 = 256 * 1024;
+/// Per-frame overhead (bytes) charged on credit-controlled `StreamData` frames so small-chunk
+/// bursts cannot multiply host buffer memory beyond the negotiated credit window.
+pub const STREAM_FRAME_OVERHEAD_BYTES: usize = 64;
 pub const HOST_STREAM_ID_MAX: u32 = 0x7fff_ffff;
 pub const GUEST_STREAM_ID_BIT: u32 = 0x8000_0000;
+
+/// Returns the flow-control credit cost for a `StreamData` frame carrying `payload_len` bytes.
+pub const fn stream_frame_credit_cost(payload_len: usize) -> usize {
+    if payload_len == 0 {
+        0
+    } else {
+        payload_len.saturating_add(STREAM_FRAME_OVERHEAD_BYTES)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u32);

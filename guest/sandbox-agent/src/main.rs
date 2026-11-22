@@ -18,9 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sandbox_protocol::{
-    read_frame, write_frame, Frame, Lane, Message, PriorityFrameQueue, ProtocolError,
-    StreamChannel, StreamId, INITIAL_STREAM_CREDIT_BYTES, MAX_FRAME_PAYLOAD_BYTES,
-    PROTOCOL_VERSION,
+    read_frame, stream_frame_credit_cost, write_frame, Frame, Lane, Message, PriorityFrameQueue,
+    ProtocolError, StreamChannel, StreamId, INITIAL_STREAM_CREDIT_BYTES, MAX_FRAME_PAYLOAD_BYTES,
+    PROTOCOL_VERSION, STREAM_FRAME_OVERHEAD_BYTES,
 };
 
 use crate::copy_tar::{run_copy_in, run_copy_out, ActiveCopyIn};
@@ -255,10 +255,11 @@ impl OutboundQueue {
                 let remaining = bytes.len() - offset;
                 match state.credits.get_mut(&(stream_id, channel as u8)) {
                     None => break remaining.min(MAX_STREAM_DATA_CHUNK_BYTES),
-                    Some(avail) if *avail > 0 => {
-                        let allowed = usize::try_from(*avail).unwrap_or(usize::MAX);
-                        let n = remaining.min(MAX_STREAM_DATA_CHUNK_BYTES).min(allowed);
-                        *avail -= n as u64;
+                    Some(avail) if *avail > STREAM_FRAME_OVERHEAD_BYTES as u64 => {
+                        let max_payload = usize::try_from(*avail - STREAM_FRAME_OVERHEAD_BYTES as u64)
+                            .unwrap_or(usize::MAX);
+                        let n = remaining.min(MAX_STREAM_DATA_CHUNK_BYTES).min(max_payload);
+                        *avail -= stream_frame_credit_cost(n) as u64;
                         break n;
                     }
                     Some(_) => {
@@ -2700,5 +2701,44 @@ mod tests {
 
         // Shutdown joins all worker threads; would hang if CopyIn or CopyOut remained stuck.
         shutdown_test_session(host_rx, host_tx, agent);
+    }
+
+    #[test]
+    fn outbound_queue_charges_frame_overhead_in_stream_credits_and_resumes_on_grant() {
+        let outbound = Arc::new(OutboundQueue::new());
+        let stream_id = StreamId(33);
+        outbound.seed_default_credit(stream_id, StreamChannel::Stdout, INITIAL_STREAM_CREDIT_BYTES);
+
+        let per_chunk_cost = stream_frame_credit_cost(1) as usize; // 1 + 64 = 65 bytes
+        let max_chunks = (INITIAL_STREAM_CREDIT_BYTES as usize) / per_chunk_cost; // 4032 chunks
+
+        let sender_outbound = Arc::clone(&outbound);
+        let worker = thread::spawn(move || {
+            for _ in 0..=max_chunks {
+                sender_outbound
+                    .send_stream_data(stream_id, StreamChannel::Stdout, b"x")
+                    .unwrap();
+            }
+        });
+
+        let mut drained = 0usize;
+        while drained < max_chunks {
+            let frame = outbound.pop_for_writer().expect("initial credit chunk");
+            assert_eq!(frame.header.stream_id, stream_id);
+            drained += 1;
+        }
+        // Remaining credit (< 65 bytes) must pause the (max_chunks + 1)-th 1-byte send.
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            outbound.state.lock().unwrap().queue.data_len(),
+            0,
+            "guest must pause cleanly before exceeding host per-frame credit window"
+        );
+
+        outbound.grant_credit(stream_id, StreamChannel::Stdout, per_chunk_cost as u32);
+        let extra = outbound.pop_for_writer().expect("resumed chunk after credit grant");
+        assert_eq!(extra.header.stream_id, stream_id);
+        worker.join().unwrap();
+        outbound.finish_and_drain();
     }
 }
