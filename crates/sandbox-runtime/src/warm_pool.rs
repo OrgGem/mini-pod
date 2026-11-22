@@ -300,6 +300,7 @@ impl WarmPoolStore {
                 notify_done = true;
             }
             if state.draining || state.ready.len() >= target_size {
+                Self::mark_transitioning_locked(&mut state, &entry);
                 Some(entry)
             } else {
                 state.ready.push_back(entry);
@@ -343,20 +344,31 @@ impl WarmPoolStore {
     }
 
     pub(crate) fn commit_checkout(&self, sandbox_id: &SandboxId) {
-        let mut state = lock_unpoisoned(&self.inner);
-        state.transitioning.remove(sandbox_id);
-        state.total_checkouts = state.total_checkouts.saturating_add(1);
+        let removed = {
+            let mut state = lock_unpoisoned(&self.inner);
+            let removed = state.transitioning.remove(sandbox_id);
+            state.total_checkouts = state.total_checkouts.saturating_add(1);
+            removed
+        };
+        drop(removed);
     }
 
     pub(crate) fn abort_checkout(&self, sandbox_id: &SandboxId) {
-        let mut state = lock_unpoisoned(&self.inner);
-        state.transitioning.remove(sandbox_id);
-        state.total_disposed_dirty = state.total_disposed_dirty.saturating_add(1);
+        let removed = {
+            let mut state = lock_unpoisoned(&self.inner);
+            let removed = state.transitioning.remove(sandbox_id);
+            state.total_disposed_dirty = state.total_disposed_dirty.saturating_add(1);
+            removed
+        };
+        drop(removed);
     }
 
     pub(crate) fn finish_eviction(&self, sandbox_id: &SandboxId) {
-        let mut state = lock_unpoisoned(&self.inner);
-        state.transitioning.remove(sandbox_id);
+        let removed = {
+            let mut state = lock_unpoisoned(&self.inner);
+            state.transitioning.remove(sandbox_id)
+        };
+        drop(removed);
     }
 
     pub(crate) fn pop_one_for_eviction(&self) -> Option<WarmEntry> {
@@ -367,31 +379,23 @@ impl WarmPoolStore {
         Some(entry)
     }
 
-    pub(crate) fn drain_expired(&self, max_idle_age: Duration) -> Vec<WarmEntry> {
+    pub(crate) fn pop_one_expired(&self, max_idle_age: Duration) -> Option<WarmEntry> {
         let mut state = lock_unpoisoned(&self.inner);
-        let len = state.ready.len();
-        let mut kept = VecDeque::with_capacity(len);
-        let mut expired = Vec::new();
-        while let Some(entry) = state.ready.pop_front() {
-            if !entry.session.is_alive() || entry.booted_at.elapsed() >= max_idle_age {
-                Self::mark_transitioning_locked(&mut state, &entry);
-                expired.push(entry);
-            } else {
-                kept.push_back(entry);
-            }
-        }
-        state.ready = kept;
-        state.total_evictions = state.total_evictions.saturating_add(expired.len() as u64);
-        expired
+        let pos = state
+            .ready
+            .iter()
+            .position(|entry| !entry.session.is_alive() || entry.booted_at.elapsed() >= max_idle_age)?;
+        let entry = state.ready.remove(pos)?;
+        Self::mark_transitioning_locked(&mut state, &entry);
+        state.total_evictions = state.total_evictions.saturating_add(1);
+        Some(entry)
     }
 
-    pub(crate) fn drain_ready(&self) -> Vec<WarmEntry> {
+    pub(crate) fn pop_one_for_drain(&self) -> Option<WarmEntry> {
         let mut state = lock_unpoisoned(&self.inner);
-        let entries: Vec<WarmEntry> = state.ready.drain(..).collect();
-        for entry in &entries {
-            Self::mark_transitioning_locked(&mut state, entry);
-        }
-        entries
+        let entry = state.ready.pop_front()?;
+        Self::mark_transitioning_locked(&mut state, &entry);
+        Some(entry)
     }
 
     pub(crate) fn clear_ready_for_drop(&self) -> Vec<WarmEntry> {

@@ -1016,8 +1016,7 @@ impl VmSessionPort for QemuVmSession {
                     self.alive.store(false, Ordering::Release);
                     false
                 }
-                Ok(None) => true,
-                Err(_) => false,
+                Ok(None) | Err(_) => true,
             }
         } else {
             !self.transport_closed.load(Ordering::Acquire)
@@ -1588,7 +1587,6 @@ impl VmSessionPort for QemuVmSession {
     }
 
     async fn force_kill(&self) -> Result<(), SandboxError> {
-        self.alive.store(false, Ordering::Release);
         self.outbound.close(Some("force_kill invoked".to_owned()));
         let _ = self
             .session_closed_tx
@@ -1599,13 +1597,26 @@ impl VmSessionPort for QemuVmSession {
         }
 
         let maybe_process = lock_unpoisoned(&self.process).take();
-        let kill_res = if let Some(mut process) = maybe_process {
-            tokio::task::spawn_blocking(move || process.kill_and_wait())
-                .await
-                .map_err(|err| SandboxError::Internal(format!("force_kill task failed: {err}")))?
+        let (retained_process, kill_res, exited) = if let Some(mut process) = maybe_process {
+            tokio::task::spawn_blocking(move || {
+                let res = process.kill_and_wait();
+                let exited = res.is_ok() || matches!(process.try_wait(), Ok(Some(_)));
+                let retained = if exited { None } else { Some(process) };
+                (retained, res, exited)
+            })
+            .await
+            .map_err(|err| SandboxError::Internal(format!("force_kill task failed: {err}")))?
         } else {
-            Ok(())
+            (None, Ok(()), true)
         };
+
+        if let Some(process) = retained_process {
+            *lock_unpoisoned(&self.process) = Some(process);
+        }
+        if !exited {
+            return kill_res;
+        }
+        self.alive.store(false, Ordering::Release);
 
         let shutdown_half = lock_unpoisoned(&self.stream_shutdown).take();
         let writer = lock_unpoisoned(&self.writer_thread).take();
