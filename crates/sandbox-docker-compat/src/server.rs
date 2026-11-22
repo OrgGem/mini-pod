@@ -165,6 +165,7 @@ enum StreamNext {
 
 enum DockerRoute<'a> {
     ForbiddenLibpod,
+    ForbiddenRoute(&'static str),
     ContainerCreate,
     VolumeCreate,
     ContainerExecCreate,
@@ -576,6 +577,17 @@ impl DockerCompatServer {
                 )
                 .await
                 .map_err(http_to_io)?;
+                return Ok(if close {
+                    StreamNext::Close
+                } else {
+                    StreamNext::Continue
+                });
+            }
+            DockerRoute::ForbiddenRoute(reason) => {
+                let close = should_close_rejected_request(&req, false);
+                write_json_error(client, 403, "Forbidden", reason, close)
+                    .await
+                    .map_err(http_to_io)?;
                 return Ok(if close {
                     StreamNext::Close
                 } else {
@@ -1525,6 +1537,25 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
         }
     }
 
+    match parts[0].to_ascii_lowercase().as_str() {
+        "plugins" => {
+            return DockerRoute::ForbiddenRoute(
+                "Docker plugins API is disabled on the sandbox compatibility endpoint",
+            );
+        }
+        "swarm" | "nodes" | "services" | "tasks" | "secrets" | "configs" => {
+            return DockerRoute::ForbiddenRoute(
+                "Docker Swarm/cluster API is disabled on the sandbox compatibility endpoint",
+            );
+        }
+        "grpc" | "session" => {
+            return DockerRoute::ForbiddenRoute(
+                "BuildKit gRPC/session API is disabled on the sandbox compatibility endpoint",
+            );
+        }
+        _ => {}
+    }
+
     if method.eq_ignore_ascii_case("POST") {
         match parts.as_slice() {
             [c, action]
@@ -1549,17 +1580,31 @@ fn parse_docker_route<'a>(method: &str, path: &'a str) -> DockerRoute<'a> {
                 if n.eq_ignore_ascii_case("networks")
                     && action.eq_ignore_ascii_case("connect") =>
             {
-                if let Some(id) = decode_safe_container_id(raw_id) {
-                    return DockerRoute::NetworkConnect { id };
-                }
+                return match decode_safe_container_id(raw_id) {
+                    Some(id) => DockerRoute::NetworkConnect { id },
+                    None => DockerRoute::ForbiddenRoute(
+                        "invalid network identifier in Docker API path",
+                    ),
+                };
             }
             [c, raw_id, action]
                 if c.eq_ignore_ascii_case("containers")
                     && action.eq_ignore_ascii_case("exec") =>
             {
-                if decode_safe_container_id(raw_id).is_some() {
-                    return DockerRoute::ContainerExecCreate;
-                }
+                return match decode_safe_container_id(raw_id) {
+                    Some(_) => DockerRoute::ContainerExecCreate,
+                    None => DockerRoute::ForbiddenRoute(
+                        "invalid container identifier in Docker API path",
+                    ),
+                };
+            }
+            [c, _, action]
+                if c.eq_ignore_ascii_case("containers")
+                    && action.eq_ignore_ascii_case("update") =>
+            {
+                return DockerRoute::ForbiddenRoute(
+                    "POST /containers/{id}/update is disabled on the sandbox compatibility endpoint",
+                );
             }
             [b] if b.eq_ignore_ascii_case("build") => {
                 return DockerRoute::ImageBuild;
@@ -2866,6 +2911,7 @@ mod tests {
             ),
             ("/v1.45/networks/host/connect", r#"{"Container":"ctr123"}"#),
             ("/v1.45/build?networkmode=host", "tar-stream-bytes"),
+            ("/v1.45/build?volume=/:/host", "tar-stream-bytes"),
         ] {
             let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
             let mut reader = PrefixedReader::new(conn);
@@ -2873,6 +2919,25 @@ mod tests {
             assert_eq!(
                 head.status, 400,
                 "expected 400 Bad Request on '{path}', got {}",
+                head.status
+            );
+        }
+
+        // 3. Admin/cluster/plugin/BuildKit/container-update endpoints must return 403 Forbidden.
+        for (method, path, body) in [
+            ("GET", "/v1.45/plugins", None),
+            ("POST", "/v1.45/plugins/pull?remote=evil", Some(&b"{}"[..])),
+            ("POST", "/v1.45/swarm/init", Some(&b"{}"[..])),
+            ("GET", "/v1.45/secrets", None),
+            ("POST", "/grpc", Some(&b"frame"[..])),
+            ("POST", "/v1.45/containers/ctr123/update", Some(&b"{\"Privileged\":true}"[..])),
+        ] {
+            let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut reader = PrefixedReader::new(conn);
+            let (head, _) = send_http(&mut reader, method, path, body).await;
+            assert_eq!(
+                head.status, 403,
+                "expected 403 Forbidden on '{method} {path}', got {}",
                 head.status
             );
         }

@@ -51,23 +51,32 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn require_phase2_artifacts() -> (PathBuf, PathBuf, BundleVerifier) {
+fn discover_phase2_artifacts(test_name: &str) -> Option<(PathBuf, PathBuf, BundleVerifier)> {
     let root = repo_root();
     let x86_64_dir = root.join(".cache").join("bundles-src").join("x86_64");
     let aarch64_dir = root.join(".cache").join("bundles-src").join("aarch64");
     let pub_key_path = root.join(".cache").join("keys").join("dev-bundle.pub");
+    let require_qemu = std::env::var_os("MINIPOD_REQUIRE_QEMU_TESTS").is_some();
 
-    assert!(
-        x86_64_dir.is_dir() && aarch64_dir.is_dir() && pub_key_path.is_file(),
-        "Missing Phase 2 signed bundle artifacts under '{}' and '{}'. Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1` first.",
-        root.join(".cache").join("bundles-src").display(),
-        pub_key_path.display()
-    );
+    if !x86_64_dir.is_dir() || !aarch64_dir.is_dir() || !pub_key_path.is_file() {
+        if require_qemu {
+            panic!(
+                "Missing Phase 2 signed bundle artifacts under '{}' and '{}'. Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1` first.",
+                root.join(".cache").join("bundles-src").display(),
+                pub_key_path.display()
+            );
+        }
+        eprintln!(
+            "[phase2_bundle_e2e::{test_name}] SKIPPED: prebuilt bundle fixtures missing under {}",
+            root.join(".cache").join("bundles-src").display()
+        );
+        return None;
+    }
 
     let pub_hex = fs::read_to_string(&pub_key_path).expect("read dev-bundle.pub");
     let pub_key = decode_hex_exact::<32>(pub_hex.trim()).expect("decode dev-bundle.pub hex");
     let verifier = BundleVerifier::with_public_key(pub_key).expect("load dev bundle verifier");
-    (x86_64_dir, aarch64_dir, verifier)
+    Some((x86_64_dir, aarch64_dir, verifier))
 }
 
 fn sha256_file(path: &Path) -> [u8; 32] {
@@ -95,7 +104,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 
 #[test]
 fn bundle_tamper_and_rogue_dll_are_rejected_before_install() {
-    let (x86_64_src, _, verifier) = require_phase2_artifacts();
+    let Some((x86_64_src, _, verifier)) =
+        discover_phase2_artifacts("bundle_tamper_and_rogue_dll_are_rejected_before_install")
+    else {
+        return;
+    };
     let tmp = TestTempDir::new("tamper");
     let staged_src = tmp.path().join("src");
     copy_dir_recursive(&x86_64_src, &staged_src);
@@ -151,7 +164,11 @@ fn bundle_tamper_and_rogue_dll_are_rejected_before_install() {
 
 #[test]
 fn signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64() {
-    let (x86_64_src, aarch64_src, verifier) = require_phase2_artifacts();
+    let Some((x86_64_src, aarch64_src, verifier)) = discover_phase2_artifacts(
+        "signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64",
+    ) else {
+        return;
+    };
     let require_qemu = std::env::var_os("MINIPOD_REQUIRE_QEMU_TESTS").is_some();
     let qemu_img = match discover_qemu_img_binary(None) {
         Ok(path) => path,

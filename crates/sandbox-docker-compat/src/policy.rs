@@ -424,6 +424,7 @@ pub fn sanitize_network_connect(
 }
 
 /// Validates query parameters on `POST /build` before streaming the build-context tar archive.
+// shortcut: strict allowlist of standard Docker POST /build v1 query params blocks Podman/BuildKit host/privilege flags, extend allowlist if post-MVP BuildKit parity is added
 pub fn validate_image_build_query(
     decoded_params: &[(String, String)],
 ) -> Result<(), PolicyRejection> {
@@ -448,12 +449,28 @@ pub fn validate_image_build_query(
                     )));
                 }
             }
-            "securityopt" | "cgroupparent" | "cgroup-parent" if !val.trim().is_empty() => {
+            "dockerfile" => {
+                let df = val.trim();
+                if !df.is_empty()
+                    && (df.contains('\0')
+                        || df.contains('\\')
+                        || df.starts_with('/')
+                        || df.split('/').any(|seg| seg == ".."))
+                {
+                    return Err(PolicyRejection::new(format!(
+                        "POST /build dockerfile='{df}' must be a safe archive-relative path"
+                    )));
+                }
+            }
+            "t" | "q" | "nocache" | "cachefrom" | "pull" | "rm" | "forcerm" | "buildargs"
+            | "labels" | "target" | "platform" | "version" | "memory" | "memswap"
+            | "cpushares" | "cpusetcpus" | "cpusetmems" | "cpuperiod" | "cpuquota" | "shmsize"
+            | "squash" => {}
+            _ => {
                 return Err(PolicyRejection::new(format!(
                     "POST /build query parameter '{raw_key}' is forbidden"
                 )));
             }
-            _ => {}
         }
     }
     Ok(())
@@ -1823,11 +1840,37 @@ mod tests {
         assert!(sanitize_network_create(br#"{"Name":"net1","Driver":"macvlan"}"#).is_err());
         assert!(sanitize_network_connect("host", br#"{"Container":"abc"}"#).is_err());
         assert!(sanitize_network_connect("app_net", br#"{"Container":"abc"}"#).is_ok());
-        assert!(validate_image_build_query(&[("t".into(), "demo:1".into())]).is_ok());
+        assert!(validate_image_build_query(&[
+            ("t".into(), "demo:1".into()),
+            ("dockerfile".into(), "docker/Dockerfile".into()),
+            ("rm".into(), "true".into()),
+            ("version".into(), "1".into()),
+            ("networkmode".into(), "bridge".into()),
+        ])
+        .is_ok());
         assert!(validate_image_build_query(&[("networkmode".into(), "host".into())]).is_err());
         assert!(
             validate_image_build_query(&[("networkmode".into(), "ns:/proc/1/ns/net".into())])
                 .is_err()
         );
+        for forbidden_param in [
+            ("securityopt", "label=disable"),
+            ("cgroupparent", "/host.slice"),
+            ("capadd", "SYS_ADMIN"),
+            ("volume", "/:/host"),
+            ("remote", "http://169.254.169.254/ctx.tar"),
+            ("outputs", "type=local,dest=/tmp"),
+            ("dockerfile", "../etc/passwd"),
+        ] {
+            assert!(
+                validate_image_build_query(&[(
+                    forbidden_param.0.into(),
+                    forbidden_param.1.into()
+                )])
+                .is_err(),
+                "expected POST /build param {:?} to be rejected",
+                forbidden_param
+            );
+        }
     }
 }

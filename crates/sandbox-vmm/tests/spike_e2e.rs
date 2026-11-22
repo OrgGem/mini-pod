@@ -123,13 +123,20 @@ fn qemu_boot_handshake_exec_ping_and_clean_teardown() {
     let kernel_path = guest_dir.join("vmlinuz-virt");
     let initrd_path = guest_dir.join("initramfs.cpio.gz");
 
-    assert!(
-        kernel_path.is_file() && initrd_path.is_file(),
-        "Missing Phase 1 Linux spike guest images in '{}'. Run `powershell -ExecutionPolicy Bypass -File scripts/build-spike-guest.ps1` first.",
-        guest_dir.display()
-    );
-
     let require_qemu = std::env::var_os("MINIPOD_REQUIRE_QEMU_TESTS").is_some();
+    if !kernel_path.is_file() || !initrd_path.is_file() {
+        if require_qemu {
+            panic!(
+                "Missing Phase 1 Linux spike guest images in '{}'. Run `powershell -ExecutionPolicy Bypass -File scripts/build-spike-guest.ps1` first.",
+                guest_dir.display()
+            );
+        }
+        eprintln!(
+            "[spike_e2e::qemu_boot_handshake_exec_ping_and_clean_teardown] SKIPPED: spike guest fixtures missing in {}",
+            guest_dir.display()
+        );
+        return;
+    }
     if let Err(err) = discover_qemu_binary(None) {
         if matches!(err, SandboxError::NotFound(_)) && !require_qemu {
             eprintln!(
