@@ -703,6 +703,52 @@ mod win_owner_file {
         let _sddl_guard = LocalMemGuard(wide_sddl.cast());
         wide_ptr_to_string(wide_sddl)
     }
+
+    #[cfg(test)]
+    pub(super) fn resolve_sddl_trustee_sid(trustee: &str) -> Result<String, SandboxError> {
+        use windows_sys::Win32::Foundation::BOOL;
+        use windows_sys::Win32::Security::{
+            GetAce, GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACL,
+        };
+
+        let wide_sddl = to_wide_null(OsStr::new(&format!("D:(A;;FA;;;{trustee})")))?;
+        let mut raw_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `wide_sddl` is NUL-terminated; `ConvertStringSecurityDescriptorToSecurityDescriptorW` allocates `raw_sd`.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut raw_sd,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || raw_sd.is_null() {
+            return Err(SandboxError::Internal(format!(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW('{trustee}') failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let _sd_guard = LocalMemGuard(raw_sd);
+        let mut present: BOOL = 0;
+        let mut defaulted: BOOL = 0;
+        let mut dacl: *mut ACL = ptr::null_mut();
+        // SAFETY: `raw_sd` is valid for this scope and all output pointers are writable.
+        let ok =
+            unsafe { GetSecurityDescriptorDacl(raw_sd, &mut present, &mut dacl, &mut defaulted) };
+        if ok == 0 || present == 0 || dacl.is_null() {
+            return Err(SandboxError::Internal("GetSecurityDescriptorDacl failed".to_owned()));
+        }
+        let mut ace: *mut c_void = ptr::null_mut();
+        // SAFETY: `dacl` has one access-allowed ACE created above.
+        let ok = unsafe { GetAce(dacl, 0, &mut ace) };
+        if ok == 0 || ace.is_null() {
+            return Err(SandboxError::Internal("GetAce(0) failed".to_owned()));
+        }
+        // SAFETY: `SidStart` begins the SID inside `ACCESS_ALLOWED_ACE`.
+        let sid =
+            unsafe { ptr::addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast_mut().cast() };
+        sid_to_string(sid)
+    }
 }
 
 fn rel_path_to_host(root: &Path, rel_path: &str) -> PathBuf {
@@ -792,12 +838,30 @@ mod tests {
             let user_sid = win_owner_file::current_user_sid_string().unwrap();
             let dacl = win_owner_file::inspect_file_dacl_sddl(&secret_path).unwrap();
             assert!(
-                dacl.starts_with("D:P("),
-                "Windows secret key file must have protected DACL (D:P), got: {dacl}"
+                dacl.starts_with("D:P(") && dacl.ends_with(')') && dacl.matches('(').count() == 1,
+                "Windows secret key file must have protected single-ACE DACL (D:P), got: {dacl}"
             );
-            assert!(
-                dacl.contains(&format!(";;;{user_sid})")) && dacl.matches('(').count() == 1,
+            let ace = &dacl["D:P(".len()..dacl.len() - 1];
+            let fields: Vec<&str> = ace.split(';').collect();
+            assert_eq!(fields.len(), 6, "unexpected ACE format in DACL: {dacl}");
+            assert_eq!(fields[0], "A", "expected allow ACE in DACL: {dacl}");
+            let trustee = fields[5];
+            let resolved_sid = if trustee == user_sid {
+                trustee.to_owned()
+            } else {
+                win_owner_file::resolve_sddl_trustee_sid(trustee).unwrap()
+            };
+            assert_eq!(
+                resolved_sid, user_sid,
                 "Windows secret key DACL must grant access strictly to current user SID '{user_sid}', got: {dacl}"
+            );
+            assert_eq!(
+                win_owner_file::resolve_sddl_trustee_sid("LA")
+                    .unwrap()
+                    .rsplit('-')
+                    .next(),
+                Some("500"),
+                "LA trustee alias must resolve to Local Administrator RID -500"
             );
         }
 
