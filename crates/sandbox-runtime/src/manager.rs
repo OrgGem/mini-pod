@@ -127,6 +127,7 @@ pub struct ReconciliationReport {
     pub orphans_killed: usize,
     pub cleaned: usize,
     pub remaining: usize,
+    pub corrupt_files: usize,
 }
 
 struct EgressProxyHandle {
@@ -773,6 +774,7 @@ impl LocalRuntimeManager {
             orphans_killed: 0,
             cleaned: 0,
             remaining: scan.corrupt_files,
+            corrupt_files: scan.corrupt_files,
         };
 
         for record in scan.records {
@@ -3589,6 +3591,7 @@ mod tests {
                 orphans_killed: 1,
                 cleaned: 2,
                 remaining: 0,
+                corrupt_files: 0,
             }
         );
         assert!(!work1.exists());
@@ -4828,6 +4831,7 @@ mod tests {
                 orphans_killed: 1,
                 cleaned: 1,
                 remaining: 0,
+                corrupt_files: 0,
             }
         );
         assert!(!orphan_work.exists());

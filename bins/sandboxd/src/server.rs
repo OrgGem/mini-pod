@@ -1,7 +1,7 @@
 //! Daemon composition root: runtime wiring, owner-only local IPC listener, Docker compat
 //! endpoint registry, streaming execution bridge, and graceful shutdown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -32,7 +32,7 @@ use sandbox_vmm::{
     QemuDriverConfig, QemuVmDriver,
 };
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
@@ -42,6 +42,8 @@ use crate::spawn_registry::SpawnRegistry;
 
 const CONTAINER_EGRESS_PROXY_URL: &str = "http://10.88.0.1:3128";
 const EXEC_CLIENT_MSG_QUEUE_DEPTH: usize = 32;
+const EXEC_STDIN_SLICE_BYTES: usize = 16 * 1024;
+const EXEC_MAX_PENDING_STDIN_BYTES: usize = 512 * 1024;
 // shortcut: fixed 256 concurrent control connections and 30s unary frame I/O timeout, expose ServeConfig knobs if multi-agent daemon load exceeds 256 concurrent streams
 const MAX_CONCURRENT_CONTROL_CONNECTIONS: usize = 256;
 const CONTROL_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1216,6 +1218,107 @@ where
     pump_exec_stream(stream, &mut exec_stream, io_timeout).await
 }
 
+struct CancelSafeFrameReader<R> {
+    reader: R,
+    header: [u8; 4],
+    header_read: usize,
+    expected_len: Option<usize>,
+    payload: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> CancelSafeFrameReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            header: [0u8; 4],
+            header_read: 0,
+            expected_len: None,
+            payload: Vec::new(),
+        }
+    }
+
+    async fn next_frame(&mut self) -> Result<Option<Vec<u8>>, SandboxError> {
+        loop {
+            if self.expected_len.is_none() {
+                while self.header_read < 4 {
+                    let n = self
+                        .reader
+                        .read(&mut self.header[self.header_read..])
+                        .await
+                        .map_err(|err| {
+                            SandboxError::Transport(format!(
+                                "failed reading control frame header: {err}"
+                            ))
+                        })?;
+                    if n == 0 {
+                        if self.header_read == 0 {
+                            return Ok(None);
+                        }
+                        return Err(SandboxError::Transport(
+                            "unexpected EOF while reading control frame header".to_owned(),
+                        ));
+                    }
+                    self.header_read += n;
+                }
+                let len = u32::from_be_bytes(self.header) as usize;
+                if len == 0 {
+                    return Err(SandboxError::Transport(
+                        "control frame length must not be zero".to_owned(),
+                    ));
+                }
+                if len > MAX_CONTROL_FRAME_BYTES {
+                    return Err(SandboxError::Transport(format!(
+                        "incoming control frame length {len} exceeds MAX_CONTROL_FRAME_BYTES ({MAX_CONTROL_FRAME_BYTES})"
+                    )));
+                }
+                self.expected_len = Some(len);
+                self.payload.clear();
+                self.payload.reserve(len.min(64 * 1024));
+            }
+
+            let target_len = self.expected_len.expect("expected_len initialized above");
+            while self.payload.len() < target_len {
+                let mut chunk = [0u8; 8192];
+                let step = (target_len - self.payload.len()).min(chunk.len());
+                let n = self
+                    .reader
+                    .read(&mut chunk[..step])
+                    .await
+                    .map_err(|err| {
+                        SandboxError::Transport(format!(
+                            "failed reading control frame payload: {err}"
+                        ))
+                    })?;
+                if n == 0 {
+                    return Err(SandboxError::Transport(
+                        "failed reading control frame payload: unexpected EOF".to_owned(),
+                    ));
+                }
+                self.payload.extend_from_slice(&chunk[..n]);
+            }
+
+            self.header_read = 0;
+            self.expected_len = None;
+            return Ok(Some(std::mem::take(&mut self.payload)));
+        }
+    }
+}
+
+fn push_stdin_slices(
+    data: Vec<u8>,
+    pending_stdin: &mut VecDeque<Option<Vec<u8>>>,
+    pending_bytes: &mut usize,
+) {
+    if data.is_empty() {
+        pending_stdin.push_back(Some(Vec::new()));
+        return;
+    }
+    for chunk in data.chunks(EXEC_STDIN_SLICE_BYTES) {
+        *pending_bytes = pending_bytes.saturating_add(chunk.len());
+        pending_stdin.push_back(Some(chunk.to_vec()));
+    }
+}
+
 async fn pump_exec_stream<S>(
     stream: S,
     exec_stream: &mut ExecStream,
@@ -1236,7 +1339,7 @@ where
         }
     }
 
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut stdin_writer = exec_stream.take_stdin_writer();
     let (stdin_tx, mut stdin_rx) =
         mpsc::channel::<Option<Vec<u8>>>(EXEC_CLIENT_MSG_QUEUE_DEPTH);
@@ -1261,32 +1364,89 @@ where
         stdin_writer.close();
     })));
 
-    // Isolate `read_control_frame` and `stdin` writes inside dedicated tasks so blocked guest stdin
-    // never starves cancellation, output draining, or host deadline enforcement.
+    // Decouple frame parsing (via CancelSafeFrameReader) from blocked `stdin_tx` sends so
+    // `Cancel` and client EOF immediately preempt bursts up to `EXEC_MAX_PENDING_STDIN_BYTES`
+    // while preserving TCP backpressure and bounded daemon memory on sustained floods.
     let _reader_guard = AbortOnDrop(tokio::spawn(async move {
+        let mut frame_reader = CancelSafeFrameReader::new(read_half);
+        let mut pending_stdin: VecDeque<Option<Vec<u8>>> = VecDeque::new();
+        let mut pending_bytes: usize = 0;
+        let mut stdin_closed = false;
+        let mut stdin_channel_closed = false;
+        let mut lookahead_stdin: Option<Vec<u8>> = None;
+
         loop {
-            match read_control_frame(&mut read_half).await {
-                Ok(Some(raw)) => match ExecWireClientMsg::from_json_bytes(&raw) {
-                    Ok(ExecWireClientMsg::Stdin { data }) => {
-                        if stdin_tx.send(Some(data)).await.is_err() {
+            let send_allowed = !pending_stdin.is_empty() && !stdin_channel_closed;
+            let read_allowed =
+                pending_bytes < EXEC_MAX_PENDING_STDIN_BYTES || lookahead_stdin.is_none();
+
+            tokio::select! {
+                biased;
+                res = stdin_tx.reserve(), if send_allowed => {
+                    match res {
+                        Ok(permit) => {
+                            if let Some(item) = pending_stdin.pop_front() {
+                                if let Some(ref chunk) = item {
+                                    pending_bytes = pending_bytes.saturating_sub(chunk.len());
+                                }
+                                permit.send(item);
+                            }
+                            if pending_bytes < EXEC_MAX_PENDING_STDIN_BYTES {
+                                if let Some(queued) = lookahead_stdin.take() {
+                                    if !stdin_closed {
+                                        push_stdin_slices(
+                                            queued,
+                                            &mut pending_stdin,
+                                            &mut pending_bytes,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            stdin_channel_closed = true;
+                            pending_stdin.clear();
+                            lookahead_stdin = None;
+                            pending_bytes = 0;
+                        }
+                    }
+                }
+                frame_res = frame_reader.next_frame(), if read_allowed => {
+                    match frame_res {
+                        Ok(Some(raw)) => match ExecWireClientMsg::from_json_bytes(&raw) {
+                            Ok(ExecWireClientMsg::Stdin { data }) => {
+                                if !stdin_closed && !stdin_channel_closed {
+                                    if pending_bytes >= EXEC_MAX_PENDING_STDIN_BYTES {
+                                        lookahead_stdin = Some(data);
+                                    } else {
+                                        push_stdin_slices(
+                                            data,
+                                            &mut pending_stdin,
+                                            &mut pending_bytes,
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(ExecWireClientMsg::StdinEof) => {
+                                if !stdin_closed && !stdin_channel_closed {
+                                    stdin_closed = true;
+                                    pending_stdin.push_back(None);
+                                }
+                            }
+                            Ok(ExecWireClientMsg::Cancel) | Err(_) => {
+                                let _ = ctrl_tx.send(ExecClientCtrl::Cancel).await;
+                                break;
+                            }
+                        },
+                        Ok(None) => {
+                            let _ = ctrl_tx.send(ExecClientCtrl::Disconnected).await;
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = ctrl_tx.send(ExecClientCtrl::Cancel).await;
                             break;
                         }
                     }
-                    Ok(ExecWireClientMsg::StdinEof) => {
-                        let _ = stdin_tx.send(None).await;
-                    }
-                    Ok(ExecWireClientMsg::Cancel) | Err(_) => {
-                        let _ = ctrl_tx.send(ExecClientCtrl::Cancel).await;
-                        break;
-                    }
-                },
-                Ok(None) => {
-                    let _ = ctrl_tx.send(ExecClientCtrl::Disconnected).await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = ctrl_tx.send(ExecClientCtrl::Cancel).await;
-                    break;
                 }
             }
         }
@@ -2716,5 +2876,172 @@ mod tests {
                 Err(SandboxError::PolicyViolation(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn pump_exec_stream_cancel_and_disconnect_preempt_stdin_bursts() {
+        use tokio::sync::Notify;
+
+        let tmp = TestTempDir::new("exec-cancel-disconnect-burst");
+        let (state, cancel_seen) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let lease = client
+            .spawn(sample_spec(NetworkPolicy::Isolated))
+            .await
+            .unwrap();
+
+        let make_block_stdin_req = || ExecRequest {
+            target: ExecTarget::Guest,
+            argv: vec!["block-stdin".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+            user: None,
+            deadline: Duration::from_secs(30),
+            stdout_budget_bytes: 64 * 1024,
+            stderr_budget_bytes: 64 * 1024,
+        };
+
+        // 1. 120 x 256 B stdin frames followed by Cancel against unread guest stdin.
+        cancel_seen.store(false, Ordering::Release);
+        let mut exec = client
+            .exec_stream(&lease.id, make_block_stdin_req())
+            .await
+            .unwrap();
+        let _ = exec.next_output().await.expect("initial stdout");
+        for _ in 0..120 {
+            if exec.write_stdin(vec![b'a'; 256]).await.is_err() {
+                break;
+            }
+        }
+        exec.cancel().unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(2), exec.wait_exit())
+            .await
+            .expect("Cancel must preempt 120x256B stdin burst immediately")
+            .unwrap();
+        assert!(!exit.timed_out);
+        assert!(cancel_seen.load(Ordering::Acquire));
+
+        // 2. Single 1 MiB stdin frame followed by Cancel.
+        cancel_seen.store(false, Ordering::Release);
+        let mut exec_1m = client
+            .exec_stream(&lease.id, make_block_stdin_req())
+            .await
+            .unwrap();
+        let _ = exec_1m.next_output().await.expect("initial stdout");
+        let _ = exec_1m.write_stdin(vec![b'b'; 1024 * 1024]).await;
+        exec_1m.cancel().unwrap();
+        let exit_1m = tokio::time::timeout(Duration::from_secs(2), exec_1m.wait_exit())
+            .await
+            .expect("Cancel must preempt 1 MiB stdin burst immediately")
+            .unwrap();
+        assert!(!exit_1m.timed_out);
+        assert!(cancel_seen.load(Ordering::Acquire));
+
+        // 3. Raw client disconnect after 1 MiB stdin burst.
+        cancel_seen.store(false, Ordering::Release);
+        let start_bytes = ControlRequest::ExecStart {
+            id: lease.id.clone(),
+            req: make_block_stdin_req(),
+        }
+        .to_json_bytes()
+        .unwrap();
+        let (mut cli_end, srv_end) = duplex(2 * 1024 * 1024);
+        let done = Arc::new(Notify::new());
+        let done_tx = Arc::clone(&done);
+        let st_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _ = serve_connection(srv_end, st_clone).await;
+            done_tx.notify_one();
+        });
+        write_control_frame(&mut cli_end, &start_bytes)
+            .await
+            .unwrap();
+        let started_raw = read_control_frame(&mut cli_end).await.unwrap().unwrap();
+        assert!(matches!(
+            ControlResponse::from_json_bytes(&started_raw).unwrap(),
+            ControlResponse::ExecStarted { .. }
+        ));
+        let stdin_frame = (ExecWireClientMsg::Stdin {
+            data: vec![b'c'; 1024 * 1024],
+        })
+        .to_json_bytes()
+        .unwrap();
+        write_control_frame(&mut cli_end, &stdin_frame)
+            .await
+            .unwrap();
+        drop(cli_end);
+        tokio::time::timeout(Duration::from_secs(2), done.notified())
+            .await
+            .expect("raw disconnect after 1 MiB stdin must cancel block-stdin immediately");
+        assert!(cancel_seen.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn spawn_registry_hardening_pending_corrupt_journal_and_oversized_spec() {
+        let tmp = TestTempDir::new("spawn-registry-hardening");
+        let (state, _) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let state_dir = tmp.path().join("state");
+
+        // 1. Corrupt .journal file must NOT block keyed spawn recovery.
+        let journals_dir = state_dir.join("journals");
+        fs::create_dir_all(&journals_dir).unwrap();
+        fs::write(journals_dir.join("corrupt-entry.journal"), b"{not-valid-json").unwrap();
+
+        let seed_op = "00000000-0000-4000-8000-000000000101".to_owned();
+        let spec = sample_spec(NetworkPolicy::Isolated);
+        let seed_lease = client.spawn_keyed(seed_op.clone(), spec.clone()).await.unwrap();
+        assert_eq!(state.list_sandboxes().len(), 1);
+
+        // 2. Pre-existing same-incarnation .pending record without .result must fail closed.
+        let ops_dir = state_dir.join("spawn-operations");
+        let seed_result: serde_json::Value = serde_json::from_slice(
+            &fs::read(ops_dir.join(format!("{seed_op}.result"))).unwrap(),
+        )
+        .unwrap();
+        let same_incarnation = seed_result
+            .get("incarnation")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_owned();
+        let pending_op = "00000000-0000-4000-8000-000000000102".to_owned();
+        let expected_bytes = ControlRequest::Spawn { spec: spec.clone() }.to_json_bytes().unwrap();
+        fs::write(ops_dir.join(format!("{pending_op}.spec")), expected_bytes).unwrap();
+        fs::write(
+            ops_dir.join(format!("{pending_op}.pending")),
+            serde_json::to_vec(&serde_json::json!({ "incarnation": same_incarnation })).unwrap(),
+        )
+        .unwrap();
+
+        let pending_err = client
+            .spawn_keyed(pending_op, spec.clone())
+            .await
+            .expect_err("interrupted same-incarnation .pending record must fail closed");
+        assert!(
+            matches!(pending_err, SandboxError::LeaseExpired(_)),
+            "expected LeaseExpired, got {pending_err:?}"
+        );
+        assert_eq!(state.list_sandboxes().len(), 1);
+
+        // 3. Oversized SandboxSpec (> 64 KiB serialized) must fail upfront without creating `.spec`.
+        let rules: Vec<sandbox_core::EgressRule> = (0..2500)
+            .map(|idx| sandbox_core::EgressRule {
+                domain: format!("allow-{idx:04}.example.com"),
+                port: 443,
+            })
+            .collect();
+        let huge_spec = sample_spec(NetworkPolicy::DomainAllowList { rules });
+        let huge_op = "00000000-0000-4000-8000-000000000103".to_owned();
+        let huge_err = client
+            .spawn_keyed(huge_op.clone(), huge_spec)
+            .await
+            .expect_err("oversized keyed spawn spec must be rejected upfront");
+        assert!(
+            matches!(huge_err, SandboxError::InvalidSpec(_)),
+            "expected InvalidSpec, got {huge_err:?}"
+        );
+        assert!(!ops_dir.join(format!("{huge_op}.spec")).exists());
+
+        client.destroy(&seed_lease.id).await.unwrap();
     }
 }

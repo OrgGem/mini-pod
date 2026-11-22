@@ -274,7 +274,7 @@ pub struct ClientExecStream {
     cached_exit: Option<Result<ExecExitStatus, SandboxError>>,
     closed: Arc<AtomicBool>,
     reader_handle: JoinHandle<()>,
-    _writer_handle: JoinHandle<()>,
+    writer_handle: JoinHandle<()>,
 }
 
 impl ClientExecStream {
@@ -397,7 +397,7 @@ impl ClientExecStream {
             cached_exit: None,
             closed,
             reader_handle,
-            _writer_handle: writer_handle,
+            writer_handle,
         }
     }
 
@@ -519,6 +519,7 @@ impl ClientExecStream {
 impl Drop for ClientExecStream {
     fn drop(&mut self) {
         self.reader_handle.abort();
+        self.writer_handle.abort();
     }
 }
 

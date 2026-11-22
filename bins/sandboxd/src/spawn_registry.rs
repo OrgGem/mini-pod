@@ -16,6 +16,7 @@ use tokio::sync::Mutex as AsyncMutex;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // shortcut: cap in-memory operation mutex cache at 4096 entries (evicting inactive unlocked entries), switch to LRU if >4096 concurrent active keyed sandboxes per daemon are needed
 const MAX_CACHED_OPERATIONS: usize = 4096;
+const MAX_OPERATION_RECORD_BYTES: usize = 65_536;
 
 #[derive(Default)]
 struct Operation {
@@ -66,6 +67,11 @@ impl SpawnRegistry {
         let pending_path = directory.join(format!("{operation_id}.pending"));
         let result_path = directory.join(format!("{operation_id}.result"));
         let expected = ControlRequest::Spawn { spec: spec.clone() }.to_json_bytes()?;
+        if expected.len() > MAX_OPERATION_RECORD_BYTES {
+            return Err(SandboxError::InvalidSpec(format!(
+                "keyed spawn spec exceeds maximum size of {MAX_OPERATION_RECORD_BYTES} bytes"
+            )));
+        }
 
         let dir_for_prep = directory.clone();
         let spec_path_for_prep = spec_path.clone();
@@ -142,6 +148,9 @@ impl SpawnRegistry {
                             .to_owned(),
                     ));
                 }
+                return Err(SandboxError::LeaseExpired(
+                    "keyed spawn was interrupted before completion".to_owned(),
+                ));
             }
 
             // A prior daemon may have died after spawn and before writing its result.
@@ -295,7 +304,7 @@ impl SpawnRegistry {
         let mut recovered = self.recovery_checked.lock().await;
         if !*recovered {
             let report = self.runtime.reconcile_startup().await?;
-            if report.remaining != 0 {
+            if report.remaining > report.corrupt_files {
                 return Err(SandboxError::Internal(
                     "keyed spawn is waiting for sandbox recovery".to_owned(),
                 ));
@@ -372,16 +381,17 @@ fn read_record(path: &Path) -> Result<Option<Vec<u8>>, SandboxError> {
         .metadata()
         .map_err(|error| map_fs_error(path, "inspect operation record", error))?;
     reject_symlink_or_reparse(path, &metadata)?;
-    if !metadata.is_file() || metadata.len() > 65536 {
+    let max_bytes = MAX_OPERATION_RECORD_BYTES as u64;
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(SandboxError::PolicyViolation(
             "invalid keyed spawn record".to_owned(),
         ));
     }
     let mut bytes = Vec::new();
-    file.take(65537)
+    file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| map_fs_error(path, "read operation record", error))?;
-    if bytes.len() > 65536 {
+    if bytes.len() > MAX_OPERATION_RECORD_BYTES {
         return Err(SandboxError::PolicyViolation(
             "invalid keyed spawn record".to_owned(),
         ));
