@@ -54,56 +54,45 @@ pub fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
     let seg = ip.segments();
     let b = ip.octets();
 
-    // ::/128, ::1/128, and ::/96 (IPv4-compatible deprecated block)
-    if seg[..6] == [0, 0, 0, 0, 0, 0] {
-        return true;
-    }
-    // ::ffff:0:0/96 (IPv4-mapped IPv6): extract trailing IPv4 and check it
+    // ::ffff:0:0/96 (IPv4-mapped IPv6): extract trailing IPv4 and validate it.
     if seg[..5] == [0, 0, 0, 0, 0] && seg[5] == 0xffff {
         return is_forbidden_ipv4(Ipv4Addr::new(b[12], b[13], b[14], b[15]));
     }
-    // ::ffff:0:0:0/96 (IPv4-translated SIIT)
-    if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
-        return true;
-    }
-    // 64:ff9b::/96 (NAT64 well-known): extract trailing IPv4 and check it
+    // 64:ff9b::/96 (NAT64 well-known prefix): extract trailing IPv4 and validate it.
     if seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
         return is_forbidden_ipv4(Ipv4Addr::new(b[12], b[13], b[14], b[15]));
     }
-    // 64:ff9b:1::/48 (NAT64 local-use)
-    if seg[..3] == [0x0064, 0xff9b, 0x0001] {
+
+    // Require IANA Global Unicast `2000::/3` for all remaining IPv6 addresses.
+    // This rejects `::/128`, `::1/128`, `::/96`, `::ffff:0:0:0/96`, `64:ff9b:1::/48`,
+    // `100::/64`, `5f00::/16` (SRv6 SIDs), `fc00::/7` (ULA), `fe80::/10` (link-local),
+    // `fec0::/10` (site-local), `ff00::/8` (multicast), and all unallocated blocks.
+    if (seg[0] & 0xe000) != 0x2000 {
         return true;
     }
-    // 2002::/16 (6to4): extract embedded IPv4 from bytes 2..6 (segments 1..3) and check it
-    if seg[0] == 0x2002 {
-        return is_forbidden_ipv4(Ipv4Addr::new(b[2], b[3], b[4], b[5]));
-    }
-    // 2001::/32 (Teredo)
-    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+
+    // IANA Special-Purpose IPv6 Registry blocks situated inside `2000::/3`:
+    // 2001::/23 — IETF Protocol Assignments (RFC 2928), covering 2001::/32 (Teredo),
+    // 2001:1::/48 (Anycast), 2001:2::/48 (Benchmarking), 2001:3::/32 (AMT),
+    // 2001:4:112::/48 (AS112-v6), 2001:10::/28 (ORCHID), 2001:20::/28 (ORCHIDv2),
+    // and 2001:30::/28 (DRIP DETs).
+    if seg[0] == 0x2001 && (seg[1] & 0xfe00) == 0 {
         return true;
     }
-    // 100::/64 (Discard-only)
-    if seg[..4] == [0x0100, 0, 0, 0] {
-        return true;
-    }
-    // 2001:2::/48 (Benchmarking)
-    if seg[..3] == [0x2001, 0x0002, 0] {
-        return true;
-    }
-    // 2001:db8::/32 (Documentation)
+    // 2001:db8::/32 — Documentation (RFC 3849).
     if seg[0] == 0x2001 && seg[1] == 0x0db8 {
         return true;
     }
-    // fc00::/7 (Unique Local Addresses)
-    if (b[0] & 0xfe) == 0xfc {
+    // 2002::/16 — 6to4: extract embedded IPv4 from bytes 2..6 and validate it.
+    if seg[0] == 0x2002 {
+        return is_forbidden_ipv4(Ipv4Addr::new(b[2], b[3], b[4], b[5]));
+    }
+    // 2620:4f:8000::/48 — Direct Delegation AS112 Service (RFC 7534).
+    if seg[..3] == [0x2620, 0x004f, 0x8000] {
         return true;
     }
-    // fe80::/10 (Link-local) and fec0::/10 (Deprecated site-local)
-    if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xffc0) == 0xfec0 {
-        return true;
-    }
-    // ff00::/8 (Multicast)
-    if b[0] == 0xff {
+    // 3fff::/20 — Documentation (RFC 9637).
+    if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0 {
         return true;
     }
     false
@@ -1079,24 +1068,46 @@ impl<S> PrefixedStream<S> {
     {
         loop {
             let avail = self.buffered_slice();
-            if let Some(rel_end) = avail.windows(2).position(|w| w == b"\r\n") {
-                if rel_end > max_len {
+            for (idx, &byte) in avail.iter().enumerate() {
+                if byte == 0 {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
-                        "chunk line exceeds maximum length",
+                        "NUL byte inside HTTP chunk/trailer line",
                     ));
                 }
-                let line = std::str::from_utf8(&avail[..rel_end])
-                    .map_err(|_| io::Error::new(ErrorKind::InvalidData, "non-UTF-8 line"))?
-                    .to_owned();
-                self.pos += rel_end + 2;
-                if self.pos == self.buf.len() {
-                    self.buf.clear();
-                    self.pos = 0;
+                if byte == b'\n' {
+                    if idx == 0 || avail[idx - 1] != b'\r' {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "bare LF without CR in HTTP chunk/trailer line",
+                        ));
+                    }
+                    let line_end = idx - 1;
+                    if line_end > max_len {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "chunk line exceeds maximum length",
+                        ));
+                    }
+                    let line_bytes = &avail[..line_end];
+                    if line_bytes.contains(&b'\r') {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "bare CR inside HTTP chunk/trailer line",
+                        ));
+                    }
+                    let line = std::str::from_utf8(line_bytes)
+                        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "non-UTF-8 line"))?
+                        .to_owned();
+                    self.pos += idx + 1;
+                    if self.pos == self.buf.len() {
+                        self.buf.clear();
+                        self.pos = 0;
+                    }
+                    return Ok(line);
                 }
-                return Ok(line);
             }
-            if avail.len() > max_len {
+            if avail.len() > max_len.saturating_add(1) {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "chunk line exceeds maximum length",
@@ -1222,6 +1233,7 @@ fn split_crlf_lines(raw: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
 
 fn parse_http_headers(
     header_lines: &[&[u8]],
+    version: &str,
     default_until_eof: bool,
 ) -> Result<ParsedHttpHeaders, &'static str> {
     if header_lines.len() > MAX_HEADER_COUNT {
@@ -1230,6 +1242,7 @@ fn parse_http_headers(
     let mut headers = Vec::with_capacity(header_lines.len());
     let mut content_lengths = Vec::new();
     let mut transfer_encodings = Vec::new();
+    let mut host_count = 0usize;
 
     for &line in header_lines {
         if line.is_empty() || matches!(line[0], b' ' | b'\t') {
@@ -1254,6 +1267,11 @@ fn parse_http_headers(
             content_lengths.push(val);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             transfer_encodings.push(val);
+        } else if name.eq_ignore_ascii_case("host") {
+            host_count += 1;
+            if host_count > 1 {
+                return Err("duplicate Host headers");
+            }
         }
         headers.push((name.to_owned(), val.to_owned()));
     }
@@ -1263,11 +1281,10 @@ fn parse_http_headers(
     }
 
     let body_mode = if !transfer_encodings.is_empty() {
-        if transfer_encodings.len() > 1
-            || !transfer_encodings[0].eq_ignore_ascii_case("chunked")
-        {
-            return Err("unsupported or duplicate Transfer-Encoding");
+        if version == "HTTP/1.0" {
+            return Err("Transfer-Encoding is forbidden in HTTP/1.0");
         }
+        validate_egress_transfer_encodings(&transfer_encodings)?;
         BodyMode::Chunked
     } else if !content_lengths.is_empty() {
         if content_lengths.len() > 1 {
@@ -1286,6 +1303,29 @@ fn parse_http_headers(
     };
 
     Ok(ParsedHttpHeaders { headers, body_mode })
+}
+
+fn validate_egress_transfer_encodings(values: &[&str]) -> Result<(), &'static str> {
+    let mut codings = Vec::new();
+    for raw in values {
+        for part in raw.split(',') {
+            let tok = part.trim_matches(|c| c == ' ' || c == '\t');
+            if tok.is_empty() || !tok.bytes().all(is_tchar) {
+                return Err("invalid Transfer-Encoding token");
+            }
+            codings.push(tok.to_ascii_lowercase());
+        }
+    }
+    if codings.last().map(String::as_str) != Some("chunked") {
+        return Err("Transfer-Encoding must terminate with chunked");
+    }
+    for coding in &codings[..codings.len() - 1] {
+        match coding.as_str() {
+            "gzip" | "x-gzip" | "deflate" | "compress" => {}
+            _ => return Err("unsupported or duplicate Transfer-Encoding"),
+        }
+    }
+    Ok(())
 }
 
 fn parse_http_request_head(raw: &[u8]) -> Result<HttpRequestHead, &'static str> {
@@ -1309,7 +1349,7 @@ fn parse_http_request_head(raw: &[u8]) -> Result<HttpRequestHead, &'static str> 
         return Err("unsupported HTTP version");
     }
 
-    let parsed = parse_http_headers(header_lines, false)?;
+    let parsed = parse_http_headers(header_lines, version, false)?;
     Ok(HttpRequestHead {
         method: method.to_owned(),
         raw_target: raw_target.to_owned(),
@@ -1346,7 +1386,7 @@ fn parse_http_response_head(raw: &[u8]) -> Result<HttpResponseHead, &'static str
         return Err("invalid control character in reason phrase");
     }
 
-    let parsed = parse_http_headers(header_lines, true)?;
+    let parsed = parse_http_headers(header_lines, version, true)?;
     Ok(HttpResponseHead {
         version: version.to_owned(),
         status,
@@ -1629,63 +1669,100 @@ where
             }
             writer.write_all(&buf[..n]).await?;
         },
-        BodyMode::Chunked => loop {
-            let line = reader.read_line_crlf(MAX_CHUNK_LINE_BYTES).await?;
-            let chunk_len = parse_chunk_size_line(&line)?;
-            if chunk_len == 0 {
-                writer.write_all(b"0\r\n").await?;
-                let mut trailer_count = 0usize;
-                loop {
-                    let trailer = reader.read_line_crlf(MAX_CHUNK_LINE_BYTES).await?;
-                    if trailer.is_empty() {
-                        writer.write_all(b"\r\n").await?;
-                        return Ok(());
+        BodyMode::Chunked => {
+            let mut total_chunk_bytes = 0u64;
+            loop {
+                let line = reader.read_line_crlf(MAX_CHUNK_LINE_BYTES).await?;
+                let chunk_len = parse_chunk_size_line(&line)?;
+                if chunk_len == 0 {
+                    let mut validated_trailers: Vec<(String, String)> = Vec::new();
+                    let mut trailer_bytes = 0usize;
+                    loop {
+                        let trailer = reader.read_line_crlf(MAX_CHUNK_LINE_BYTES).await?;
+                        if trailer.is_empty() {
+                            break;
+                        }
+                        if validated_trailers.len() >= MAX_HEADER_COUNT {
+                            return Err(io::Error::new(
+                                ErrorKind::InvalidData,
+                                "too many chunked trailers",
+                            ));
+                        }
+                        trailer_bytes = trailer_bytes.saturating_add(trailer.len() + 2);
+                        if trailer_bytes > MAX_HTTP_HEAD_BYTES {
+                            return Err(io::Error::new(
+                                ErrorKind::InvalidData,
+                                "chunked trailers exceed maximum byte budget",
+                            ));
+                        }
+                        validated_trailers.push(validate_egress_trailer_line(&trailer)?);
                     }
-                    trailer_count += 1;
-                    if trailer_count > MAX_HEADER_COUNT {
+                    writer.write_all(b"0\r\n").await?;
+                    for (name, val) in &validated_trailers {
+                        writer.write_all(name.as_bytes()).await?;
+                        writer.write_all(b": ").await?;
+                        writer.write_all(val.as_bytes()).await?;
+                        writer.write_all(b"\r\n").await?;
+                    }
+                    writer.write_all(b"\r\n").await?;
+                    return Ok(());
+                }
+
+                total_chunk_bytes = total_chunk_bytes.checked_add(chunk_len).ok_or_else(|| {
+                    io::Error::new(ErrorKind::InvalidData, "chunked payload overflow")
+                })?;
+
+                let hdr = format!("{chunk_len:x}\r\n");
+                writer.write_all(hdr.as_bytes()).await?;
+                let mut remaining = chunk_len;
+                while remaining > 0 {
+                    let to_read = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(buf.len());
+                    let n = reader.read(&mut buf[..to_read]).await?;
+                    if n == 0 {
                         return Err(io::Error::new(
-                            ErrorKind::InvalidData,
-                            "too many chunked trailers",
+                            ErrorKind::UnexpectedEof,
+                            "truncated chunk payload",
                         ));
                     }
-                    writer.write_all(trailer.as_bytes()).await?;
-                    writer.write_all(b"\r\n").await?;
+                    writer.write_all(&buf[..n]).await?;
+                    remaining -= n as u64;
                 }
-            }
-
-            let hdr = format!("{chunk_len:x}\r\n");
-            writer.write_all(hdr.as_bytes()).await?;
-            let mut remaining = chunk_len;
-            while remaining > 0 {
-                let to_read = usize::try_from(remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(buf.len());
-                let n = reader.read(&mut buf[..to_read]).await?;
-                if n == 0 {
+                let mut crlf = [0u8; 2];
+                reader.read_exact(&mut crlf).await?;
+                if &crlf != b"\r\n" {
                     return Err(io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "truncated chunk payload",
+                        ErrorKind::InvalidData,
+                        "missing CRLF after chunk payload",
                     ));
                 }
-                writer.write_all(&buf[..n]).await?;
-                remaining -= n as u64;
+                writer.write_all(b"\r\n").await?;
             }
-            let mut crlf = [0u8; 2];
-            reader.read_exact(&mut crlf).await?;
-            if &crlf != b"\r\n" {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "missing CRLF after chunk payload",
-                ));
-            }
-            writer.write_all(b"\r\n").await?;
-        },
+        }
     }
 }
 
 fn parse_chunk_size_line(line: &str) -> io::Result<u64> {
-    let size_part = line.split(';').next().unwrap_or("").trim_end_matches([' ', '\t']);
-    if size_part.is_empty() || size_part.len() > 16 || !size_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let size_part = match line.split_once(';') {
+        Some((raw_size, ext)) => {
+            if ext
+                .bytes()
+                .any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
+            {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid control character in chunk extension",
+                ));
+            }
+            raw_size.trim_end_matches([' ', '\t'])
+        }
+        None => line,
+    };
+    if size_part.is_empty()
+        || size_part.len() > 16
+        || !size_part.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "invalid chunked encoding size",
@@ -1693,6 +1770,63 @@ fn parse_chunk_size_line(line: &str) -> io::Result<u64> {
     }
     u64::from_str_radix(size_part, 16)
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "chunk size overflow"))
+}
+
+fn validate_egress_trailer_line(line: &str) -> io::Result<(String, String)> {
+    if line.is_empty() || matches!(line.as_bytes()[0], b' ' | b'\t') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid empty or folded chunked trailer line",
+        ));
+    }
+    let (name, raw_val) = line.split_once(':').ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "chunked trailer missing ':' separator",
+        )
+    })?;
+    if name.is_empty() || !name.bytes().all(is_tchar) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid chunked trailer field name",
+        ));
+    }
+    if is_forbidden_egress_trailer_field(name) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "forbidden framing/control header in chunked trailers",
+        ));
+    }
+    let val = raw_val.trim_matches(|c| c == ' ' || c == '\t');
+    if val
+        .bytes()
+        .any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid control character in chunked trailer value",
+        ));
+    }
+    Ok((name.to_owned(), val.to_owned()))
+}
+
+fn is_forbidden_egress_trailer_field(name: &str) -> bool {
+    name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("www-authenticate")
+        || name.eq_ignore_ascii_case("content-encoding")
+        || name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-range")
 }
 
 fn is_supported_forward_method(method: &str) -> bool {
@@ -2051,9 +2185,21 @@ mod tests {
             "2002:7f00:0001::", // 6to4 -> 127.0.0.1
             "2002:0a00:0001::", // 6to4 -> 10.0.0.1
             "2001::1",          // Teredo 2001::/32
-            "100::1",           // Discard 100::/64
+            "2001:1::1",        // IETF Protocol Assignments 2001::/23
             "2001:2::1",        // Benchmarking 2001:2::/48
+            "2001:3::1",        // AMT 2001:3::/32
+            "2001:4:112::1",    // AS112-v6 2001:4:112::/48
+            "2001:10::1",       // ORCHID 2001:10::/28
+            "2001:20::1",       // ORCHIDv2 2001:20::/28
+            "2001:30::1",       // DRIP DETs 2001:30::/28
+            "2001:1ff:ffff::1", // Top edge of 2001::/23
+            "100::1",           // Discard 100::/64
+            "0400::1",          // Non-global outside 2000::/3
             "2001:db8::1",      // Documentation 2001:db8::/32
+            "2620:4f:8000::1",  // Direct Delegation AS112 2620:4f:8000::/48
+            "3fff::1",          // Documentation 3fff::/20 (RFC 9637)
+            "3fff:0fff:ffff::1",// Top edge of 3fff::/20
+            "5f00::1",          // SRv6 SIDs 5f00::/16 (outside 2000::/3)
             "fc00::1",          // ULA fc00::/7
             "fd00::1",          // ULA fc00::/7
             "fe80::1",          // Link-local fe80::/10
@@ -2070,8 +2216,11 @@ mod tests {
             "::ffff:8.8.8.8",
             "64:ff9b::8.8.8.8",
             "2002:0808:0808::",
+            "2001:0200::1",
             "2001:4860:4860::8888",
             "2606:4700:4700::1111",
+            "2620:4f:8001::1",
+            "3fff:1000::1",
         ];
         for s in allowed {
             let ip: IpAddr = s.parse().unwrap();
@@ -2530,5 +2679,40 @@ mod tests {
             .expect("idle established tunnel must time out promptly")
             .unwrap();
         assert_eq!(peer_a.read(&mut probe).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn egress_http_rejects_http10_chunked_bare_lf_and_malformed_or_forbidden_trailers() {
+        let dns = MockDnsResolver::with_responses(vec![
+            Ok(vec![SocketAddr::from(([93, 184, 216, 34], 80))]),
+            Ok(vec![SocketAddr::from(([93, 184, 216, 34], 80))]),
+            Ok(vec![SocketAddr::from(([93, 184, 216, 34], 80))]),
+        ]);
+        let dialer = MockDialer::http(vec![]);
+        let proxy = HostEgressProxy::new(NetworkPolicy::InternetOnly, dns, dialer);
+
+        // 1. HTTP/1.0 with Transfer-Encoding: chunked must be rejected with 400.
+        let r_10 = run_proxy_once(
+            &proxy,
+            b"POST http://example.com/ HTTP/1.0\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&r_10).starts_with("HTTP/1.1 400"));
+
+        // 2. Bare LF inside chunk size line must fail body forwarding with 400.
+        let r_bare_lf = run_proxy_once(
+            &proxy,
+            b"POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n2\nok\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&r_bare_lf).starts_with("HTTP/1.1 400"));
+
+        // 3. Forbidden framing/auth trailer (`Content-Length`) in chunked body must fail with 400.
+        let r_bad_trailer = run_proxy_once(
+            &proxy,
+            b"POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nContent-Length: 99\r\n\r\n",
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&r_bad_trailer).starts_with("HTTP/1.1 400"));
     }
 }

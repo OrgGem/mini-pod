@@ -13,6 +13,7 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Default maximum buffered body size (16 MiB) for JSON/control payloads read into memory.
 pub const MAX_BUFFERED_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+const MAX_HEADER_COUNT: usize = 128;
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
 const STREAM_COPY_BUF_BYTES: usize = 16 * 1024;
 
@@ -732,6 +733,11 @@ fn parse_request_head_bytes(raw_head: &[u8]) -> Result<HttpRequestHead, HttpErro
     };
 
     let headers = parse_and_validate_headers(header_lines, true)?;
+    if version == "HTTP/1.0" && find_header(&headers, "transfer-encoding").is_some() {
+        return Err(HttpError::MalformedHead(
+            "Transfer-Encoding is forbidden in HTTP/1.0 requests".to_owned(),
+        ));
+    }
     Ok(HttpRequestHead {
         method: method.to_owned(),
         raw_target: raw_target.to_owned(),
@@ -783,6 +789,11 @@ fn parse_response_head_bytes(raw_head: &[u8]) -> Result<HttpResponseHead, HttpEr
     }
 
     let headers = parse_and_validate_headers(header_lines, true)?;
+    if version == "HTTP/1.0" && find_header(&headers, "transfer-encoding").is_some() {
+        return Err(HttpError::MalformedHead(
+            "Transfer-Encoding is forbidden in HTTP/1.0 responses".to_owned(),
+        ));
+    }
     Ok(HttpResponseHead {
         version: version.to_owned(),
         status,
@@ -795,6 +806,17 @@ fn parse_and_validate_headers(
     header_lines: &[&[u8]],
     allow_framing_headers: bool,
 ) -> Result<Vec<(String, String)>, HttpError> {
+    if header_lines.len() > MAX_HEADER_COUNT {
+        return Err(if allow_framing_headers {
+            HttpError::MalformedHead(format!(
+                "HTTP header count exceeds maximum ({MAX_HEADER_COUNT})"
+            ))
+        } else {
+            HttpError::InvalidChunk(format!(
+                "chunked trailer count exceeds maximum ({MAX_HEADER_COUNT})"
+            ))
+        });
+    }
     let mut headers = Vec::with_capacity(header_lines.len());
     for &line in header_lines {
         if line.is_empty() {
@@ -847,12 +869,15 @@ fn validate_framing_headers(
     let te_values = find_headers_all(headers, "transfer-encoding");
     let host_values = find_headers_all(headers, "host");
 
-    if !allow_framing_headers
-        && (!cl_values.is_empty() || !te_values.is_empty() || !host_values.is_empty())
-    {
-        return Err(HttpError::InvalidChunk(
-            "framing headers are forbidden in chunked trailers".to_owned(),
-        ));
+    if !allow_framing_headers {
+        for (name, _) in headers {
+            if is_forbidden_trailer_field(name) {
+                return Err(HttpError::InvalidChunk(format!(
+                    "header '{name}' is forbidden in chunked trailers"
+                )));
+            }
+        }
+        return Ok(());
     }
 
     if host_values.len() > 1 {
@@ -947,7 +972,10 @@ fn parse_chunk_size_line(line: &str) -> Result<u64, HttpError> {
         None => line,
     };
 
-    if size_part.is_empty() || !size_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if size_part.is_empty()
+        || size_part.len() > 16
+        || !size_part.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return Err(HttpError::InvalidChunk(format!(
             "invalid chunk size '{size_part}'"
         )));
@@ -962,9 +990,14 @@ async fn read_chunked_trailers<R: AsyncRead + Unpin>(
     let mut raw_lines: Vec<String> = Vec::new();
     let mut total_bytes = 0usize;
     loop {
-        let line = reader.read_line_crlf(MAX_HEADER_BYTES).await?;
+        let line = reader.read_line_crlf(MAX_CHUNK_LINE_BYTES).await?;
         if line.is_empty() {
             break;
+        }
+        if raw_lines.len() >= MAX_HEADER_COUNT {
+            return Err(HttpError::InvalidChunk(format!(
+                "chunked trailer count exceeds maximum ({MAX_HEADER_COUNT})"
+            )));
         }
         total_bytes = total_bytes.saturating_add(line.len() + 2);
         if total_bytes > MAX_HEADER_BYTES {
@@ -979,6 +1012,25 @@ async fn read_chunked_trailers<R: AsyncRead + Unpin>(
     }
     let refs: Vec<&[u8]> = raw_lines.iter().map(String::as_bytes).collect();
     parse_and_validate_headers(&refs, false)
+}
+
+fn is_forbidden_trailer_field(name: &str) -> bool {
+    name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("www-authenticate")
+        || name.eq_ignore_ascii_case("content-encoding")
+        || name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-range")
 }
 
 async fn expect_chunk_crlf<R: AsyncRead + Unpin>(
@@ -1407,5 +1459,49 @@ mod tests {
         sink_read.read_exact(&mut second).await.unwrap();
         assert_eq!(&second, b"-tail");
         assert_eq!(forward_task.await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn rejects_http10_transfer_encoding_and_forbidden_or_excess_trailers() {
+        let te_10 = b"POST /x HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut r10 = PrefixedReader::new(&te_10[..]);
+        assert!(matches!(
+            read_request_head(&mut r10).await,
+            Err(HttpError::MalformedHead(_))
+        ));
+
+        for forbidden_trailer in [
+            "Authorization: Bearer secret",
+            "Trailer: X-Checksum",
+            "Connection: keep-alive",
+            "Content-Type: application/json",
+            "Transfer-Encoding: chunked",
+        ] {
+            let wire = format!(
+                "POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n{forbidden_trailer}\r\n\r\n"
+            );
+            let mut r = PrefixedReader::new(wire.as_bytes());
+            let head = read_request_head(&mut r).await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    read_body_bytes(&mut r, head.body_mode(), 1024).await,
+                    Err(HttpError::InvalidChunk(_))
+                ),
+                "expected forbidden trailer '{forbidden_trailer}' to be rejected"
+            );
+        }
+
+        let mut many_trailers =
+            String::from("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n");
+        for i in 0..=MAX_HEADER_COUNT {
+            many_trailers.push_str(&format!("X-T-{i}: v\r\n"));
+        }
+        many_trailers.push_str("\r\n");
+        let mut r_many = PrefixedReader::new(many_trailers.as_bytes());
+        let h_many = read_request_head(&mut r_many).await.unwrap().unwrap();
+        assert!(matches!(
+            read_body_bytes(&mut r_many, h_many.body_mode(), 1024).await,
+            Err(HttpError::InvalidChunk(_))
+        ));
     }
 }

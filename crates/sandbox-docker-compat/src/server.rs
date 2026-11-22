@@ -565,8 +565,8 @@ impl DockerCompatServer {
 
         let route = match parse_docker_route(&req.method, &req.path) {
             DockerRoute::ForbiddenLibpod => {
-                // Close if `req` carries an unread body so keep-alive framing never desyncs.
-                let close = req.wants_close() || !matches!(req.body_mode(), BodyMode::Empty);
+                // Close if `req` carries an unread body or upgrade intent so keep-alive framing never desyncs.
+                let close = should_close_rejected_request(&req, false);
                 write_json_error(
                     client,
                     403,
@@ -641,7 +641,7 @@ impl DockerCompatServer {
             DockerRoute::ImageBuild => {
                 let params = decode_all_query_params(req.query.as_deref());
                 if let Err(rejection) = validate_image_build_query(&params) {
-                    let close = req.wants_close() || !matches!(req.body_mode(), BodyMode::Empty);
+                    let close = should_close_rejected_request(&req, false);
                     write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                         .await
                         .map_err(http_to_io)?;
@@ -816,7 +816,7 @@ impl DockerCompatServer {
         let (rewritten, meta) = match sanitize(&raw_body, &self.policy) {
             Ok(pair) => pair,
             Err(rejection) => {
-                let close = req.wants_close();
+                let close = should_close_rejected_request(&req, true);
                 write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                     .await
                     .map_err(http_to_io)?;
@@ -840,7 +840,7 @@ impl DockerCompatServer {
         {
             Ok(stream) => stream,
             Err(err) => {
-                let close = req.wants_close();
+                let close = should_close_rejected_request(&req, true);
                 write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                     .await
                     .map_err(http_to_io)?;
@@ -853,7 +853,7 @@ impl DockerCompatServer {
         };
 
         if let Err(err) = write_request_and_bytes(&mut upstream, &up_req, &rewritten).await {
-            let close = req.wants_close();
+            let close = should_close_rejected_request(&req, true);
             write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                 .await
                 .map_err(http_to_io)?;
@@ -1220,7 +1220,7 @@ impl DockerCompatServer {
         {
             Ok(stream) => stream,
             Err(err) => {
-                let close = req.wants_close() || !matches!(body_mode, BodyMode::Empty);
+                let close = should_close_rejected_request(req, false);
                 let res = write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                     .await
                     .map_err(http_to_io);
@@ -1235,7 +1235,7 @@ impl DockerCompatServer {
         };
 
         if let Err(err) = write_request_head(&mut upstream, req).await {
-            let close = req.wants_close() || !matches!(body_mode, BodyMode::Empty);
+            let close = should_close_rejected_request(req, false);
             let res = write_json_error(client, 502, "Bad Gateway", &err.to_string(), close)
                 .await
                 .map_err(http_to_io);
@@ -1303,6 +1303,12 @@ impl DockerCompatServer {
         serde_json::from_slice(&body)
             .map_err(|err| format!("invalid Podman inspect JSON: {err}"))
     }
+}
+
+fn should_close_rejected_request(req: &HttpRequestHead, body_consumed: bool) -> bool {
+    req.wants_close()
+        || req.wants_upgrade()
+        || (!body_consumed && !matches!(req.body_mode(), BodyMode::Empty))
 }
 
 async fn stream_upstream_response<S>(
