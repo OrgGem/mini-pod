@@ -2,18 +2,19 @@
 //! directory validation/creation and `0600` Unix domain socket listener/stream for QEMU
 //! `-chardev socket,...,server=off`.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder};
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::mem::zeroed;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr;
+#[cfg(any(target_os = "linux", test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
