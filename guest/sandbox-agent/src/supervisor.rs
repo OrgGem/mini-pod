@@ -487,6 +487,7 @@ fn run_exec_inner(
     #[cfg(unix)]
     {
         let pgid = child.id();
+        exec_scope.record_leader(pgid);
         let immediate_kill = {
             let mut state = handle.control.state.lock().unwrap_or_else(|e| e.into_inner());
             state.pgid = Some(pgid);
@@ -975,6 +976,121 @@ fn lookup_group_by_name(table: &str, name: &str) -> Option<u32> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcStatEntry {
+    pub pid: i32,
+    pub state: char,
+    pub ppid: i32,
+    pub pgrp: i32,
+    pub session: i32,
+    pub starttime: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_proc_stat_line(raw: &str) -> Option<ProcStatEntry> {
+    let open = raw.find('(')?;
+    let close = raw.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let pid = raw[..open].trim().parse::<i32>().ok()?;
+    let mut fields = raw[close + 1..].split_ascii_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse::<i32>().ok()?;
+    let pgrp = fields.next()?.parse::<i32>().ok()?;
+    let session = fields.next()?.parse::<i32>().ok()?;
+    // Fields 3..=6 consumed above; field 22 (`starttime`) is 15 fields ahead (skip 7..=21).
+    let starttime = fields.nth(15)?.parse::<u64>().ok()?;
+    Some(ProcStatEntry {
+        pid,
+        state,
+        ppid,
+        pgrp,
+        session,
+        starttime,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn is_trusted_conmon_exe(exe_path: &str) -> bool {
+    let cleaned = exe_path.strip_suffix(" (deleted)").unwrap_or(exe_path);
+    matches!(
+        cleaned,
+        "/usr/bin/conmon"
+            | "/usr/libexec/podman/conmon"
+            | "/usr/lib/podman/conmon"
+            | "/usr/local/libexec/podman/conmon"
+            | "/usr/local/bin/conmon"
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn extract_conmon_exec_pidfile<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    if !args.iter().any(|&a| a == "-e" || a == "--exec") {
+        return None;
+    }
+    let mut pidfile_path: Option<&str> = None;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = args[idx];
+        if (arg == "-p" || arg == "--pidfile") && idx + 1 < args.len() {
+            pidfile_path = Some(args[idx + 1]);
+            break;
+        }
+        if let Some(rest) = arg.strip_prefix("--pidfile=") {
+            pidfile_path = Some(rest);
+            break;
+        }
+        idx += 1;
+    }
+    let path = pidfile_path?;
+    if path.is_empty()
+        || path.contains('\0')
+        || path.split('/').any(|seg| seg == "..")
+    {
+        return None;
+    }
+    let trusted_root_dir = path.starts_with("/run/containers/")
+        || path.starts_with("/run/libpod/")
+        || path.starts_with("/var/run/containers/")
+        || path.starts_with("/var/run/libpod/")
+        || path.starts_with("/var/lib/containers/")
+        || path.starts_with("/run/user/0/");
+    trusted_root_dir.then_some(path)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn expand_scoped_proc_closure(
+    tracked: &mut HashMap<i32, u64>,
+    table: &[ProcStatEntry],
+    self_pid: i32,
+    min_starttime: u64,
+) {
+    loop {
+        let mut added = false;
+        for entry in table {
+            if entry.pid <= 1
+                || entry.pid == self_pid
+                || tracked.contains_key(&entry.pid)
+                || entry.starttime < min_starttime
+            {
+                continue;
+            }
+            if tracked.contains_key(&entry.ppid)
+                || (entry.pgrp > 1 && tracked.contains_key(&entry.pgrp))
+                || (entry.session > 1 && tracked.contains_key(&entry.session))
+            {
+                tracked.insert(entry.pid, entry.starttime);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,5 +1232,95 @@ mod tests {
             "NO_PROXY={}",
             crate::egress_listener::DEFAULT_NO_PROXY
         )));
+    }
+
+    #[test]
+    fn proc_closure_and_conmon_discovery_enforce_starttime_exe_exec_flag_and_root_pidfile_paths() {
+        let stat_line =
+            "4242 (weird ) name) S 100 4200 4200 0 -1 4194304 10 0 0 0 1 2 0 0 20 0 1 0 987654 12345 10";
+        let parsed = parse_proc_stat_line(stat_line).unwrap();
+        assert_eq!(
+            parsed,
+            ProcStatEntry {
+                pid: 4242,
+                state: 'S',
+                ppid: 100,
+                pgrp: 4200,
+                session: 4200,
+                starttime: 987_654,
+            }
+        );
+
+        // Trusted vs spoofed conmon binary paths.
+        assert!(is_trusted_conmon_exe("/usr/bin/conmon"));
+        assert!(is_trusted_conmon_exe("/usr/libexec/podman/conmon (deleted)"));
+        assert!(!is_trusted_conmon_exe("/tmp/conmon"));
+        assert!(!is_trusted_conmon_exe("/workspace/fake-conmon"));
+
+        // Requires `-e`/`--exec` and rejects `/tmp/` or `..` pidfile paths.
+        assert_eq!(
+            extract_conmon_exec_pidfile(&[
+                "/usr/bin/conmon",
+                "-e",
+                "-p",
+                "/run/containers/storage/overlay-containers/abc/userdata/exec_pid"
+            ]),
+            Some("/run/containers/storage/overlay-containers/abc/userdata/exec_pid")
+        );
+        assert_eq!(
+            extract_conmon_exec_pidfile(&[
+                "/usr/bin/conmon",
+                "-p",
+                "/run/containers/storage/exec_pid"
+            ]),
+            None,
+            "non-exec conmon monitor without -e must be ignored"
+        );
+        assert_eq!(
+            extract_conmon_exec_pidfile(&["/usr/bin/conmon", "-e", "-p", "/tmp/evil.pid"]),
+            None,
+            "world-writable /tmp pidfile must be rejected"
+        );
+        assert_eq!(
+            extract_conmon_exec_pidfile(&[
+                "/usr/bin/conmon",
+                "-e",
+                "--pidfile=/run/containers/../../tmp/evil.pid"
+            ]),
+            None
+        );
+
+        // Closure rejects processes started before `min_starttime` (even if PGID/SID matches).
+        let mut tracked = HashMap::from([(200, 1000u64)]);
+        let table = vec![
+            ProcStatEntry {
+                pid: 150,
+                state: 'S',
+                ppid: 1,
+                pgrp: 200,
+                session: 200,
+                starttime: 500, // older than min_starttime=1000!
+            },
+            ProcStatEntry {
+                pid: 201,
+                state: 'S',
+                ppid: 200,
+                pgrp: 201,
+                session: 201,
+                starttime: 1005,
+            },
+            ProcStatEntry {
+                pid: 202,
+                state: 'S',
+                ppid: 1,
+                pgrp: 202,
+                session: 201,
+                starttime: 1010,
+            },
+        ];
+        expand_scoped_proc_closure(&mut tracked, &table, 99, 1000);
+        assert!(!tracked.contains_key(&150));
+        assert_eq!(tracked.get(&201), Some(&1005));
+        assert_eq!(tracked.get(&202), Some(&1010));
     }
 }

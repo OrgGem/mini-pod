@@ -645,14 +645,27 @@ impl UnixConfinedProcess {
     }
 
     /// Non-blocking check for process exit.
+    ///
+    /// When the child leader has already transitioned to a zombie (`'Z'` on Linux, `SZOMB` on
+    /// macOS), terminates the confined process group (`-pid`) **before** calling `try_wait()` to
+    /// reap the leader so `-pid` is only ever signaled while the leader pins `pgid` in the kernel.
     pub fn try_wait(&mut self) -> Result<Option<ProcessExitStatus>, SandboxError> {
         if let Some(status) = self.exited {
             return Ok(Some(status));
+        }
+        match self.probe_unreaped_leader_zombie() {
+            Some(false) => return Ok(None),
+            Some(true) => {
+                let _ = self.kill_pinned_group_once();
+            }
+            None => {}
         }
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 let normalized = exit_status_from_std(status);
                 self.exited = Some(normalized);
+                // Once reaped, `pgid` is no longer pinned by the leader; never signal `-pgid` later.
+                self.group_killed = true;
                 #[cfg(target_os = "linux")]
                 self.try_remove_cgroup_dir_once();
                 Ok(Some(normalized))
@@ -684,13 +697,11 @@ impl UnixConfinedProcess {
         }
     }
 
-    /// Sends `SIGKILL` to the child's dedicated process group (`-pid`) and reaps the child.
+    /// Sends `SIGKILL` to the child's dedicated process group (`-pid`) while the leader still pins
+    /// `pgid` and reaps the child. Never signals `-pid` after the leader has already been reaped.
     pub fn kill_and_wait(&mut self) -> Result<(), SandboxError> {
-        if !self.group_killed {
-            kill_process_group_raw(self.identity.pid)?;
-            self.group_killed = true;
-        }
         if self.exited.is_none() {
+            self.kill_pinned_group_once()?;
             match self.child.kill() {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::InvalidInput => {}
@@ -708,15 +719,55 @@ impl UnixConfinedProcess {
                 ))
             })?;
             self.exited = Some(exit_status_from_std(status));
+            self.group_killed = true;
         }
         #[cfg(target_os = "linux")]
         self.cleanup_cgroup_dir_with_retry();
         Ok(())
     }
 
+    fn probe_unreaped_leader_zombie(&self) -> Option<bool> {
+        let pid = self.identity.pid;
+        #[cfg(target_os = "linux")]
+        {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (state, _) = parse_proc_stat_state_and_starttime(&stat)?;
+            Some(state == 'Z')
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match query_macos_proc_bsd_start_token(pid) {
+                Ok(Some((is_zombie, _))) => Some(is_zombie),
+                _ => None,
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    fn kill_pinned_group_once(&mut self) -> Result<(), SandboxError> {
+        if self.group_killed || self.exited.is_some() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(dir) = self.cgroup_dir.as_ref() {
+            let _ = fs::write(dir.join("cgroup.kill"), b"1");
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            kill_process_group_raw(self.identity.pid)?;
+        }
+        self.group_killed = true;
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     fn try_remove_cgroup_dir_once(&mut self) {
         if let Some(dir) = self.cgroup_dir.as_ref() {
+            let _ = fs::write(dir.join("cgroup.kill"), b"1");
             match fs::remove_dir(dir) {
                 Ok(()) => {
                     self.cgroup_dir = None;
@@ -735,6 +786,7 @@ impl UnixConfinedProcess {
             return;
         };
         for attempt in 0..10 {
+            let _ = fs::write(dir.join("cgroup.kill"), b"1");
             match fs::remove_dir(&dir) {
                 Ok(()) => return,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => return,
@@ -1353,6 +1405,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(15));
         }
         assert!(grandchild_gone, "grandchild PID {grandchild_pid} must be terminated on Drop");
+    }
+
+    #[test]
+    fn unix_try_wait_kills_surviving_group_descendants_before_reaping_leader() {
+        let dir = CleanupDir::unique("pgid-try-wait");
+        fs::create_dir_all(&dir.0).expect("create test temp dir");
+        let out_path = dir.0.join("bg.pid");
+        let out_file = fs::File::create(&out_path).expect("create stdout file");
+
+        let mut spec = ProcessLaunchSpec::new(
+            "/bin/sh",
+            vec!["-c".into(), "sleep 25 & echo $!; exit 0".into()],
+        );
+        spec.stdout = ProcessStdio::File(out_file);
+
+        let mut confined = spawn_confined(spec).expect("spawn confined shell");
+        let status = confined
+            .wait_timeout(Duration::from_secs(3))
+            .expect("wait_timeout")
+            .expect("leader shell exits promptly");
+        assert!(status.success());
+        assert!(
+            confined.group_killed,
+            "try_wait must signal confined process group while zombie leader still pins pgid"
+        );
+
+        let bg_pid: u32 = fs::read_to_string(&out_path)
+            .expect("read bg pid")
+            .lines()
+            .next()
+            .expect("pid line")
+            .trim()
+            .parse()
+            .expect("parse bg pid");
+        let bg_token = read_process_start_token(bg_pid);
+
+        let mut bg_gone = false;
+        for _ in 0..40 {
+            if is_process_terminated(bg_pid, bg_token) {
+                bg_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            bg_gone,
+            "surviving group descendant {bg_pid} must be terminated before leader reap"
+        );
     }
 
     fn is_process_terminated(pid: u32, expected_start_token: u64) -> bool {
