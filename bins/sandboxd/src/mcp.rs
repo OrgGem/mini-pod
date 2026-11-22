@@ -22,6 +22,7 @@ use crate::server::{build_runtime, daemon_status_info, wait_for_shutdown_signal}
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const DEFAULT_EXEC_DEADLINE_SECS: u64 = 30;
 const DEFAULT_EXEC_OUTPUT_BUDGET_BYTES: u64 = 1024 * 1024;
+// shortcut: fixed 16 MiB per-stream MCP exec output budget ceiling to fit inside 24 MiB wire frames, stream chunked MCP notifications if larger inline outputs are needed
 const MAX_MCP_EXEC_OUTPUT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum byte length of a single newline-delimited JSON-RPC 2.0 request line over MCP stdio.
 // shortcut: fixed 4 MiB JSON-RPC line cap over MCP stdio, add McpConfig override if larger inline payloads are needed

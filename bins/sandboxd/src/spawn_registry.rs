@@ -14,6 +14,7 @@ use sandbox_runtime::{LocalRuntimeManager, RuntimeManager};
 use tokio::sync::Mutex as AsyncMutex;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// shortcut: cap in-memory operation mutex cache at 4096 entries (evicting inactive unlocked entries), switch to LRU if >4096 concurrent active keyed sandboxes per daemon are needed
 const MAX_CACHED_OPERATIONS: usize = 4096;
 
 #[derive(Default)]
@@ -203,7 +204,17 @@ impl SpawnRegistry {
                     )),
                 };
             }
-            Err(SandboxError::NotFound(_) | SandboxError::LeaseExpired(_)) => {
+            Err(SandboxError::LeaseExpired(_)) => {
+                return match self.runtime.destroy(&lease.id).await? {
+                    DestroyStatus::AllResourcesCleaned => Err(SandboxError::LeaseExpired(
+                        "keyed spawn's sandbox is no longer active".to_owned(),
+                    )),
+                    DestroyStatus::ProcessExited { .. } => Err(SandboxError::AdmissionRejected(
+                        "keyed sandbox cleanup is still in progress".to_owned(),
+                    )),
+                };
+            }
+            Err(SandboxError::NotFound(_)) => {
                 let id = lease.id.as_str();
                 if id.is_empty()
                     || !id

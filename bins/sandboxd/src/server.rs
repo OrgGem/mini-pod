@@ -1592,7 +1592,23 @@ mod tests {
             _max_bytes: u64,
         ) -> Result<Vec<u8>, SandboxError> {
             if src_guest == "/oversized-frame" {
-                return Ok(vec![b'x'; MAX_CONTROL_FRAME_BYTES]);
+                let payload_len = 19 * 1024 * 1024usize;
+                let mut hdr = [0u8; 512];
+                hdr[..7].copy_from_slice(b"big.bin");
+                hdr[100..108].copy_from_slice(b"0000644\0");
+                hdr[108..116].copy_from_slice(b"0000000\0");
+                hdr[116..124].copy_from_slice(b"0000000\0");
+                hdr[124..136].copy_from_slice(format!("{payload_len:011o}\0").as_bytes());
+                hdr[136..148].copy_from_slice(b"00000000000\0");
+                hdr[148..156].copy_from_slice(b"        ");
+                hdr[156] = b'0';
+                hdr[257..263].copy_from_slice(b"ustar\0");
+                hdr[263..265].copy_from_slice(b"00");
+                let cksum: u32 = hdr.iter().map(|&b| u32::from(b)).sum();
+                hdr[148..156].copy_from_slice(format!("{cksum:06o}\0 ").as_bytes());
+                let mut archive = vec![0u8; 512 + payload_len + 1024];
+                archive[..512].copy_from_slice(&hdr);
+                return Ok(archive);
             }
             Ok(self.copied_in.lock().unwrap().clone().unwrap_or_default())
         }
@@ -1664,7 +1680,7 @@ mod tests {
             state_dir: tmp.path().join("state"),
             sweep_interval: Duration::from_secs(10),
             graceful_shutdown_timeout: Duration::from_millis(50),
-            max_copy_bytes: 8 * 1024 * 1024,
+            max_copy_bytes: 20 * 1024 * 1024,
             max_copy_entries: 1024,
             cleanup_max_attempts: 3,
             cleanup_initial_delay: Duration::from_millis(5),
@@ -1696,7 +1712,7 @@ mod tests {
             state_dir: tmp.path().join("state"),
             sweep_interval: Duration::from_secs(10),
             graceful_shutdown_timeout: Duration::from_millis(50),
-            max_copy_bytes: 8 * 1024 * 1024,
+            max_copy_bytes: 20 * 1024 * 1024,
             max_copy_entries: 1024,
             cleanup_max_attempts: 3,
             cleanup_initial_delay: Duration::from_millis(5),
@@ -2123,7 +2139,7 @@ mod tests {
             state_dir: tmp.path().join("state"),
             sweep_interval: Duration::from_secs(10),
             graceful_shutdown_timeout: Duration::from_millis(50),
-            max_copy_bytes: 8 * 1024 * 1024,
+            max_copy_bytes: 20 * 1024 * 1024,
             max_copy_entries: 1024,
             cleanup_max_attempts: 3,
             cleanup_initial_delay: Duration::from_millis(5),
@@ -2383,10 +2399,10 @@ mod tests {
         let client = test_client(Arc::clone(&state));
         let operation_id = "00000000-0000-4000-8000-000000000004".to_owned();
         let mut spec = sample_spec(NetworkPolicy::Isolated);
-        spec.lease_ttl = Duration::from_millis(30);
+        spec.lease_ttl = Duration::from_millis(250);
         let expired = client.spawn_keyed(operation_id.clone(), spec.clone()).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(state.runtime.sweep_expired_leases().await, 1);
         assert!(state.list_sandboxes().is_empty());
         assert!(matches!(
@@ -2503,7 +2519,14 @@ mod tests {
         // Simulate a daemon crash between writing `<uuid>.pending` and writing `<uuid>.result`.
         let op_crashed = "00000000-0000-4000-8000-000000000092".to_owned();
         let dir = state.runtime.config().state_dir.join("spawn-operations");
-        fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        sandbox_vmm::os::windows::create_owner_only_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let spec = sample_spec(NetworkPolicy::Isolated);
         fs::write(
             dir.join(format!("{op_crashed}.spec")),

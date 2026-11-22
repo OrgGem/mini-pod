@@ -924,7 +924,7 @@ pub fn kill_verified_orphan_process(
                 if !still_alive {
                     break;
                 }
-                thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
 

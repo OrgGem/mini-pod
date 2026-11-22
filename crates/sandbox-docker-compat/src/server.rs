@@ -1344,6 +1344,7 @@ impl DockerCompatServer {
                             }
                             let _ = client.flush().await;
                         }
+                        shutdown_and_drain_after_early_abort(client).await;
                         return Err(Ok(StreamNext::Close));
                     }
                     let _ = write_json_error(
@@ -1354,11 +1355,13 @@ impl DockerCompatServer {
                         true,
                     )
                     .await;
+                    shutdown_and_drain_after_early_abort(client).await;
                     return Err(Ok(StreamNext::Close));
                 }
                 _ => {
                     let _ = write_json_error(client, 502, "Bad Gateway", &err.to_string(), true)
                         .await;
+                    shutdown_and_drain_after_early_abort(client).await;
                     return Err(Ok(StreamNext::Close));
                 }
             }
@@ -1455,6 +1458,34 @@ where
     } else {
         StreamNext::Continue
     })
+}
+
+async fn shutdown_and_drain_after_early_abort<S>(client: &mut PrefixedReader<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = client.shutdown().await;
+    // Drain already-buffered request body bytes briefly after half-closing the write side so OS
+    // kernels (especially Windows Winsock) do not emit a TCP RST that wipes the in-flight response.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    let mut discard = [0u8; 8192];
+    let mut drained = 0usize;
+    const MAX_DRAIN_BYTES: usize = 2 * 1024 * 1024;
+    while drained < MAX_DRAIN_BYTES {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(25)),
+            tokio::io::AsyncReadExt::read(client, &mut discard),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => drained += n,
+        }
+    }
 }
 
 async fn write_buffered_response<S>(

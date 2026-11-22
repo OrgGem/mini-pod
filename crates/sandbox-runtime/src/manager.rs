@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -290,12 +290,14 @@ pub struct LocalRuntimeManager {
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
     destroy_listeners: Mutex<Vec<DestroyListener>>,
     next_seq: AtomicU64,
+    alive: Arc<AtomicBool>,
 }
 
 type DestroyListener = Arc<dyn Fn(&SandboxId) + Send + Sync>;
 
 impl Drop for LocalRuntimeManager {
     fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
         {
             let mut guard = lock_unpoisoned(&self.sweeper_abort);
             if let Some(handle) = guard.take() {
@@ -393,6 +395,7 @@ impl LocalRuntimeManager {
             sweeper_abort: Mutex::new(None),
             destroy_listeners: Mutex::new(Vec::new()),
             next_seq: AtomicU64::new(1),
+            alive: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -1223,6 +1226,7 @@ impl Drop for TransitioningCheckoutGuard {
 }
 
 struct BootCancellationGuard {
+    manager_alive: Arc<AtomicBool>,
     journal: JournalStore,
     overlay: Arc<dyn DiskOverlayPort>,
     vm_runtime: Arc<dyn VmRuntimePort>,
@@ -1237,9 +1241,10 @@ struct BootCancellationGuard {
 
 impl Drop for BootCancellationGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || !self.manager_alive.load(Ordering::Acquire) {
             return;
         }
+        let manager_alive = Arc::clone(&self.manager_alive);
         let journal = self.journal.clone();
         let overlay = Arc::clone(&self.overlay);
         let vm_runtime = Arc::clone(&self.vm_runtime);
@@ -1252,6 +1257,9 @@ impl Drop for BootCancellationGuard {
 
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.spawn(async move {
+                if !manager_alive.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(session) = session {
                     let graceful = session
                         .graceful_shutdown(config.graceful_shutdown_timeout)
@@ -1268,12 +1276,18 @@ impl Drop for BootCancellationGuard {
                         tokio::task::spawn_blocking(move || rec_journal.load_record(&rec_id)).await
                     {
                         if let (Some(pid), Some(start_token)) = (rec.pid, rec.start_token) {
+                            if !manager_alive.load(Ordering::Acquire) {
+                                return;
+                            }
                             let _ = vm_runtime.kill_orphan_process(pid, start_token).await;
                         }
                         for path in rec.artifact_paths {
                             push_unique_path(&mut artifact_paths, &path);
                         }
                     }
+                }
+                if !manager_alive.load(Ordering::Acquire) {
+                    return;
                 }
                 rollback_spawn_with_deps(
                     &journal,
@@ -1300,6 +1314,7 @@ impl LocalRuntimeManager {
         let work_dir = self.sandboxes_dir.join(sandbox_id.as_str());
         let initial_expires_ms = expires_at_unix_ms(spec.lease_ttl);
         let mut cancel_guard = BootCancellationGuard {
+            manager_alive: Arc::clone(&self.alive),
             journal: self.journal.clone(),
             overlay: Arc::clone(&self.overlay),
             vm_runtime: Arc::clone(&self.vm_runtime),
@@ -3345,13 +3360,15 @@ mod tests {
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while mgr.journal.load_record(&lease.id).unwrap().is_some() {
+        while mgr.journal.load_record(&lease.id).unwrap().is_some()
+            || Arc::strong_count(&mgr) > 1
+        {
             assert!(
                 Instant::now() < deadline,
-                "sweeper did not reap expired sandbox '{}' within 2s",
+                "sweeper did not reap expired sandbox '{}' and release manager ref within 2s",
                 lease.id
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         drop(mgr);
