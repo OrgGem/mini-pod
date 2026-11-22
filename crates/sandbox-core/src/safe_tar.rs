@@ -10,6 +10,9 @@ use std::time::UNIX_EPOCH;
 use crate::error::SandboxError;
 
 const COPY_IO_BUFFER_BYTES: usize = 64 * 1024;
+pub const MAX_TAR_DIRECTORY_DEPTH: usize = 128;
+pub const MAX_PACK_ENTRIES: usize = 65_536;
+const MAX_MEASURE_ENTRIES: usize = 262_144;
 pub const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 pub const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
@@ -59,6 +62,43 @@ const UNIX_O_NOFOLLOW: Option<i32> = Some(0x0100);
 ))]
 const UNIX_O_NOFOLLOW: Option<i32> = None;
 
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )
+))]
+const UNIX_O_NONBLOCK: Option<i32> = Some(0o4000);
+#[cfg(target_os = "macos")]
+const UNIX_O_NONBLOCK: Option<i32> = Some(0x0004);
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "powerpc",
+            target_arch = "powerpc64"
+        )
+    ))
+))]
+const UNIX_O_NONBLOCK: Option<i32> = None;
+
 /// Configures `opts` not to follow terminal symlinks (`O_NOFOLLOW` on Unix) or Windows reparse
 /// points (`FILE_FLAG_OPEN_REPARSE_POINT` on Windows) so post-open handle inspection sees the
 /// link/reparse entry itself rather than a target swapped in via TOCTOU.
@@ -67,6 +107,23 @@ pub fn apply_open_no_follow(opts: &mut OpenOptions) {
     if let Some(flag) = UNIX_O_NOFOLLOW {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(flag);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let _ = opts;
+}
+
+fn apply_open_read_no_follow_nonblock(opts: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        let flags = UNIX_O_NOFOLLOW.unwrap_or(0) | UNIX_O_NONBLOCK.unwrap_or(0);
+        if flags != 0 {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(flags);
+        }
     }
     #[cfg(windows)]
     {
@@ -177,12 +234,37 @@ pub fn map_fs_error(path: &Path, action: &str, err: io::Error) -> SandboxError {
 /// `max_bytes`, inspecting every host path with `symlink_metadata` and rejecting symlinks,
 /// Windows reparse points, and non-regular/non-directory nodes.
 pub fn pack_host_path_to_tar(src_host: &Path, max_bytes: u64) -> Result<Vec<u8>, SandboxError> {
+    pack_host_path_to_tar_with_limits(
+        src_host,
+        max_bytes,
+        MAX_PACK_ENTRIES,
+        MAX_TAR_DIRECTORY_DEPTH,
+    )
+}
+
+fn pack_host_path_to_tar_with_limits(
+    src_host: &Path,
+    max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<Vec<u8>, SandboxError> {
     let root_meta = inspect_existing_host_path_no_link(src_host)?;
 
     let mut plan = Vec::new();
     let mut raw_bytes_total: u64 = 0;
 
     if root_meta.file_type().is_file() {
+        if max_entries == 0 {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "source entry count exceeds max_entries ({max_entries})"
+            )));
+        }
+        if max_depth == 0 {
+            return Err(SandboxError::PolicyViolation(format!(
+                "source path '{}' exceeds maximum depth ({max_depth})",
+                src_host.display()
+            )));
+        }
         let name = src_host.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
             SandboxError::PolicyViolation(format!(
                 "source path '{}' does not have a valid UTF-8 file name",
@@ -204,7 +286,16 @@ pub fn pack_host_path_to_tar(src_host: &Path, max_bytes: u64) -> Result<Vec<u8>,
             meta: root_meta,
         });
     } else if root_meta.file_type().is_dir() {
-        collect_dir_plan(src_host, "", &mut plan, &mut raw_bytes_total, max_bytes)?;
+        collect_dir_plan(
+            src_host,
+            "",
+            1,
+            &mut plan,
+            &mut raw_bytes_total,
+            max_bytes,
+            max_entries,
+            max_depth,
+        )?;
     } else {
         return Err(SandboxError::PolicyViolation(format!(
             "refusing non-regular source node '{}'",
@@ -511,9 +602,12 @@ fn validate_entry_type_and_path(
 fn collect_dir_plan(
     disk_dir: &Path,
     rel_prefix: &str,
+    segment_depth: usize,
     plan: &mut Vec<PlannedEntry>,
     raw_bytes_total: &mut u64,
     max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
 ) -> Result<(), SandboxError> {
     let entries = fs::read_dir(disk_dir)
         .map_err(|err| map_fs_error(disk_dir, "read source directory", err))?;
@@ -522,6 +616,12 @@ fn collect_dir_plan(
     for entry_res in entries {
         let entry = entry_res
             .map_err(|err| map_fs_error(disk_dir, "iterate source directory", err))?;
+        if segment_depth > max_depth {
+            return Err(SandboxError::PolicyViolation(format!(
+                "source directory nesting inside '{}' exceeds maximum depth ({max_depth})",
+                disk_dir.display()
+            )));
+        }
         let raw_name = entry.file_name();
         let name = raw_name.to_str().ok_or_else(|| {
             SandboxError::PolicyViolation(format!(
@@ -531,10 +631,20 @@ fn collect_dir_plan(
         })?;
         validate_archive_segment(name)?;
         children.push((name.to_owned(), entry.path()));
+        if plan.len().saturating_add(children.len()) > max_entries {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "source entry count exceeds max_entries ({max_entries})"
+            )));
+        }
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (name, child_path) in children {
+        if plan.len() >= max_entries {
+            return Err(SandboxError::BudgetExceeded(format!(
+                "source entry count exceeds max_entries ({max_entries})"
+            )));
+        }
         let meta = fs::symlink_metadata(&child_path)
             .map_err(|err| map_fs_error(&child_path, "inspect source entry metadata", err))?;
         reject_symlink_or_reparse(&child_path, &meta)?;
@@ -550,7 +660,16 @@ fn collect_dir_plan(
                 rel: rel.clone(),
                 meta,
             });
-            collect_dir_plan(&child_path, &rel, plan, raw_bytes_total, max_bytes)?;
+            collect_dir_plan(
+                &child_path,
+                &rel,
+                segment_depth + 1,
+                plan,
+                raw_bytes_total,
+                max_bytes,
+                max_entries,
+                max_depth,
+            )?;
         } else if meta.file_type().is_file() {
             *raw_bytes_total = raw_bytes_total
                 .checked_add(meta.len())
@@ -638,6 +757,11 @@ fn validate_tar_entry_segments(
     for seg in trimmed.split('/') {
         validate_archive_segment(seg)?;
         segments.push(seg.to_owned());
+        if segments.len() > MAX_TAR_DIRECTORY_DEPTH {
+            return Err(SandboxError::PolicyViolation(format!(
+                "tar entry path '{raw_str}' exceeds maximum depth ({MAX_TAR_DIRECTORY_DEPTH})"
+            )));
+        }
     }
 
     if segments.is_empty() {
@@ -661,11 +785,13 @@ fn validate_archive_segment(seg: &str) -> Result<(), SandboxError> {
         )));
     }
     #[cfg(windows)]
-    if seg.contains(':') || is_windows_reserved_device_name(seg) {
+    if is_windows_invalid_segment(seg) {
         return Err(SandboxError::PolicyViolation(format!(
-            "tar entry segment '{seg}' uses forbidden Windows device or colon syntax"
+            "tar entry segment '{seg}' uses forbidden Windows device, trailing dot/space, or special syntax"
         )));
     }
+    #[cfg(not(windows))]
+    let _ = is_windows_invalid_segment;
     let mut comps = Path::new(seg).components();
     match (comps.next(), comps.next()) {
         (Some(Component::Normal(_)), None) => Ok(()),
@@ -675,34 +801,45 @@ fn validate_archive_segment(seg: &str) -> Result<(), SandboxError> {
     }
 }
 
-#[cfg(windows)]
+fn is_windows_invalid_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg.ends_with('.') || seg.ends_with(' ') {
+        return true;
+    }
+    if seg.chars().any(|c| {
+        (c as u32) < 0x20 || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    }) {
+        return true;
+    }
+    is_windows_reserved_device_name(seg)
+}
+
 fn is_windows_reserved_device_name(seg: &str) -> bool {
-    let stem = seg.split('.').next().unwrap_or(seg);
-    matches!(
+    let stem = seg.split('.').next().unwrap_or(seg).trim_end_matches(' ');
+    if matches!(
         stem.to_ascii_uppercase().as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return true;
+    }
+    if let Some(prefix) = stem.get(..3) {
+        if prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT") {
+            return matches!(
+                &stem[3..],
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{00B9}"
+                    | "\u{00B2}"
+                    | "\u{00B3}"
+            );
+        }
+    }
+    false
 }
 
 fn inspect_existing_host_path_no_link(path: &Path) -> Result<fs::Metadata, SandboxError> {
@@ -830,8 +967,9 @@ pub fn measure_dir_bytes(path: &Path) -> Result<u64, SandboxError> {
     }
 
     let mut total_bytes: u64 = 0;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut visited_entries: usize = 0;
+    let mut stack = vec![(path.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
@@ -855,6 +993,19 @@ pub fn measure_dir_bytes(path: &Path) -> Result<u64, SandboxError> {
                     ))
                 }
             };
+            visited_entries = visited_entries.saturating_add(1);
+            if visited_entries > MAX_MEASURE_ENTRIES {
+                return Err(SandboxError::BudgetExceeded(format!(
+                    "directory measurement entry count inside '{}' exceeds maximum ({MAX_MEASURE_ENTRIES})",
+                    path.display()
+                )));
+            }
+            if depth + 1 > MAX_TAR_DIRECTORY_DEPTH {
+                return Err(SandboxError::PolicyViolation(format!(
+                    "directory nesting inside '{}' exceeds maximum depth ({MAX_TAR_DIRECTORY_DEPTH})",
+                    path.display()
+                )));
+            }
             let child = entry.path();
             let meta = match fs::symlink_metadata(&child) {
                 Ok(meta) => meta,
@@ -865,7 +1016,7 @@ pub fn measure_dir_bytes(path: &Path) -> Result<u64, SandboxError> {
                 continue;
             }
             if meta.file_type().is_dir() {
-                stack.push(child);
+                stack.push((child, depth + 1));
             } else if meta.file_type().is_file() {
                 total_bytes = total_bytes.saturating_add(meta.len());
             }
@@ -880,6 +1031,18 @@ fn validate_host_path_components(path: &Path) -> Result<(), SandboxError> {
             "host path must not be empty".to_owned(),
         ));
     }
+    #[cfg(windows)]
+    {
+        // `Path::components` only checks raw trailing dots/spaces on `as_os_str()`, because
+        // `Component::Normal` on non-verbatim paths may still preserve trailing dots/spaces or ADS.
+        let raw_lossy = path.as_os_str().to_string_lossy();
+        if raw_lossy.ends_with(' ') || (raw_lossy.ends_with('.') && raw_lossy != "." && !raw_lossy.ends_with("\\.") && !raw_lossy.ends_with("/.")) {
+            return Err(SandboxError::PolicyViolation(format!(
+                "host path '{}' must not end with trailing space or dot",
+                path.display()
+            )));
+        }
+    }
     for comp in path.components() {
         match comp {
             Component::ParentDir => {
@@ -892,6 +1055,21 @@ fn validate_host_path_components(path: &Path) -> Result<(), SandboxError> {
                 if matches!(prefix.kind(), Prefix::DeviceNS(_)) {
                     return Err(SandboxError::PolicyViolation(format!(
                         "refusing Windows device namespace path '{}'",
+                        path.display()
+                    )));
+                }
+            }
+            #[cfg(windows)]
+            Component::Normal(part) => {
+                let Some(seg) = part.to_str() else {
+                    return Err(SandboxError::PolicyViolation(format!(
+                        "host path '{}' contains invalid UTF-8 component",
+                        path.display()
+                    )));
+                };
+                if is_windows_invalid_segment(seg) {
+                    return Err(SandboxError::PolicyViolation(format!(
+                        "host path '{}' contains forbidden Windows device, ADS colon, or trailing dot/space component '{seg}'",
                         path.display()
                     )));
                 }
@@ -973,7 +1151,7 @@ fn open_source_regular_no_follow(
 
     let mut opts = OpenOptions::new();
     opts.read(true);
-    apply_open_no_follow(&mut opts);
+    apply_open_read_no_follow_nonblock(&mut opts);
     let file = opts
         .open(path)
         .map_err(|err| map_fs_error(path, "open source file", err))?;
@@ -1121,7 +1299,20 @@ fn verify_opened_regular_matches(
             )));
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // shortcut: stable `std` lacks `file_index`/`volume_serial_number`, switch to `ByHandleFileInformation` if sub-100ns replacement collisions matter.
+        if (lstat_meta.creation_time(), lstat_meta.file_attributes())
+            != (open_meta.creation_time(), open_meta.file_attributes())
+        {
+            return Err(SandboxError::PolicyViolation(format!(
+                "file '{}' changed metadata identity between lstat and open",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = (path, lstat_meta);
     Ok(())
 }
@@ -1722,5 +1913,141 @@ mod tests {
             !has_leftover_tmp,
             "temporary staged file must be removed on error"
         );
+    }
+
+    #[test]
+    fn windows_segment_rules_reject_extended_devices_superscripts_trailing_dots_and_spaces() {
+        let forbidden = [
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "CONIN$",
+            "conin$.txt",
+            "CONOUT$",
+            "CLOCK$",
+            "clock$.log",
+            "NUL .txt",
+            "COM1 .log",
+            "COM\u{00B9}",
+            "com\u{00B2}.txt",
+            "COM\u{00B3}",
+            "LPT\u{00B9}",
+            "LPT\u{00B2}",
+            "lpt\u{00B3}.dat",
+            "trailing.",
+            "trailing ",
+            "dots...",
+            "file.txt:ads",
+            "bad*glob",
+            "bad?char",
+            "ctrl\x07bell",
+        ];
+        for seg in forbidden {
+            assert!(
+                is_windows_invalid_segment(seg),
+                "expected Windows segment check to reject {seg:?}"
+            );
+        }
+
+        let allowed = [
+            "COM0",
+            "COM10",
+            "LPT0",
+            "LPT10",
+            "CONSOLE",
+            "CONIN",
+            "CONOUT",
+            "CLOCK",
+            "my file.txt",
+            ".gitignore",
+        ];
+        for seg in allowed {
+            assert!(
+                !is_windows_invalid_segment(seg),
+                "expected Windows segment check to allow {seg:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let tmp = TestTempDir::new("win-ext-devices");
+            let dst = tmp.path().join("dst");
+            fs::create_dir_all(&dst).unwrap();
+
+            for raw in [
+                "CONIN$".as_bytes(),
+                "CONOUT$.txt".as_bytes(),
+                "CLOCK$".as_bytes(),
+                "COM\u{00B9}".as_bytes(),
+                "LPT\u{00B3}.log".as_bytes(),
+                "NUL .txt".as_bytes(),
+                "sneaky. ".as_bytes(),
+                "sneaky.".as_bytes(),
+            ] {
+                let tar = make_raw_tar(&[(raw, tar::EntryType::Regular, b"x", None)]);
+                assert!(
+                    matches!(
+                        extract_tar_safely(&tar, &dst, 64 * 1024, 16),
+                        Err(SandboxError::PolicyViolation(_))
+                    ),
+                    "expected PolicyViolation extracting {:?}",
+                    String::from_utf8_lossy(raw)
+                );
+            }
+
+            assert!(matches!(
+                ensure_safe_dir_path(&tmp.path().join("CONIN$"), true),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+            assert!(matches!(
+                ensure_safe_dir_path(&tmp.path().join("dir. "), true),
+                Err(SandboxError::PolicyViolation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn pack_and_extract_enforce_directory_depth_and_pack_entry_caps() {
+        let tmp = TestTempDir::new("depth-and-entry-caps");
+        let src = tmp.path().join("src");
+        let deep = src.join("d1").join("d2").join("d3");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("leaf.txt"), b"ok").unwrap();
+
+        // 4 segments (`d1/d2/d3/leaf.txt`): allowed at max_depth=4, rejected at max_depth=3.
+        assert!(pack_host_path_to_tar_with_limits(&src, 64 * 1024, 16, 4).is_ok());
+        assert!(matches!(
+            pack_host_path_to_tar_with_limits(&src, 64 * 1024, 16, 3),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+
+        // 4 planned entries (`d1`, `d1/d2`, `d1/d2/d3`, `d1/d2/d3/leaf.txt`): rejected at max_entries=3.
+        assert!(matches!(
+            pack_host_path_to_tar_with_limits(&src, 64 * 1024, 3, 16),
+            Err(SandboxError::BudgetExceeded(_))
+        ));
+
+        // Archive entry exceeding `MAX_TAR_DIRECTORY_DEPTH` (129 segments via GNU LongName).
+        let mut long_path = "d/".repeat(MAX_TAR_DIRECTORY_DEPTH);
+        long_path.push_str("leaf.txt\0");
+        let deep_tar = make_raw_tar(&[
+            (
+                b"././@LongLink",
+                tar::EntryType::GNULongName,
+                long_path.as_bytes(),
+                None,
+            ),
+            (b"leaf.txt", tar::EntryType::Regular, b"x", None),
+        ]);
+        let dst = tmp.path().join("dst");
+        assert!(matches!(
+            validate_tar_bytes(&deep_tar, 64 * 1024, 16),
+            Err(SandboxError::PolicyViolation(_))
+        ));
+        assert!(matches!(
+            extract_tar_safely(&deep_tar, &dst, 64 * 1024, 16),
+            Err(SandboxError::PolicyViolation(_))
+        ));
     }
 }

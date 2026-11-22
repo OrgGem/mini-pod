@@ -23,6 +23,8 @@ const COPY_CHUNK_BYTES: usize = 64 * 1024;
 const TAR_BLOCK_BYTES: u64 = 512;
 const TAR_TRAILER_BYTES: u64 = 1024;
 const MAX_COPY_IO_BUF: usize = 64 * 1024;
+const MAX_GUEST_COPY_DEPTH: usize = 128;
+const MAX_GUEST_COPY_ENTRIES: usize = 65_536;
 
 static NEXT_GUEST_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -113,6 +115,26 @@ fn execute_copy_in(
     rx: mpsc::Receiver<CopyInItem>,
     outbound: &Arc<OutboundQueue>,
 ) -> Result<u64, String> {
+    execute_copy_in_with_limits(
+        stream_id,
+        dst_guest,
+        max_bytes,
+        MAX_GUEST_COPY_ENTRIES,
+        MAX_GUEST_COPY_DEPTH,
+        rx,
+        outbound,
+    )
+}
+
+fn execute_copy_in_with_limits(
+    stream_id: StreamId,
+    dst_guest: &str,
+    max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
+    rx: mpsc::Receiver<CopyInItem>,
+    outbound: &Arc<OutboundQueue>,
+) -> Result<u64, String> {
     let dst_root = validate_absolute_guest_path(dst_guest)?;
     ensure_dir_no_symlink(&dst_root, true)?;
 
@@ -126,14 +148,19 @@ fn execute_copy_in(
             .map_err(|err| format!("invalid tar stream header: {err}"))?;
         let mut copy_buf = vec![0u8; MAX_COPY_IO_BUF];
 
-        for entry_res in entries {
+        for (entry_count, entry_res) in entries.enumerate() {
+            if entry_count >= max_entries {
+                return Err(format!(
+                    "copy_in tar entry count exceeds maximum ({max_entries})"
+                ));
+            }
             let mut entry = entry_res.map_err(|err| format!("invalid tar entry: {err}"))?;
             let entry_type = entry.header().entry_type();
             let raw_path_bytes = entry.path_bytes();
             let entry_path = entry
                 .path()
                 .map_err(|err| format!("invalid tar entry path: {err}"))?;
-            let rel_path = validate_tar_entry_path(&raw_path_bytes, &entry_path)?;
+            let rel_path = validate_tar_entry_path(&raw_path_bytes, &entry_path, max_depth)?;
 
             match entry_type {
                 tar::EntryType::Directory => {
@@ -345,14 +372,39 @@ impl Read for CopyInReader<'_> {
 }
 
 enum PlannedEntry {
-    Dir { rel: PathBuf, meta: fs::Metadata },
-    File { rel: PathBuf, disk_path: PathBuf },
+    Dir {
+        rel: PathBuf,
+        meta: fs::Metadata,
+    },
+    File {
+        rel: PathBuf,
+        disk_path: PathBuf,
+        lstat_meta: fs::Metadata,
+    },
 }
 
 fn execute_copy_out(
     stream_id: StreamId,
     src_guest: &str,
     max_bytes: u64,
+    outbound: &Arc<OutboundQueue>,
+) -> Result<u64, String> {
+    execute_copy_out_with_limits(
+        stream_id,
+        src_guest,
+        max_bytes,
+        MAX_GUEST_COPY_ENTRIES,
+        MAX_GUEST_COPY_DEPTH,
+        outbound,
+    )
+}
+
+fn execute_copy_out_with_limits(
+    stream_id: StreamId,
+    src_guest: &str,
+    max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
     outbound: &Arc<OutboundQueue>,
 ) -> Result<u64, String> {
     let src_path = validate_absolute_guest_path(src_guest)?;
@@ -371,6 +423,9 @@ fn execute_copy_out(
     let mut min_tar_bytes = TAR_TRAILER_BYTES;
 
     if root_meta.is_file() {
+        if max_entries == 0 || max_depth == 0 {
+            return Err("copy_out source exceeds entry or depth budget".to_owned());
+        }
         let name = src_path
             .file_name()
             .ok_or_else(|| format!("copy_out source '{}' has no filename", src_path.display()))?;
@@ -382,9 +437,19 @@ fn execute_copy_out(
         plan.push(PlannedEntry::File {
             rel: PathBuf::from(name),
             disk_path: src_path,
+            lstat_meta: root_meta,
         });
     } else if root_meta.is_dir() {
-        collect_dir_plan(&src_path, Path::new(""), &mut plan, &mut min_tar_bytes)?;
+        collect_dir_plan_with_limits(
+            &src_path,
+            Path::new(""),
+            1,
+            &mut plan,
+            &mut min_tar_bytes,
+            max_bytes,
+            max_entries,
+            max_depth,
+        )?;
     } else {
         return Err(format!(
             "copy_out source '{}' is not a regular file or directory",
@@ -422,17 +487,16 @@ fn execute_copy_out(
                         .append_data(&mut header, &rel, io::empty())
                         .map_err(|err| format!("failed packing dir '{}': {err}", rel.display()))?;
                 }
-                PlannedEntry::File { rel, disk_path } => {
+                PlannedEntry::File {
+                    rel,
+                    disk_path,
+                    lstat_meta,
+                } => {
                     let mut file = open_source_file_no_symlink(&disk_path)?;
                     let meta = file.metadata().map_err(|err| {
                         format!("failed to stat '{}': {err}", disk_path.display())
                     })?;
-                    if is_symlink_or_reparse(&meta) || !meta.is_file() {
-                        return Err(format!(
-                            "copy_out file '{}' is not a regular file",
-                            disk_path.display()
-                        ));
-                    }
+                    verify_guest_opened_regular_matches(&disk_path, &lstat_meta, &meta)?;
                     let size = meta.len();
                     let mut header = tar::Header::new_gnu();
                     header.set_entry_type(tar::EntryType::Regular);
@@ -456,19 +520,43 @@ fn execute_copy_out(
     writer.finish()
 }
 
-fn collect_dir_plan(
+fn collect_dir_plan_with_limits(
     disk_dir: &Path,
     rel_prefix: &Path,
+    segment_depth: usize,
     plan: &mut Vec<PlannedEntry>,
     min_tar_bytes: &mut u64,
+    max_bytes: u64,
+    max_entries: usize,
+    max_depth: usize,
 ) -> Result<(), String> {
-    let mut children: Vec<_> = fs::read_dir(disk_dir)
+    let mut children = Vec::new();
+    for entry_res in fs::read_dir(disk_dir)
         .map_err(|err| format!("failed reading directory '{}': {err}", disk_dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("failed iterating directory '{}': {err}", disk_dir.display()))?;
+    {
+        let entry = entry_res
+            .map_err(|err| format!("failed iterating directory '{}': {err}", disk_dir.display()))?;
+        if segment_depth > max_depth {
+            return Err(format!(
+                "copy_out directory nesting inside '{}' exceeds maximum depth ({max_depth})",
+                disk_dir.display()
+            ));
+        }
+        children.push(entry);
+        if plan.len().saturating_add(children.len()) > max_entries {
+            return Err(format!(
+                "copy_out entry count exceeds maximum ({max_entries})"
+            ));
+        }
+    }
     children.sort_by_key(|entry| entry.file_name());
 
     for child in children {
+        if plan.len() >= max_entries {
+            return Err(format!(
+                "copy_out entry count exceeds maximum ({max_entries})"
+            ));
+        }
         let name = child.file_name();
         let disk_path = child.path();
         let rel_path = if rel_prefix.as_os_str().is_empty() {
@@ -490,20 +578,40 @@ fn collect_dir_plan(
             *min_tar_bytes = min_tar_bytes
                 .checked_add(TAR_BLOCK_BYTES)
                 .ok_or_else(|| "copy_out archive size overflow".to_owned())?;
+            if *min_tar_bytes > max_bytes {
+                return Err(format!(
+                    "copy_out archive size ({min_tar_bytes} bytes minimum) exceeds max_bytes ({max_bytes})"
+                ));
+            }
             plan.push(PlannedEntry::Dir {
                 rel: rel_path.clone(),
                 meta,
             });
-            collect_dir_plan(&disk_path, &rel_path, plan, min_tar_bytes)?;
+            collect_dir_plan_with_limits(
+                &disk_path,
+                &rel_path,
+                segment_depth + 1,
+                plan,
+                min_tar_bytes,
+                max_bytes,
+                max_entries,
+                max_depth,
+            )?;
         } else if meta.is_file() {
             let file_blocks = padded_tar_blocks(meta.len())?;
             *min_tar_bytes = min_tar_bytes
                 .checked_add(TAR_BLOCK_BYTES)
                 .and_then(|v| v.checked_add(file_blocks))
                 .ok_or_else(|| "copy_out archive size overflow".to_owned())?;
+            if *min_tar_bytes > max_bytes {
+                return Err(format!(
+                    "copy_out archive size ({min_tar_bytes} bytes minimum) exceeds max_bytes ({max_bytes})"
+                ));
+            }
             plan.push(PlannedEntry::File {
                 rel: rel_path,
                 disk_path,
+                lstat_meta: meta,
             });
         } else {
             return Err(format!(
@@ -731,7 +839,11 @@ fn prepare_parent_dirs_no_symlink(root: &Path, rel: &Path) -> Result<PathBuf, St
     Ok(cur)
 }
 
-fn validate_tar_entry_path(raw_bytes: &[u8], entry_path: &Path) -> Result<Option<PathBuf>, String> {
+fn validate_tar_entry_path(
+    raw_bytes: &[u8],
+    entry_path: &Path,
+    max_depth: usize,
+) -> Result<Option<PathBuf>, String> {
     if raw_bytes.is_empty() {
         return Err("tar entry path must not be empty".to_owned());
     }
@@ -745,6 +857,7 @@ fn validate_tar_entry_path(raw_bytes: &[u8], entry_path: &Path) -> Result<Option
     }
 
     let mut rel = PathBuf::new();
+    let mut depth = 0usize;
     for comp in entry_path.components() {
         match comp {
             Component::Prefix(_) | Component::RootDir => {
@@ -760,6 +873,12 @@ fn validate_tar_entry_path(raw_bytes: &[u8], entry_path: &Path) -> Result<Option
                 };
                 if part_str == ".." || part_str.contains('\\') || part_str.contains('\0') {
                     return Err(format!("tar entry path '{raw_str}' contains forbidden component"));
+                }
+                depth += 1;
+                if depth > max_depth {
+                    return Err(format!(
+                        "tar entry path '{raw_str}' exceeds maximum depth ({max_depth})"
+                    ));
                 }
                 rel.push(part);
             }
@@ -794,6 +913,12 @@ impl StagedGuestExtractFile {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
                 opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             }
             match opts.open(&tmp_path) {
                 Ok(file) => {
@@ -904,10 +1029,56 @@ fn open_source_file_no_symlink(path: &Path) -> Result<File, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // `O_NONBLOCK` prevents `open()` from blocking indefinitely if a regular file was
+        // swapped with a FIFO (`mkfifo`) between `symlink_metadata` and `open` before `fstat`.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     opts.open(path)
         .map_err(|err| format!("failed to open '{}' for read: {err}", path.display()))
+}
+
+fn verify_guest_opened_regular_matches(
+    path: &Path,
+    lstat_meta: &fs::Metadata,
+    open_meta: &fs::Metadata,
+) -> Result<(), String> {
+    if is_symlink_or_reparse(open_meta) || !open_meta.is_file() {
+        return Err(format!(
+            "copy_out file '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (lstat_meta.dev(), lstat_meta.ino()) != (open_meta.dev(), open_meta.ino()) {
+            return Err(format!(
+                "copy_out file '{}' changed inode identity between lstat and open",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if (lstat_meta.creation_time(), lstat_meta.file_attributes())
+            != (open_meta.creation_time(), open_meta.file_attributes())
+        {
+            return Err(format!(
+                "copy_out file '{}' changed metadata identity between lstat and open",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = lstat_meta;
+    Ok(())
 }
 
 fn apply_safe_file_mode(file: &File, mode: u32) -> Result<(), String> {
@@ -961,4 +1132,155 @@ fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
         }
     }
     meta.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static COPY_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct LocalTempDir(PathBuf);
+
+    impl LocalTempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "minipod-agent-copy-{label}-{}-{}",
+                std::process::id(),
+                COPY_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for LocalTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn build_tar_entries(paths: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut out);
+            for (path, data) in paths {
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_entry_type(tar::EntryType::Regular);
+                hdr.set_size(data.len() as u64);
+                hdr.set_mode(0o644);
+                hdr.set_uid(0);
+                hdr.set_gid(0);
+                hdr.set_cksum();
+                builder.append_data(&mut hdr, path, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn guest_copy_in_and_out_enforce_depth_and_entry_ceilings() {
+        let tmp = LocalTempDir::new("limits");
+        let src = tmp.0.join("src");
+        let deep = src.join("d1").join("d2").join("d3");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("leaf.txt"), b"payload").unwrap();
+
+        let outbound = Arc::new(OutboundQueue::new());
+        outbound.seed_default_credit(StreamId(1), StreamChannel::Stdout, 1_048_576);
+        assert!(execute_copy_out_with_limits(
+            StreamId(1),
+            &src.to_string_lossy(),
+            1_048_576,
+            16,
+            4,
+            &outbound,
+        )
+        .is_ok());
+
+        // Depth ceiling exceeded (`d1/d2/d3/leaf.txt` has 4 segments > max_depth=3).
+        let err_depth = execute_copy_out_with_limits(
+            StreamId(2),
+            &src.to_string_lossy(),
+            1_048_576,
+            16,
+            3,
+            &outbound,
+        )
+        .unwrap_err();
+        assert!(err_depth.contains("exceeds maximum depth"), "got {err_depth}");
+
+        // Entry ceiling exceeded (4 entries > max_entries=3).
+        let err_entries = execute_copy_out_with_limits(
+            StreamId(3),
+            &src.to_string_lossy(),
+            1_048_576,
+            3,
+            16,
+            &outbound,
+        )
+        .unwrap_err();
+        assert!(err_entries.contains("entry count exceeds maximum"), "got {err_entries}");
+
+        // CopyIn entry ceiling and depth ceiling.
+        let tar_bytes = build_tar_entries(&[("a/b/c.txt", b"1"), ("a/b/d.txt", b"2")]);
+        let dst = tmp.0.join("dst");
+
+        let (handle1, rx1) = ActiveCopyIn::new();
+        handle1.push_chunk(tar_bytes.clone(), true);
+        let err_in_entries = execute_copy_in_with_limits(
+            StreamId(4),
+            &dst.to_string_lossy(),
+            65_536,
+            1,
+            16,
+            rx1,
+            &outbound,
+        )
+        .unwrap_err();
+        assert!(
+            err_in_entries.contains("entry count exceeds maximum"),
+            "got {err_in_entries}"
+        );
+
+        let (handle2, rx2) = ActiveCopyIn::new();
+        handle2.push_chunk(tar_bytes, true);
+        let err_in_depth = execute_copy_in_with_limits(
+            StreamId(5),
+            &dst.to_string_lossy(),
+            65_536,
+            16,
+            2,
+            rx2,
+            &outbound,
+        )
+        .unwrap_err();
+        assert!(
+            err_in_depth.contains("exceeds maximum depth"),
+            "got {err_in_depth}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_source_file_no_symlink_does_not_block_on_fifo() {
+        let tmp = LocalTempDir::new("fifo-nonblock");
+        let regular_path = tmp.0.join("orig.txt");
+        fs::write(&regular_path, b"regular").unwrap();
+        let regular_meta = fs::symlink_metadata(&regular_path).unwrap();
+
+        let fifo_path = tmp.0.join("pipe.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("invoke mkfifo");
+        assert!(status.success(), "mkfifo must succeed");
+
+        let opened = open_source_file_no_symlink(&fifo_path).expect("O_NONBLOCK open returns immediately");
+        let fifo_meta = opened.metadata().unwrap();
+        let err = verify_guest_opened_regular_matches(&fifo_path, &regular_meta, &fifo_meta)
+            .unwrap_err();
+        assert!(err.contains("not a regular file"), "got {err}");
+    }
 }
