@@ -1484,10 +1484,14 @@ impl VmSessionPort for QemuVmSession {
             return Ok(true);
         }
 
+        let mut closed_rx = self.session_closed_tx.subscribe();
         let _ = self.enqueue_control_message(StreamId(0), &Message::Shutdown);
 
         let maybe_process = lock_unpoisoned(&self.process).take();
         let Some(mut process) = maybe_process else {
+            if closed_rx.borrow().is_none() {
+                let _ = tokio::time::timeout(timeout, closed_rx.changed()).await;
+            }
             self.alive.store(false, Ordering::Release);
             self.teardown_ipc_and_threads();
             return Ok(true);
@@ -2229,9 +2233,11 @@ fn run_reader_loop(
                             if let Some(StreamHandler::Tunnel {
                                 inbound_tx,
                                 stdin_credits,
+                                _egress_permit: egress_permit,
                                 ..
                             }) = map.remove(&stream_id)
                             {
+                                drop(egress_permit);
                                 stdin_credits.close();
                                 let _ = inbound_tx.send(TunnelInbound::RemoteClose);
                             }
@@ -2252,9 +2258,11 @@ fn run_reader_loop(
                                 if let Some(StreamHandler::Tunnel {
                                     inbound_tx,
                                     stdin_credits,
+                                    _egress_permit: egress_permit,
                                     ..
                                 }) = map.remove(&stream_id)
                                 {
+                                    drop(egress_permit);
                                     stdin_credits.close();
                                     let _ = inbound_tx.send(TunnelInbound::RemoteClose);
                                 }
@@ -2370,9 +2378,11 @@ fn run_reader_loop(
                     mut connect_tx,
                     inbound_tx,
                     stdin_credits,
+                    _egress_permit: egress_permit,
                     ..
                 }) = removed
                 {
+                    drop(egress_permit);
                     stdin_credits.close();
                     if let Some(tx) = connect_tx.take() {
                         let _ = tx.send(Err(SandboxError::Transport(message)));
@@ -2387,9 +2397,11 @@ fn run_reader_loop(
                     mut connect_tx,
                     inbound_tx,
                     stdin_credits,
+                    _egress_permit: egress_permit,
                     ..
                 }) = removed
                 {
+                    drop(egress_permit);
                     stdin_credits.close();
                     if let Some(tx) = connect_tx.take() {
                         let _ = tx.send(Err(SandboxError::Transport(
@@ -2605,8 +2617,10 @@ fn fail_all_pending_ops(
                 mut connect_tx,
                 inbound_tx,
                 stdin_credits,
+                _egress_permit: egress_permit,
                 ..
             } => {
+                drop(egress_permit);
                 stdin_credits.close();
                 if let Some(tx) = connect_tx.take() {
                     let _ = tx.send(Err(SandboxError::Transport(reason.to_owned())));
