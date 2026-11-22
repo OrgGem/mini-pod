@@ -47,7 +47,7 @@ jobs:
       - name: Run npm launcher tests
         run: |
           cargo build --locked -p sandbox-cli -p sandboxd
-          node --test npm/test/launcher.test.js
+          node --test npm/test/launcher.test.js npm/test/stage.test.js
 
   guest-linux-musl:
     name: Guest Static Musl Check & Test (rust:alpine)

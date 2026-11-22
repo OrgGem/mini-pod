@@ -580,9 +580,14 @@ pub(crate) fn spawn_in_job_internal(
 }
 
 fn is_forbidden_windows_script(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd")
-    })
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let trimmed = name.trim_end_matches([' ', '.']);
+    Path::new(trimmed)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"))
 }
 
 fn is_single_bare_filename(path: &Path) -> bool {
@@ -1656,6 +1661,9 @@ mod tests {
             Path::new("qemu.bat"),
             Path::new("qemu.CMD"),
             Path::new(r"C:\tools\qemu.bat"),
+            Path::new("qemu.bat "),
+            Path::new("qemu.cmd."),
+            Path::new(r"C:\tools\qemu.BAT. ."),
         ] {
             assert!(
                 matches!(

@@ -806,6 +806,7 @@ pub fn parse_compose_yaml(
                 || trimmed.eq_ignore_ascii_case("bridge")
                 || trimmed.eq_ignore_ascii_case("default")
             {
+                // shortcut: only 'none', 'bridge', and 'default' network_mode supported; add 'service:<name>' / 'container:<id>' when requested
                 Some(trimmed.to_ascii_lowercase())
             } else {
                 return Err(SandboxError::InvalidSpec(format!(
@@ -815,11 +816,9 @@ pub fn parse_compose_yaml(
         } else {
             None
         };
-        if matches!(network_mode.as_deref(), Some("none"))
-            && map_get(svc_hash, "networks").is_some_and(|v| !v.is_null())
-        {
+        if network_mode.is_some() && map_get(svc_hash, "networks").is_some_and(|v| !v.is_null()) {
             return Err(SandboxError::InvalidSpec(format!(
-                "service '{svc_name}' cannot specify both network_mode='none' and 'networks'"
+                "service '{svc_name}' cannot specify both 'network_mode' and 'networks'"
             )));
         }
 
@@ -859,13 +858,20 @@ pub fn parse_compose_yaml(
         let restart = parse_restart_policy(svc_hash, &svc_name)?;
         let ports = parse_service_ports(svc_hash, &svc_name)?;
         let expose = parse_service_expose(svc_hash, &svc_name)?;
+        if matches!(network_mode.as_deref(), Some("none"))
+            && (!ports.is_empty() || !expose.is_empty())
+        {
+            return Err(SandboxError::InvalidSpec(format!(
+                "service '{svc_name}' cannot specify 'ports' or 'expose' when network_mode='none'"
+            )));
+        }
         let mounts = parse_service_mounts(
             svc_hash,
             &svc_name,
             &project_name,
             &mut declared_volumes,
         )?;
-        let networks = if matches!(network_mode.as_deref(), Some("none")) {
+        let networks = if network_mode.is_some() {
             Vec::new()
         } else {
             parse_service_networks(svc_hash, &svc_name, &declared_networks)?
@@ -1239,43 +1245,9 @@ fn parse_service_env(
             )?;
             let content = read_confined_env_file(&path, svc_name)?;
             for (line_no, raw_line) in content.trim_start_matches('\u{feff}').lines().enumerate() {
-                if raw_line.contains('\0') {
-                    return Err(SandboxError::InvalidSpec(format!(
-                        "env_file {}:{} contains forbidden NUL byte",
-                        path.display(),
-                        line_no + 1
-                    )));
+                if let Some((key, val)) = parse_env_file_line(raw_line, &path, line_no)? {
+                    env.insert(key, val);
                 }
-                let trimmed = raw_line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-                let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
-                let Some((k, v)) = stripped.split_once('=') else {
-                    return Err(SandboxError::InvalidSpec(format!(
-                        "invalid env_file entry at {}:{}: expected KEY=VALUE",
-                        path.display(),
-                        line_no + 1
-                    )));
-                };
-                let key = k.trim();
-                if key.is_empty() || key.contains(|c: char| c.is_whitespace() || c == '=') {
-                    return Err(SandboxError::InvalidSpec(format!(
-                        "invalid env_file key at {}:{}",
-                        path.display(),
-                        line_no + 1
-                    )));
-                }
-                let v_trimmed = v.trim();
-                let val = if v_trimmed.len() >= 2
-                    && ((v_trimmed.starts_with('"') && v_trimmed.ends_with('"'))
-                        || (v_trimmed.starts_with('\'') && v_trimmed.ends_with('\'')))
-                {
-                    &v_trimmed[1..v_trimmed.len() - 1]
-                } else {
-                    v_trimmed
-                };
-                env.insert(key.to_owned(), val.to_owned());
             }
         }
     }
@@ -1287,6 +1259,120 @@ fn parse_service_env(
     }
 
     Ok(env)
+}
+
+fn strip_unquoted_inline_comment(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    for idx in 1..bytes.len() {
+        if bytes[idx] == b'#' && bytes[idx - 1].is_ascii_whitespace() {
+            return &raw[..idx - 1];
+        }
+    }
+    raw
+}
+
+fn parse_env_file_value(raw_val: &str) -> String {
+    let trimmed = raw_val.trim();
+    if let Some(after_open) = trimmed.strip_prefix('\'') {
+        if let Some(close_idx) = after_open.find('\'') {
+            let tail = after_open[close_idx + 1..].trim();
+            if tail.is_empty() || tail.starts_with('#') {
+                return after_open[..close_idx].to_owned();
+            }
+        }
+    } else if let Some(after_open) = trimmed.strip_prefix('"') {
+        let mut unescaped = String::new();
+        let mut chars = after_open.char_indices();
+        let mut closed_at = None;
+        while let Some((idx, ch)) = chars.next() {
+            match ch {
+                '"' => {
+                    closed_at = Some(idx);
+                    break;
+                }
+                '\\' => {
+                    if let Some((_, esc)) = chars.next() {
+                        match esc {
+                            '"' => unescaped.push('"'),
+                            '\\' => unescaped.push('\\'),
+                            'n' => unescaped.push('\n'),
+                            'r' => unescaped.push('\r'),
+                            't' => unescaped.push('\t'),
+                            other => {
+                                unescaped.push('\\');
+                                unescaped.push(other);
+                            }
+                        }
+                    } else {
+                        unescaped.push('\\');
+                    }
+                }
+                other => unescaped.push(other),
+            }
+        }
+        if let Some(close_idx) = closed_at {
+            let tail = after_open[close_idx + 1..].trim();
+            if tail.is_empty() || tail.starts_with('#') {
+                return unescaped;
+            }
+        }
+    }
+
+    let cleaned = strip_unquoted_inline_comment(raw_val).trim();
+    if cleaned.len() >= 2
+        && ((cleaned.starts_with('"') && cleaned.ends_with('"'))
+            || (cleaned.starts_with('\'') && cleaned.ends_with('\'')))
+    {
+        cleaned[1..cleaned.len() - 1].to_owned()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn parse_env_file_line(
+    raw_line: &str,
+    path: &Path,
+    line_no: usize,
+) -> Result<Option<(String, String)>, SandboxError> {
+    if raw_line.contains('\0') {
+        return Err(SandboxError::InvalidSpec(format!(
+            "env_file {}:{} contains forbidden NUL byte",
+            path.display(),
+            line_no + 1
+        )));
+    }
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(None);
+    }
+    let stripped = match trimmed.strip_prefix("export") {
+        Some(rest) if rest.chars().next().is_some_and(|c| c.is_ascii_whitespace()) => {
+            rest.trim_start()
+        }
+        _ => trimmed,
+    };
+    let Some((k, v)) = stripped.split_once('=') else {
+        return Err(SandboxError::InvalidSpec(format!(
+            "invalid env_file entry at {}:{}: expected KEY=VALUE",
+            path.display(),
+            line_no + 1
+        )));
+    };
+    let key = k.trim();
+    if !is_valid_env_key(key) {
+        return Err(SandboxError::InvalidSpec(format!(
+            "invalid env_file key at {}:{}",
+            path.display(),
+            line_no + 1
+        )));
+    }
+    Ok(Some((key.to_owned(), parse_env_file_value(v))))
 }
 
 fn read_confined_env_file(path: &Path, svc_name: &str) -> Result<String, SandboxError> {
@@ -2001,8 +2087,8 @@ fn build_container_create_payload(spec: &ComposeSpec, svc: &ServiceSpec) -> Valu
         );
     }
 
-    if matches!(svc.network_mode.as_deref(), Some("none")) {
-        hc.insert("NetworkMode".to_owned(), Value::String("none".to_owned()));
+    if let Some(ref mode) = svc.network_mode {
+        hc.insert("NetworkMode".to_owned(), Value::String(mode.clone()));
     } else if let Some(primary_net) = svc.networks.first() {
         let actual_net = spec
             .networks
@@ -2900,6 +2986,61 @@ services:
             ),
             Err(SandboxError::InvalidSpec(_))
         ));
+
+        fs::write(proj.join("bad-ident.env"), "1BAD=value\n").unwrap();
+        assert!(matches!(
+            parse_compose_yaml(
+                "services:\n  app:\n    image: alpine\n    env_file: bad-ident.env\n",
+                &proj,
+                Some("demo")
+            ),
+            Err(SandboxError::InvalidSpec(_))
+        ));
+
+        // 6. network_mode: bridge / none+ports / env_file tabs, inline comments & unescaping.
+        let bridge_spec = parse_compose_yaml(
+            "services:\n  web:\n    image: alpine:latest\n    network_mode: bridge\n",
+            &proj,
+            Some("demo"),
+        )
+        .unwrap();
+        assert!(!bridge_spec.networks.contains_key("default"));
+        let bridge_payload =
+            build_container_create_payload(&bridge_spec, &bridge_spec.services["web"]);
+        assert_eq!(bridge_payload["HostConfig"]["NetworkMode"], "bridge");
+        assert!(bridge_payload.get("NetworkingConfig").is_none());
+
+        for invalid_net_yaml in [
+            "services:\n  a:\n    image: alpine\n    network_mode: bridge\n    networks: [default]\n",
+            "services:\n  a:\n    image: alpine\n    network_mode: none\n    ports: [\"8080:80\"]\n",
+            "services:\n  a:\n    image: alpine\n    network_mode: none\n    expose: [\"80\"]\n",
+        ] {
+            assert!(
+                matches!(
+                    parse_compose_yaml(invalid_net_yaml, &proj, Some("demo")),
+                    Err(SandboxError::InvalidSpec(_))
+                ),
+                "expected InvalidSpec for:\n{invalid_net_yaml}"
+            );
+        }
+
+        fs::write(
+            proj.join("rich.env"),
+            "export\tTABBED=one # inline comment\nINLINE_HASH=bar#keep\nEMPTY_COMMENT= # comment\nESCAPED=\"line1\\nline2\\\"q\\\" # keep\" # trailing\nSINGLE_LIT='a\\nb # stay' # comment\n",
+        )
+        .unwrap();
+        let rich_spec = parse_compose_yaml(
+            "services:\n  app:\n    image: alpine\n    env_file: rich.env\n",
+            &proj,
+            Some("demo"),
+        )
+        .unwrap();
+        let rich_env = &rich_spec.services["app"].env;
+        assert_eq!(rich_env["TABBED"], "one");
+        assert_eq!(rich_env["INLINE_HASH"], "bar#keep");
+        assert_eq!(rich_env["EMPTY_COMMENT"], "");
+        assert_eq!(rich_env["ESCAPED"], "line1\nline2\"q\" # keep");
+        assert_eq!(rich_env["SINGLE_LIT"], "a\\nb # stay");
 
         let _ = fs::remove_dir_all(&tmp);
     }

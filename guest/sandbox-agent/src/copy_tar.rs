@@ -1402,39 +1402,39 @@ mod tests {
         let outbound = Arc::new(OutboundQueue::new());
 
         // Construct an entry where the 12-byte ustar octal size is 0, while the PAX
-        // extended header declares size=6 so `entry.size()` catches `6 > max_bytes=4`.
+        // extended header declares size=8192 so `entry.size()` (PAX) catches `8192 > max_bytes=4096`.
         let mut pax_tar = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut pax_tar);
             builder
-                .append_pax_extensions([("size", b"6".as_slice())])
-                .unwrap();
-            let mut hdr = tar::Header::new_ustar();
-            hdr.set_entry_type(tar::EntryType::Regular);
-            hdr.set_size(6);
-            hdr.set_mode(0o644);
-            hdr.set_cksum();
-            // Overwrite octal header size field cleanly via a custom zeroed header after PAX:
-            builder
-                .append_data(&mut hdr, "pax.txt", b"abcdef".as_slice())
+                .append_pax_extensions([("size", b"8192".as_slice())])
                 .unwrap();
             builder.finish().unwrap();
         }
-        // Corrupt only the second header's octal size field (after the 1024-byte PAX entry)
-        // or test directly with max_bytes=4: either way PAX header must be honored.
+        // Strip finish's 1024-byte zero trailer, append raw ustar header with octal size=0, then trailer.
+        pax_tar.truncate(pax_tar.len().saturating_sub(1024));
+        let mut hdr = tar::Header::new_ustar();
+        hdr.set_entry_type(tar::EntryType::Regular);
+        hdr.set_path("pax.txt").unwrap();
+        hdr.set_size(0);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        pax_tar.extend_from_slice(hdr.as_bytes());
+        pax_tar.extend_from_slice(&[0u8; 1024]);
+
         let (handle, rx) = ActiveCopyIn::new();
         handle.push_chunk(pax_tar, true);
         let err_pax = execute_copy_in_with_limits(
             StreamId(20),
             &dst.to_string_lossy(),
-            4,
+            4096,
             16,
             8,
             rx,
             &outbound,
         )
         .unwrap_err();
-        assert!(err_pax.contains("exceeds max_bytes"), "got {err_pax}");
+        assert!(err_pax.contains("extracted payload exceeds max_bytes"), "got {err_pax}");
 
         // Reject Regular entry whose raw path ends with '/'.
         let mut slash_tar = Vec::new();

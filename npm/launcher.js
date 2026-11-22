@@ -1,5 +1,6 @@
 'use strict';
 
+const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
@@ -40,7 +41,7 @@ function run(command) {
     const signalHandlers = [];
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
       const handler = () => {
-        if (!child.killed) {
+        if (child.exitCode === null && child.signalCode === null) {
           try {
             child.kill(sig);
           } catch {
@@ -66,7 +67,13 @@ function run(command) {
     child.on('exit', (code, signal) => {
       cleanupSignals();
       if (signal) {
-        process.kill(process.pid, signal);
+        const signo = os.constants.signals[signal];
+        process.exitCode = typeof signo === 'number' ? 128 + signo : 1;
+        try {
+          process.kill(process.pid, signal);
+        } catch {
+          // Fall back to `process.exitCode` set above if signal re-delivery fails.
+        }
       } else {
         process.exitCode = code ?? 1;
       }

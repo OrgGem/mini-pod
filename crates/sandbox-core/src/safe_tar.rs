@@ -1084,7 +1084,14 @@ fn validate_host_path_components(path: &Path) -> Result<(), SandboxError> {
                 )));
             }
             Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {
+                    if !path.has_root() {
+                        return Err(SandboxError::PolicyViolation(format!(
+                            "refusing drive-relative Windows path '{}'",
+                            path.display()
+                        )));
+                    }
+                }
                 Prefix::DeviceNS(_)
                 | Prefix::UNC(..)
                 | Prefix::VerbatimUNC(..)
@@ -2096,6 +2103,8 @@ mod tests {
             Path::new(r"\\?\foo.txt"),
             Path::new(r"\\server\share\file.txt"),
             Path::new(r"\\?\UNC\server\share\file.txt"),
+            Path::new("C:foo"),
+            Path::new("C:"),
         ] {
             assert!(
                 matches!(
@@ -2117,5 +2126,52 @@ mod tests {
                 ok.display()
             );
         }
+    }
+
+    #[test]
+    fn counting_reader_tracks_exact_bytes_across_short_reads() {
+        struct ShortChunkReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            step: usize,
+        }
+        impl Read for ShortChunkReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.step).min(self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let payload = b"fragmented-short-read-payload-12345";
+        let mut reader = CountingReader {
+            inner: ShortChunkReader {
+                data: payload,
+                pos: 0,
+                step: 2,
+            },
+            bytes_read: 0,
+        };
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+        assert_eq!(reader.bytes_read, payload.len() as u64);
+
+        let mut truncated = CountingReader {
+            inner: ShortChunkReader {
+                data: &payload[..10],
+                pos: 0,
+                step: 3,
+            }
+            .take(payload.len() as u64),
+            bytes_read: 0,
+        };
+        let mut trunc_out = Vec::new();
+        truncated.read_to_end(&mut trunc_out).unwrap();
+        assert_ne!(truncated.bytes_read, payload.len() as u64);
     }
 }

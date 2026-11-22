@@ -181,3 +181,82 @@ test('Unix launcher asynchronously forwards SIGTERM to spawned child', { skip: p
   assert.equal(code, 0);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'caught');
 });
+
+test('Unix launcher forwards multiple escalating signals and propagates uncaught child signal exit', { skip: process.platform === 'win32' }, async t => {
+  const root = tempDir(t);
+  const stagedMain = path.join(root, 'staged-main');
+  stage('main', main.version, stagedMain);
+  const installRoot = path.join(root, 'install', 'node_modules', '@orggem');
+  const installedMain = path.join(installRoot, 'mini-pod');
+  fs.mkdirSync(installRoot, { recursive: true });
+  fs.cpSync(stagedMain, installedMain, { recursive: true });
+
+  const glibcVersion = process.platform === 'linux'
+    ? process.report.getReport().header.glibcVersionRuntime
+    : undefined;
+  const binaryPackageName = platformPackage(process.platform, process.arch, glibcVersion).split('/')[1];
+  const binaryPackage = path.join(installRoot, binaryPackageName);
+  const binaryDirectory = path.join(binaryPackage, 'bin');
+  fs.mkdirSync(binaryDirectory, { recursive: true });
+  fs.writeFileSync(path.join(binaryPackage, 'package.json'), JSON.stringify({ name: `@orggem/${binaryPackageName}`, version: main.version }));
+  const marker = path.join(root, 'escalation.marker');
+  const fakeBinary = path.join(binaryDirectory, 'sandbox-cli');
+  fs.writeFileSync(fakeBinary, [
+    '#!/usr/bin/env node',
+    'const fs = require("node:fs");',
+    `const marker = ${JSON.stringify(marker)};`,
+    'if (process.argv.includes("--sigkill")) { process.kill(process.pid, "SIGKILL"); }',
+    'process.on("SIGINT", () => { fs.appendFileSync(marker, "sigint;"); });',
+    'process.on("SIGTERM", () => { fs.appendFileSync(marker, "sigterm"); process.exit(0); });',
+    'process.stdout.write("READY\\n");',
+    'setInterval(() => {}, 1000);',
+    '',
+  ].join('\n'));
+  fs.chmodSync(fakeBinary, 0o755);
+
+  const child = spawn(process.execPath, [path.join(installedMain, 'bin', 'sandbox-cli.js')], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for READY, stdout=${stdout}`)), 5000);
+    child.stdout.on('data', chunk => {
+      stdout += chunk.toString('utf8');
+      if (stdout.includes('READY\n')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    child.on('error', reject);
+  });
+
+  child.kill('SIGINT');
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').includes('sigint;')) {
+      break;
+    }
+    await new Promise(r => setTimeout(r, 20));
+  }
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'sigint;');
+
+  // Escalate with SIGTERM after child handled/ignored SIGINT.
+  child.kill('SIGTERM');
+  const [code, signal] = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for escalated exit')), 5000);
+    child.on('exit', (c, s) => {
+      clearTimeout(timer);
+      resolve([c, s]);
+    });
+  });
+  assert.equal(signal, null);
+  assert.equal(code, 0);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'sigint;sigterm');
+
+  const killedRun = spawnSync(
+    process.execPath,
+    [path.join(installedMain, 'bin', 'sandbox-cli.js'), '--sigkill'],
+    { encoding: 'utf8' },
+  );
+  assert.ok(killedRun.signal === 'SIGKILL' || killedRun.status === 128 + os.constants.signals.SIGKILL);
+});

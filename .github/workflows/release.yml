@@ -103,6 +103,7 @@ jobs:
           chmod 0755 "${STAGE_DIR}/sandboxd" "${STAGE_DIR}/sandbox-cli" "${STAGE_DIR}/bundle-pack"
           cp README.md BRD.md docs/release-candidate-v0.1.0.md "${STAGE_DIR}/"
 
+          chmod 0755 "${STAGE_DIR}"
           ARCHIVE_NAME="${STAGE_DIR}.tar.gz"
           tar -czf "dist/${ARCHIVE_NAME}" "${STAGE_DIR}"
           (
@@ -370,6 +371,7 @@ jobs:
               done
             '
 
+          chmod 0755 "${STAGE_DIR}"
           ARCHIVE_NAME="${STAGE_DIR}.tar.gz"
           tar -czf "dist/${ARCHIVE_NAME}" "${STAGE_DIR}"
           (
