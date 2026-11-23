@@ -1656,7 +1656,7 @@ impl LocalRuntimeManager {
             if st.cancelled {
                 let mut newly_recorded = false;
                 if let Some((p, t)) = identity {
-                    if st.pid != Some(p) || st.start_token != Some(t) {
+                    if st.pid.is_none() || st.start_token.is_none() {
                         st.pid = Some(p);
                         st.start_token = Some(t);
                         newly_recorded = true;
@@ -6476,7 +6476,7 @@ mod tests {
         let state_dir = tmp.path().join("state");
         let ext_path = tmp.path().join("attempt1-ext.sock");
         let overlay = Arc::new(MockOverlayStore::default());
-        let journal = JournalStore::new(&state_dir.join("journals")).unwrap();
+        let journal = JournalStore::new(state_dir.join("journals")).unwrap();
         let vm = Arc::new(TwoAttemptVm {
             ext_path: ext_path.clone(),
             saw_ext_after_reset: AtomicBool::new(false),

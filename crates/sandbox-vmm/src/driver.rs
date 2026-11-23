@@ -2075,7 +2075,6 @@ async fn pump_tunnel_outbound(
     let mut buf = vec![0u8; MAX_HOST_STREAM_CHUNK_BYTES];
     let mut stdin_eof = false;
     let mut remote_eof = false;
-    let mut host_dropped = false;
     let mut need_stream_close = false;
     let mut remote_abort_done = false;
     let mut linger_deadline: Option<tokio::time::Instant> = None;
@@ -2098,7 +2097,7 @@ async fn pump_tunnel_outbound(
                     Ok(true) => {
                         need_stream_close = true;
                         remote_eof = true;
-                        if stdin_eof || !host_dropped {
+                        if stdin_eof {
                             break;
                         }
                     }
@@ -2110,7 +2109,7 @@ async fn pump_tunnel_outbound(
                     Some(dl) => tokio::time::sleep_until(dl).await,
                     None => std::future::pending::<()>().await,
                 }
-            }, if linger_deadline.is_some() && !remote_eof => {
+            }, if linger_deadline.is_some() => {
                 need_stream_close = true;
                 break;
             }
@@ -2132,7 +2131,6 @@ async fn pump_tunnel_outbound(
                 }
             }, if drop_rx.is_some() => {
                 drop_rx = None;
-                host_dropped = true;
                 let graceful_write = matches!(res, Ok(true));
                 // Only abort with `StreamClose` immediately on ungraceful drop without write
                 // `shutdown()`. On graceful write shutdown, drain remaining `read_half` data and
@@ -2145,9 +2143,7 @@ async fn pump_tunnel_outbound(
                     }
                     return;
                 }
-                if stdin_eof && !remote_eof {
-                    linger_deadline = Some(tokio::time::Instant::now() + linger_duration);
-                }
+                linger_deadline = Some(tokio::time::Instant::now() + linger_duration);
             }
             read_res = async {
                 let cap = stdin_credits.wait_available(MAX_HOST_STREAM_CHUNK_BYTES).await?;
@@ -2169,9 +2165,6 @@ async fn pump_tunnel_outbound(
                         stdin_eof = true;
                         if need_stream_close {
                             break;
-                        }
-                        if host_dropped && !remote_eof && linger_deadline.is_none() {
-                            linger_deadline = Some(tokio::time::Instant::now() + linger_duration);
                         }
                     }
                     Some(Ok(n)) => {
@@ -2197,13 +2190,22 @@ async fn pump_tunnel_outbound(
 
     stdin_credits.close();
     if need_stream_close {
-        // Wait for queued `Lane::Data` Stdin frames to hit the wire before sending `StreamClose`.
-        outbound.wait_stream_data_flushed(stream_id).await;
+        // Wait for queued `Lane::Data` Stdin frames to hit the wire before sending `StreamClose`,
+        // bounded by the linger deadline so a wedged transport cannot stall permit cleanup.
+        let flush_deadline =
+            linger_deadline.unwrap_or_else(|| tokio::time::Instant::now() + linger_duration);
+        let _ = tokio::time::timeout_at(
+            flush_deadline,
+            outbound.wait_stream_data_flushed(stream_id),
+        )
+        .await;
+    }
+    lock_unpoisoned(&ops).remove(&stream_id);
+    if need_stream_close {
         if let Ok(frame) = Frame::from_message(stream_id, &Message::StreamClose) {
             let _ = outbound.enqueue_control(frame);
         }
     }
-    lock_unpoisoned(&ops).remove(&stream_id);
 }
 
 async fn enqueue_exec_stdin_frame(
@@ -5234,6 +5236,8 @@ mod tests {
 
         let listener = AgentIpcEndpoint::bind_temp("drv-egress-reap").unwrap();
         let sock_path = listener.socket_path().to_path_buf();
+        let (phase2_tx, phase2_rx) = std::sync::mpsc::channel::<()>();
+        let (sid2_done_tx, sid2_done_rx) = oneshot::channel::<()>();
 
         let guest_thread = thread::spawn(move || {
             let mut client = IpcStream::connect(&sock_path).unwrap();
@@ -5256,7 +5260,10 @@ mod tests {
                 }
             }
 
-            // 2. Guest keeps flooding data after host graceful shutdown + drop -> receives StreamClose.
+            phase2_rx.recv().unwrap();
+
+            // 2. Guest keeps flooding data after host writes response + graceful shutdown + drop ->
+            //    receives buffered response bytes BEFORE StreamClose.
             let sid2 = StreamId(GUEST_STREAM_ID_BIT | 2);
             write_frame(&mut client, &Frame::from_message(sid2, &Message::EgressOpen).unwrap())
                 .unwrap();
@@ -5280,13 +5287,31 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+            let mut sid2_resp = Vec::new();
             loop {
                 let f = read_frame(&mut client).unwrap();
-                if matches!(f.decode_message(), Ok(Message::StreamClose)) {
-                    assert_eq!(f.header.stream_id, sid2);
-                    break;
+                match f.decode_message().unwrap() {
+                    Message::StreamData {
+                        channel: StreamChannel::Stdin,
+                        data,
+                        ..
+                    } => {
+                        assert_eq!(f.header.stream_id, sid2);
+                        sid2_resp.extend_from_slice(&data);
+                    }
+                    Message::StreamCredit {
+                        channel: StreamChannel::Stdout,
+                        ..
+                    } => {}
+                    Message::StreamClose => {
+                        assert_eq!(f.header.stream_id, sid2);
+                        break;
+                    }
+                    other => panic!("unexpected frame on sid2: {other:?}"),
                 }
             }
+            assert_eq!(sid2_resp, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            let _ = sid2_done_tx.send(());
             while read_frame(&mut client).is_ok() {}
         });
 
@@ -5311,11 +5336,14 @@ mod tests {
         .await
         .expect("abandoned egress permit must be reaped after graceful shutdown+drop");
 
-        // Stream 2: call shutdown() and drop while guest writes to trigger BrokenPipe abort path.
+        phase2_tx.send(()).unwrap();
+
+        // Stream 2: write response, call shutdown(), and drop while guest writes to trigger abort path.
         let mut s2 = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
             .await
             .unwrap()
             .unwrap();
+        s2.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await.unwrap();
         s2.shutdown().await.unwrap();
         drop(s2);
 
@@ -5326,6 +5354,11 @@ mod tests {
         })
         .await
         .expect("flooding egress permit must be reaped after host drop");
+
+        tokio::time::timeout(Duration::from_secs(2), sid2_done_rx)
+            .await
+            .expect("guest must receive response and StreamClose before force_kill")
+            .unwrap();
 
         session.force_kill().await.unwrap();
         guest_thread.join().unwrap();
@@ -5344,9 +5377,10 @@ mod tests {
             },
         )
         .unwrap();
-        for _ in 0..5 {
+        for _ in 0..4 {
             outbound.enqueue_data(filler.clone()).await.unwrap();
         }
+        assert!(lock_unpoisoned(&outbound.state).queue.data_bytes() >= MAX_OUTBOUND_DATA_QUEUE_BYTES);
 
         let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
         let (stdin_tx, mut stdin_rx) = mpsc::channel(4);
@@ -5368,6 +5402,14 @@ mod tests {
         stdin_tx.send(vec![b'z'; 32]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel_tx.send(()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lock_unpoisoned(&outbound.state).queue.control_len() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("ExecCancel must be enqueued on control lane while data lane is full");
 
         let popped = tokio::task::spawn_blocking(move || outbound.pop_blocking().unwrap())
             .await
