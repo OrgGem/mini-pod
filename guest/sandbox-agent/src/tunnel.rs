@@ -601,7 +601,10 @@ mod tests {
         }
 
         assert!(ack_seen);
-        assert_eq!(stdin_credit_bytes, 5);
+        assert_eq!(
+            stdin_credit_bytes,
+            stream_frame_credit_cost(b"PING ".len()) as u64
+        );
         assert!(eof_seen);
         assert_eq!(received.len(), 70_005);
         assert!(received[..70_000].iter().all(|&b| b == b'A'));

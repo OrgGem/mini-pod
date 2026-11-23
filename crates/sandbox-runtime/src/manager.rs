@@ -1658,21 +1658,19 @@ impl LocalRuntimeManager {
             for path in &merged {
                 push_unique_path(&mut st.artifacts, path);
             }
-            if let Some((p, t)) = identity {
-                st.pid = Some(p);
-                st.start_token = Some(t);
-            } else if !st.cancelled {
-                st.pid = None;
-                st.start_token = None;
-            }
-            let (pid, start_token) = (st.pid, st.start_token);
-            let merged_snapshot = st.artifacts.clone();
             if st.cancelled {
+                let mut newly_recorded = false;
+                if let Some((p, t)) = identity {
+                    if st.pid.is_none() || st.start_token.is_none() {
+                        st.pid = Some(p);
+                        st.start_token = Some(t);
+                        newly_recorded = true;
+                    }
+                }
+                let (pid, start_token) = (st.pid, st.start_token);
+                let merged_snapshot = st.artifacts.clone();
                 drop(st);
-                if pid.is_some()
-                    && start_token.is_some()
-                    && manager_alive_for_hook.load(Ordering::Acquire)
-                {
+                if newly_recorded && manager_alive_for_hook.load(Ordering::Acquire) {
                     let _ = journal_for_hook.write_record(&JournalRecord {
                         sandbox_id: id_for_hook.clone(),
                         state: JournalLifecycleState::Spawning,
@@ -1684,6 +1682,12 @@ impl LocalRuntimeManager {
                 }
                 return Err(SandboxError::Transport("spawn cancelled".to_owned()));
             }
+            let (pid, start_token) = match identity {
+                Some((p, t)) => (Some(p), Some(t)),
+                None => (None, None),
+            };
+            st.pid = pid;
+            st.start_token = start_token;
             drop(st);
             journal_for_hook.write_record(&JournalRecord {
                 sandbox_id: id_for_hook.clone(),
