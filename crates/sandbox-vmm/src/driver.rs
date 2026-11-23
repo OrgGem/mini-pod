@@ -16,7 +16,7 @@ use sandbox_core::{
 use sandbox_protocol::{
     is_guest_stream_id, read_frame, stream_frame_credit_cost, write_frame, ExecTargetWire, Frame,
     Lane, Message, PriorityFrameQueue, StreamChannel, StreamId, StreamTargetWire,
-    HOST_STREAM_ID_MAX, INITIAL_STREAM_CREDIT_BYTES,
+    HOST_STREAM_ID_MAX, INITIAL_STREAM_CREDIT_BYTES, STREAM_FRAME_OVERHEAD_BYTES,
 };
 use sandbox_runtime::{
     validate_guest_path, ExecOutputChunk, ExecStream, OutputStreamKind, TunnelStream,
@@ -235,6 +235,9 @@ fn boot_single_attempt(
     qemu_bin: &Path,
     accel: Accelerator,
 ) -> Result<VmBootOutcome, SandboxError> {
+    // Check cancellation before binding sockets or directories (especially before fallback attempts).
+    boot_cfg.record_boot_progress(None, &[])?;
+
     let (endpoint, mut artifact_paths) = bind_agent_endpoint(driver_cfg, &boot_cfg.work_dir)?;
     let socket_path = endpoint.socket_path().to_path_buf();
 
@@ -599,11 +602,13 @@ impl StdinCreditWindow {
         self.notify.notify_waiters();
     }
 
-    /// Cancel-safe wait for at least 1 byte of `Stdin` credit without deducting it yet.
+    /// Cancel-safe wait for at least 1 payload byte of `Stdin` credit (excluding frame overhead)
+    /// without deducting it yet.
     async fn wait_available(&self, max_chunk: usize) -> Option<usize> {
         if max_chunk == 0 {
             return Some(0);
         }
+        let overhead = STREAM_FRAME_OVERHEAD_BYTES as u64;
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -613,8 +618,8 @@ impl StdinCreditWindow {
                 if guard.closed {
                     return None;
                 }
-                if guard.available > 0 {
-                    let allowed = usize::try_from(guard.available).unwrap_or(usize::MAX);
+                if guard.available > overhead {
+                    let allowed = usize::try_from(guard.available - overhead).unwrap_or(usize::MAX);
                     return Some(max_chunk.min(allowed));
                 }
             }
@@ -626,8 +631,9 @@ impl StdinCreditWindow {
         if bytes == 0 {
             return;
         }
+        let cost = stream_frame_credit_cost(bytes) as u64;
         let mut guard = lock_unpoisoned(&self.state);
-        guard.available = guard.available.saturating_sub(bytes as u64);
+        guard.available = guard.available.saturating_sub(cost);
     }
 }
 
@@ -757,9 +763,10 @@ pub struct QemuVmSession {
     pid: u32,
     accelerator: Option<Accelerator>,
     start_token: u64,
+    has_process: bool,
     io_timeout: Duration,
     artifact_paths: Vec<PathBuf>,
-    process: Mutex<Option<ConfinedProcess>>,
+    process: Arc<Mutex<Option<ConfinedProcess>>>,
     endpoint: Mutex<Option<AgentIpcEndpoint>>,
     stream_shutdown: Mutex<Option<IpcReadHalf>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
@@ -771,15 +778,16 @@ pub struct QemuVmSession {
     active_guest_egress: Arc<AtomicUsize>,
     pending_network_ack: Arc<NetworkAckSlot>,
     network_cfg_lock: AsyncMutex<()>,
+    shutdown_lock: Arc<AsyncMutex<()>>,
     session_closed_tx: watch::Sender<Option<String>>,
     transport_closed: Arc<AtomicBool>,
-    alive: AtomicBool,
+    alive: Arc<AtomicBool>,
     next_stream_id: AtomicU32,
 }
 
 impl Drop for QemuVmSession {
     fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
+        let was_alive = self.alive.swap(false, Ordering::AcqRel);
         self.outbound.close(Some("session dropped".to_owned()));
         let _ = self
             .session_closed_tx
@@ -790,6 +798,9 @@ impl Drop for QemuVmSession {
         }
         if let Some(mut process) = lock_unpoisoned(&self.process).take() {
             let _ = process.kill_and_wait();
+        } else if self.has_process && was_alive {
+            // Wake any detached `graceful_shutdown` blocking wait if the session dropped mid-flight.
+            let _ = kill_verified_orphan_process(self.pid, self.start_token);
         }
         self.teardown_ipc_and_threads();
     }
@@ -807,6 +818,7 @@ impl QemuVmSession {
         start_token: u64,
         egress_tx: Option<mpsc::Sender<TunnelStream>>,
     ) -> Result<Self, SandboxError> {
+        let has_process = process.is_some();
         // Blocking reader waits indefinitely for async guest output; bounded writes guard against stalls.
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(io_timeout))?;
@@ -870,9 +882,10 @@ impl QemuVmSession {
             pid,
             accelerator: None,
             start_token,
+            has_process,
             io_timeout,
             artifact_paths,
-            process: Mutex::new(process),
+            process: Arc::new(Mutex::new(process)),
             endpoint: Mutex::new(endpoint),
             stream_shutdown: Mutex::new(Some(stream_shutdown)),
             reader_thread: Mutex::new(Some(reader_thread)),
@@ -884,9 +897,10 @@ impl QemuVmSession {
             active_guest_egress,
             pending_network_ack,
             network_cfg_lock: AsyncMutex::new(()),
+            shutdown_lock: Arc::new(AsyncMutex::new(())),
             session_closed_tx,
             transport_closed,
-            alive: AtomicBool::new(true),
+            alive: Arc::new(AtomicBool::new(true)),
             next_stream_id: AtomicU32::new(1),
         })
     }
@@ -1018,16 +1032,33 @@ impl VmSessionPort for QemuVmSession {
                 }
                 Ok(None) | Err(_) => true,
             }
+        } else if self.has_process {
+            // Process handle is temporarily checked out under `shutdown_lock` and not confirmed exited yet.
+            true
         } else {
             !self.transport_closed.load(Ordering::Acquire)
         }
     }
 
     fn confirmed_exited(&self) -> Result<bool, SandboxError> {
+        if !self.has_process {
+            return Err(SandboxError::Internal(
+                "VM process handle is unavailable".to_owned(),
+            ));
+        }
+        if !self.alive.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         let mut process = lock_unpoisoned(&self.process);
         match process.as_mut() {
-            Some(process) => Ok(process.try_wait()?.is_some()),
-            None => Err(SandboxError::Internal("VM process handle is unavailable".to_owned())),
+            Some(proc_ref) => {
+                let exited = proc_ref.try_wait()?.is_some();
+                if exited {
+                    self.alive.store(false, Ordering::Release);
+                }
+                Ok(exited)
+            }
+            None => Ok(!self.alive.load(Ordering::Acquire)),
         }
     }
 
@@ -1542,7 +1573,9 @@ impl VmSessionPort for QemuVmSession {
     }
 
     async fn graceful_shutdown(&self, timeout: Duration) -> Result<bool, SandboxError> {
+        let guard = Arc::clone(&self.shutdown_lock).lock_owned().await;
         if !self.alive.load(Ordering::Acquire) {
+            drop(guard);
             self.teardown_ipc_and_threads();
             return Ok(true);
         }
@@ -1550,40 +1583,59 @@ impl VmSessionPort for QemuVmSession {
         let mut closed_rx = self.session_closed_tx.subscribe();
         let _ = self.enqueue_control_message(StreamId(0), &Message::Shutdown);
 
-        let maybe_process = lock_unpoisoned(&self.process).take();
-        let Some(mut process) = maybe_process else {
+        if !self.has_process {
             if closed_rx.borrow().is_none() {
                 let _ = tokio::time::timeout(timeout, closed_rx.changed()).await;
             }
             self.alive.store(false, Ordering::Release);
+            drop(guard);
             self.teardown_ipc_and_threads();
             return Ok(true);
-        };
+        }
 
-        let wait_result = tokio::task::spawn_blocking(move || {
-            let status = process.wait_timeout(timeout);
-            (process, status)
+        let proc_slot = Arc::clone(&self.process);
+        let alive_flag = Arc::clone(&self.alive);
+        // Move `guard` into `spawn_blocking` so cancelling this future still serializes any
+        // subsequent `graceful_shutdown` / `force_kill` until `wait_timeout` returns the handle.
+        let exited = tokio::task::spawn_blocking(move || {
+            let _shutdown_guard = guard;
+            let Some(mut process) = lock_unpoisoned(&proc_slot).take() else {
+                alive_flag.store(false, Ordering::Release);
+                return Ok(true);
+            };
+            match process.wait_timeout(timeout) {
+                Ok(Some(_)) => {
+                    alive_flag.store(false, Ordering::Release);
+                    drop(process);
+                    Ok(true)
+                }
+                Ok(None) => {
+                    if alive_flag.load(Ordering::Acquire) {
+                        *lock_unpoisoned(&proc_slot) = Some(process);
+                        Ok(false)
+                    } else {
+                        let _ = process.kill_and_wait();
+                        Ok(true)
+                    }
+                }
+                Err(err) => {
+                    if alive_flag.load(Ordering::Acquire) {
+                        *lock_unpoisoned(&proc_slot) = Some(process);
+                        Err(err)
+                    } else {
+                        let _ = process.kill_and_wait();
+                        Ok(true)
+                    }
+                }
+            }
         })
         .await
-        .map_err(|err| SandboxError::Internal(format!("graceful_shutdown wait failed: {err}")))?;
+        .map_err(|err| SandboxError::Internal(format!("graceful_shutdown wait failed: {err}")))??;
 
-        let (process, exit_res) = wait_result;
-        match exit_res {
-            Ok(Some(_)) => {
-                self.alive.store(false, Ordering::Release);
-                drop(process);
-                self.teardown_ipc_and_threads();
-                Ok(true)
-            }
-            Ok(None) => {
-                *lock_unpoisoned(&self.process) = Some(process);
-                Ok(false)
-            }
-            Err(err) => {
-                *lock_unpoisoned(&self.process) = Some(process);
-                Err(err)
-            }
+        if exited {
+            self.teardown_ipc_and_threads();
         }
+        Ok(exited)
     }
 
     async fn force_kill(&self) -> Result<(), SandboxError> {
@@ -1596,27 +1648,37 @@ impl VmSessionPort for QemuVmSession {
             let _ = shutdown_half.shutdown();
         }
 
-        let maybe_process = lock_unpoisoned(&self.process).take();
-        let (retained_process, kill_res, exited) = if let Some(mut process) = maybe_process {
+        let guard = Arc::clone(&self.shutdown_lock).lock_owned().await;
+        let (kill_res, exited) = if self.has_process {
+            let proc_slot = Arc::clone(&self.process);
+            let alive_flag = Arc::clone(&self.alive);
             tokio::task::spawn_blocking(move || {
+                let _shutdown_guard = guard;
+                let Some(mut process) = lock_unpoisoned(&proc_slot).take() else {
+                    alive_flag.store(false, Ordering::Release);
+                    return (Ok(()), true);
+                };
                 let res = process.kill_and_wait();
                 let exited = res.is_ok() || matches!(process.try_wait(), Ok(Some(_)));
-                let retained = if exited { None } else { Some(process) };
-                (retained, res, exited)
+                if exited {
+                    alive_flag.store(false, Ordering::Release);
+                    drop(process);
+                } else {
+                    *lock_unpoisoned(&proc_slot) = Some(process);
+                }
+                (res, exited)
             })
             .await
             .map_err(|err| SandboxError::Internal(format!("force_kill task failed: {err}")))?
         } else {
-            (None, Ok(()), true)
+            self.alive.store(false, Ordering::Release);
+            drop(guard);
+            (Ok(()), true)
         };
 
-        if let Some(process) = retained_process {
-            *lock_unpoisoned(&self.process) = Some(process);
-        }
         if !exited {
             return kill_res;
         }
-        self.alive.store(false, Ordering::Release);
 
         let shutdown_half = lock_unpoisoned(&self.stream_shutdown).take();
         let writer = lock_unpoisoned(&self.writer_thread).take();
@@ -4857,5 +4919,98 @@ mod tests {
 
         session.force_kill().await.unwrap();
         guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdin_credit_window_accounts_for_frame_overhead() {
+        let initial = STREAM_FRAME_OVERHEAD_BYTES as u32 + 136;
+        let win = StdinCreditWindow::new(initial);
+        assert_eq!(win.wait_available(1024).await, Some(136));
+
+        // Each 1-byte frame consumes `STREAM_FRAME_OVERHEAD_BYTES + 1` (= 65) credit bytes.
+        win.consume(1);
+        win.consume(1);
+        win.consume(1);
+        // 200 - 195 = 5 bytes remaining (< STREAM_FRAME_OVERHEAD_BYTES + 1): must wait.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), win.wait_available(1))
+                .await
+                .is_err(),
+            "remaining credit <= overhead must block further Stdin sends"
+        );
+
+        win.grant(STREAM_FRAME_OVERHEAD_BYTES as u32);
+        // Now 5 + 64 = 69 bytes available -> allows 5 payload bytes.
+        assert_eq!(win.wait_available(64).await, Some(5));
+        win.consume(5);
+    }
+
+    #[tokio::test]
+    async fn cancelled_graceful_shutdown_serializes_with_force_kill_and_preserves_liveness() {
+        #[cfg(windows)]
+        let launch = ProcessLaunchSpec::new(
+            "cmd.exe",
+            vec![
+                std::ffi::OsString::from("/C"),
+                std::ffi::OsString::from("ping -n 10 127.0.0.1 >NUL"),
+            ],
+        );
+        #[cfg(unix)]
+        let launch = ProcessLaunchSpec::new(
+            "/bin/sh",
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 10"),
+            ],
+        );
+        let proc_handle = ConfinedProcess::spawn(launch).expect("spawn sleeping child");
+        let pid = proc_handle.id();
+        let start_token = proc_handle.start_identity().start_token;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-shutdown-race").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let peer_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::start(
+            Some(proc_handle),
+            None,
+            host_stream,
+            Vec::new(),
+            Duration::from_secs(2),
+            pid,
+            start_token,
+            None,
+        )
+        .unwrap();
+
+        // Cancel `graceful_shutdown` while `wait_timeout(350ms)` is mid-flight inside `spawn_blocking`.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(40),
+            session.graceful_shutdown(Duration::from_millis(350)),
+        )
+        .await;
+        assert!(cancelled.is_err(), "graceful_shutdown should be cancelled mid-wait");
+
+        // While the process handle is checked out under `shutdown_lock`, status must stay consistent.
+        assert!(session.is_alive(), "session must still report alive mid-shutdown");
+        assert!(
+            matches!(session.confirmed_exited(), Ok(false)),
+            "confirmed_exited must not error or report true before exit"
+        );
+
+        // Concurrent/subsequent `force_kill` waits for `shutdown_lock`, reclaims handle, and kills it.
+        session.force_kill().await.expect("force_kill succeeds after cancelled graceful_shutdown");
+        assert!(!session.is_alive());
+        assert!(matches!(session.confirmed_exited(), Ok(true)));
+        assert!(
+            !kill_verified_orphan_process(pid, start_token).unwrap_or(false),
+            "process must already be dead after force_kill"
+        );
+
+        peer_thread.join().unwrap();
     }
 }

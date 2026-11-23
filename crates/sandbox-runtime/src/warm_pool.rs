@@ -344,31 +344,41 @@ impl WarmPoolStore {
     }
 
     pub(crate) fn commit_checkout(&self, sandbox_id: &SandboxId) {
-        let removed = {
+        let (removed, notify_idle) = {
             let mut state = lock_unpoisoned(&self.inner);
             let removed = state.transitioning.remove(sandbox_id);
             state.total_checkouts = state.total_checkouts.saturating_add(1);
-            removed
+            (removed, state.transitioning.is_empty())
         };
         drop(removed);
+        if notify_idle {
+            self.replenish_done_notify.notify_waiters();
+        }
     }
 
     pub(crate) fn abort_checkout(&self, sandbox_id: &SandboxId) {
-        let removed = {
+        let (removed, notify_idle) = {
             let mut state = lock_unpoisoned(&self.inner);
             let removed = state.transitioning.remove(sandbox_id);
             state.total_disposed_dirty = state.total_disposed_dirty.saturating_add(1);
-            removed
+            (removed, state.transitioning.is_empty())
         };
         drop(removed);
+        if notify_idle {
+            self.replenish_done_notify.notify_waiters();
+        }
     }
 
     pub(crate) fn finish_eviction(&self, sandbox_id: &SandboxId) {
-        let removed = {
+        let (removed, notify_idle) = {
             let mut state = lock_unpoisoned(&self.inner);
-            state.transitioning.remove(sandbox_id)
+            let removed = state.transitioning.remove(sandbox_id);
+            (removed, state.transitioning.is_empty())
         };
         drop(removed);
+        if notify_idle {
+            self.replenish_done_notify.notify_waiters();
+        }
     }
 
     pub(crate) fn pop_one_for_eviction(&self) -> Option<WarmEntry> {
@@ -417,8 +427,25 @@ impl WarmPoolStore {
     pub(crate) async fn wait_for_no_replenishing(&self) {
         loop {
             let notified = self.replenish_done_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if lock_unpoisoned(&self.inner).replenishing_vms == 0 {
                 return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_idle_drain(&self) {
+        loop {
+            let notified = self.replenish_done_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = lock_unpoisoned(&self.inner);
+                if state.replenishing_vms == 0 && state.transitioning.is_empty() {
+                    return;
+                }
             }
             notified.await;
         }

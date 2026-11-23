@@ -747,6 +747,14 @@ impl LocalRuntimeManager {
             }
         }
 
+        // Wait for any concurrently checking-out, evicting, or replenishing-rejected entries to finish
+        // transitioning cleanly before returning (bounded so a stuck guest cannot hang shutdown forever).
+        let transition_wait = self
+            .config
+            .graceful_shutdown_timeout
+            .saturating_add(Duration::from_secs(5));
+        let _ = tokio::time::timeout(transition_wait, self.warm_pool.wait_for_idle_drain()).await;
+
         match first_err {
             Some(err) => Err(err),
             None => Ok(drained),
@@ -783,6 +791,7 @@ impl LocalRuntimeManager {
                 active.contains_key(&record.sandbox_id)
                     || self.warm_pool.contains_live_id(&record.sandbox_id)
                     || self.is_in_flight_spawn(&record.sandbox_id)
+                    || lock_unpoisoned(&self.in_flight_destroys).contains_key(&record.sandbox_id)
             };
             if is_live {
                 continue;
@@ -1199,6 +1208,37 @@ enum CheckoutAttempt {
     Err(SandboxError),
 }
 
+struct OwnedAbortTransitionGuard {
+    warm_pool: WarmPoolStore,
+    sandbox_id: SandboxId,
+    is_dirty_checkout: bool,
+    armed: bool,
+}
+
+impl OwnedAbortTransitionGuard {
+    fn new(warm_pool: WarmPoolStore, sandbox_id: SandboxId, is_dirty_checkout: bool) -> Self {
+        Self {
+            warm_pool,
+            sandbox_id,
+            is_dirty_checkout,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for OwnedAbortTransitionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.is_dirty_checkout {
+            self.warm_pool.abort_checkout(&self.sandbox_id);
+        } else {
+            self.warm_pool.finish_eviction(&self.sandbox_id);
+        }
+    }
+}
+
 struct TransitioningCheckoutGuard {
     manager_alive: Arc<AtomicBool>,
     warm_pool: WarmPoolStore,
@@ -1223,6 +1263,8 @@ impl Drop for TransitioningCheckoutGuard {
                 drop(entry);
                 return;
             }
+            let abort_guard =
+                OwnedAbortTransitionGuard::new(warm_pool.clone(), entry.sandbox_id.clone(), true);
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
                     let _ = dispose_warm_entry_with_deps(
@@ -1233,16 +1275,28 @@ impl Drop for TransitioningCheckoutGuard {
                         &overlay,
                         &config,
                         entry,
-                        true,
+                        abort_guard,
                     )
                     .await;
                     warm_pool.notify_replenisher();
                 });
             } else {
-                warm_pool.abort_checkout(&entry.sandbox_id);
+                drop(abort_guard);
                 drop(entry);
             }
         }
+    }
+}
+
+struct BootHookDoneGuard(watch::Sender<bool>);
+
+impl BootHookDoneGuard {
+    fn keep_alive(&self) {}
+}
+
+impl Drop for BootHookDoneGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
     }
 }
 
@@ -1273,6 +1327,7 @@ struct BootCancellationGuard {
     in_flight_guard: Option<InFlightSpawnGuard>,
     warm_guard: Option<WarmReplenishGuard>,
     progress: Arc<Mutex<BootProgressState>>,
+    boot_done_rx: Option<watch::Receiver<bool>>,
     armed: bool,
 }
 
@@ -1304,7 +1359,7 @@ impl Drop for BootCancellationGuard {
                 std::mem::take(&mut st.artifacts),
             )
         };
-        if !self.armed || !self.manager_alive.load(Ordering::Acquire) {
+        if !self.armed {
             return;
         }
         let manager_alive = Arc::clone(&self.manager_alive);
@@ -1327,6 +1382,8 @@ impl Drop for BootCancellationGuard {
         let permit = self.permit.take();
         let in_flight_guard = self.in_flight_guard.take();
         let warm_guard = self.warm_guard.take();
+        let progress = Arc::clone(&self.progress);
+        let boot_done_rx = self.boot_done_rx.take();
 
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.spawn(async move {
@@ -1335,9 +1392,6 @@ impl Drop for BootCancellationGuard {
                 let _warm_guard = warm_guard;
                 let _bundle_guard = bundle_guard;
 
-                if !manager_alive.load(Ordering::Acquire) {
-                    return;
-                }
                 if let Some(session) = session {
                     let graceful = session
                         .graceful_shutdown(config.graceful_shutdown_timeout)
@@ -1349,27 +1403,30 @@ impl Drop for BootCancellationGuard {
                         Ok(())
                     };
                     if kill_res.is_err() && session.is_alive() {
-                        if let Some(permit) = _permit {
-                            let overlay_path = overlay_path.unwrap_or_else(|| work_dir.join("overlay.qcow2"));
-                            let reserved_rss_mb = permit.demand().rss_mb;
-                            let mut active_map = lock_unpoisoned(&active);
-                            active_map.insert(
-                                sandbox_id,
-                                ActiveSandbox {
-                                    session,
-                                    work_dir,
-                                    overlay_path,
-                                    artifact_paths,
-                                    network_policy: spec.network,
-                                    expires_at: Instant::now(),
-                                    reserved_rss_mb,
-                                    host_rss_budget_mb: spec.budget.host_rss_budget_mb,
-                                    host_storage_budget_mb: spec.budget.host_storage_budget_mb,
-                                    egress_proxy: None,
-                                    bundle_guard: _bundle_guard,
-                                    permit,
-                                },
-                            );
+                        if manager_alive.load(Ordering::Acquire) {
+                            if let Some(permit) = _permit {
+                                let overlay_path =
+                                    overlay_path.unwrap_or_else(|| work_dir.join("overlay.qcow2"));
+                                let reserved_rss_mb = permit.demand().rss_mb;
+                                let mut active_map = lock_unpoisoned(&active);
+                                active_map.insert(
+                                    sandbox_id,
+                                    ActiveSandbox {
+                                        session,
+                                        work_dir,
+                                        overlay_path,
+                                        artifact_paths,
+                                        network_policy: spec.network,
+                                        expires_at: Instant::now(),
+                                        reserved_rss_mb,
+                                        host_rss_budget_mb: spec.budget.host_rss_budget_mb,
+                                        host_storage_budget_mb: spec.budget.host_storage_budget_mb,
+                                        egress_proxy: None,
+                                        bundle_guard: _bundle_guard,
+                                        permit,
+                                    },
+                                );
+                            }
                         }
                         return;
                     }
@@ -1377,29 +1434,69 @@ impl Drop for BootCancellationGuard {
                 } else {
                     let mut target_pid = recorded_pid;
                     let mut target_token = recorded_token;
-                    let rec_journal = journal.clone();
-                    let rec_id = sandbox_id.clone();
-                    if let Ok(Ok(Some(rec))) =
-                        tokio::task::spawn_blocking(move || rec_journal.load_record(&rec_id)).await
-                    {
-                        if target_pid.is_none() || target_token.is_none() {
-                            target_pid = rec.pid;
-                            target_token = rec.start_token;
-                        }
-                        for path in rec.artifact_paths {
-                            push_unique_path(&mut artifact_paths, &path);
+                    if manager_alive.load(Ordering::Acquire) {
+                        let rec_journal = journal.clone();
+                        let rec_id = sandbox_id.clone();
+                        if let Ok(Ok(Some(rec))) =
+                            tokio::task::spawn_blocking(move || rec_journal.load_record(&rec_id))
+                                .await
+                        {
+                            if target_pid.is_none() || target_token.is_none() {
+                                target_pid = rec.pid;
+                                target_token = rec.start_token;
+                            }
+                            for path in rec.artifact_paths {
+                                push_unique_path(&mut artifact_paths, &path);
+                            }
                         }
                     }
+                    // Immediately terminate any already-started QEMU process to unblock `boot_vm_blocking`.
+                    let mut kill_failed = false;
+                    let mut attempted_identity: Option<(u32, u64)> = None;
                     if let (Some(pid), Some(start_token)) = (target_pid, target_token) {
-                        if !manager_alive.load(Ordering::Acquire) {
-                            return;
-                        }
+                        attempted_identity = Some((pid, start_token));
                         match vm_runtime.kill_orphan_process(pid, start_token).await {
                             Ok(_) | Err(SandboxError::NotFound(_)) => {}
-                            Err(_) => return,
+                            Err(_) => kill_failed = true,
                         }
                     }
+
+                    // Wait for `boot_vm` (including any `spawn_blocking` thread) to drop its
+                    // `VmBootConfig` before removing overlay/artifacts or releasing permits.
+                    let mut boot_still_running = false;
+                    if let Some(mut rx) = boot_done_rx {
+                        let wait_cap = config.graceful_shutdown_timeout.max(Duration::from_secs(5));
+                        if tokio::time::timeout(wait_cap, rx.wait_for(|done| *done))
+                            .await
+                            .is_err()
+                        {
+                            boot_still_running = true;
+                        }
+                    }
+
+                    // Re-read progress to catch any late PID/token/artifacts recorded right before
+                    // `boot_vm_blocking` observed cancellation.
+                    let (late_pid, late_token, late_artifacts) = {
+                        let mut st = lock_unpoisoned(&progress);
+                        (st.pid, st.start_token, std::mem::take(&mut st.artifacts))
+                    };
+                    for path in late_artifacts {
+                        push_unique_path(&mut artifact_paths, &path);
+                    }
+                    if let (Some(pid), Some(start_token)) = (late_pid, late_token) {
+                        if attempted_identity != Some((pid, start_token)) || kill_failed {
+                            match vm_runtime.kill_orphan_process(pid, start_token).await {
+                                Ok(_) | Err(SandboxError::NotFound(_)) => kill_failed = false,
+                                Err(_) => kill_failed = true,
+                            }
+                        }
+                    }
+
+                    if kill_failed || boot_still_running {
+                        return;
+                    }
                 }
+
                 if !manager_alive.load(Ordering::Acquire) {
                     return;
                 }
@@ -1459,6 +1556,7 @@ impl LocalRuntimeManager {
             in_flight_guard,
             warm_guard,
             progress: Arc::clone(&progress),
+            boot_done_rx: None,
             armed: true,
         };
         if let Err(err) = self
@@ -1540,27 +1638,53 @@ impl LocalRuntimeManager {
         }
 
         let journal_for_hook = self.journal.clone();
+        let manager_alive_for_hook = Arc::clone(&self.alive);
         let id_for_hook = sandbox_id.clone();
         let overlay_for_hook = prepared.overlay_path.clone();
         let work_dir_for_hook = work_dir.clone();
         let progress_for_hook = Arc::clone(&progress);
+        let (boot_done_tx, boot_done_rx) = watch::channel(false);
+        let boot_done_guard = BootHookDoneGuard(boot_done_tx);
+        cancel_guard.boot_done_rx = Some(boot_done_rx);
         let on_boot_progress: PreBootJournalHook = Arc::new(move |identity, boot_artifacts| {
+            // Keep the full `BootHookDoneGuard` inside the hook closure until `VmBootConfig` drops.
+            boot_done_guard.keep_alive();
             let mut st = lock_unpoisoned(&progress_for_hook);
-            if st.cancelled {
-                return Err(SandboxError::Transport("spawn cancelled".to_owned()));
-            }
             let merged = merge_artifact_paths(
                 boot_artifacts,
                 std::slice::from_ref(&overlay_for_hook),
                 &work_dir_for_hook,
             );
-            let (pid, start_token) = match identity {
-                Some((p, t)) => (Some(p), Some(t)),
-                None => (None, None),
-            };
-            st.pid = pid;
-            st.start_token = start_token;
-            st.artifacts = merged.clone();
+            for path in &merged {
+                push_unique_path(&mut st.artifacts, path);
+            }
+            if let Some((p, t)) = identity {
+                st.pid = Some(p);
+                st.start_token = Some(t);
+            } else if !st.cancelled {
+                st.pid = None;
+                st.start_token = None;
+            }
+            let (pid, start_token) = (st.pid, st.start_token);
+            let merged_snapshot = st.artifacts.clone();
+            if st.cancelled {
+                drop(st);
+                if pid.is_some()
+                    && start_token.is_some()
+                    && manager_alive_for_hook.load(Ordering::Acquire)
+                {
+                    let _ = journal_for_hook.write_record(&JournalRecord {
+                        sandbox_id: id_for_hook.clone(),
+                        state: JournalLifecycleState::Spawning,
+                        pid,
+                        start_token,
+                        artifact_paths: merged_snapshot,
+                        expires_at_unix_ms: initial_expires_ms,
+                    });
+                }
+                return Err(SandboxError::Transport("spawn cancelled".to_owned()));
+            }
+            drop(st);
             journal_for_hook.write_record(&JournalRecord {
                 sandbox_id: id_for_hook.clone(),
                 state: JournalLifecycleState::Spawning,
@@ -1581,16 +1705,39 @@ impl LocalRuntimeManager {
         let boot = match self.vm_runtime.boot_vm(boot_cfg).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                drop(prepared.bundle_guard);
-                let recorded = self.load_record_async(sandbox_id.clone()).await.ok().flatten();
-                let rollback_artifacts = match recorded {
-                    Some(rec) => merge_artifact_paths(
-                        &rec.artifact_paths,
-                        &spawn_artifacts,
-                        &work_dir,
-                    ),
-                    None => spawn_artifacts,
+                let (prog_pid, prog_token, prog_artifacts) = {
+                    let mut st = lock_unpoisoned(&progress);
+                    (st.pid, st.start_token, std::mem::take(&mut st.artifacts))
                 };
+                let recorded = self.load_record_async(sandbox_id.clone()).await.ok().flatten();
+                let (mut target_pid, mut target_token) = (prog_pid, prog_token);
+                let mut rollback_artifacts = spawn_artifacts;
+                for path in prog_artifacts {
+                    push_unique_path(&mut rollback_artifacts, &path);
+                }
+                if let Some(rec) = recorded {
+                    if target_pid.is_none() || target_token.is_none() {
+                        target_pid = rec.pid;
+                        target_token = rec.start_token;
+                    }
+                    rollback_artifacts = merge_artifact_paths(
+                        &rec.artifact_paths,
+                        &rollback_artifacts,
+                        &work_dir,
+                    );
+                }
+                if let (Some(pid), Some(start_token)) = (target_pid, target_token) {
+                    match self.vm_runtime.kill_orphan_process(pid, start_token).await {
+                        Ok(_) | Err(SandboxError::NotFound(_)) => {}
+                        Err(_) => {
+                            // Leave the `Spawning` journal with `(pid, start_token)` intact so
+                            // `reconcile_startup()` can reap the surviving process later.
+                            cancel_guard.armed = false;
+                            return Err(err);
+                        }
+                    }
+                }
+                drop(prepared.bundle_guard);
                 self.rollback_spawn(
                     &sandbox_id,
                     Some(&prepared.overlay_path),
@@ -1682,47 +1829,78 @@ impl LocalRuntimeManager {
         artifacts: Vec<PathBuf>,
         expires_at_unix_ms: u64,
     ) {
-        let graceful = session
-            .graceful_shutdown(self.config.graceful_shutdown_timeout)
-            .await
-            .unwrap_or(false);
-        let kill_res = if !graceful && session.is_alive() {
-            session.force_kill().await
-        } else {
-            Ok(())
-        };
-        cancel_guard.session = None;
-        if kill_res.is_err() && session.is_alive() {
-            if let Some(permit) = cancel_guard.permit.take() {
-                let reserved_rss_mb = permit.demand().rss_mb;
-                let restored = ActiveSandbox {
-                    session,
-                    work_dir: cancel_guard.work_dir.clone(),
-                    overlay_path: overlay_path.to_path_buf(),
-                    artifact_paths: artifacts,
-                    network_policy: cancel_guard.spec.network.clone(),
-                    expires_at: Instant::now(),
-                    reserved_rss_mb,
-                    host_rss_budget_mb: cancel_guard.spec.budget.host_rss_budget_mb,
-                    host_storage_budget_mb: cancel_guard.spec.budget.host_storage_budget_mb,
-                    egress_proxy: None,
-                    bundle_guard: cancel_guard.bundle_guard.take(),
-                    permit,
-                };
-                lock_unpoisoned(&self.active).insert(sandbox_id.clone(), restored);
-            }
-            cancel_guard.armed = false;
-            return;
-        }
-        drop(session);
-        self.rollback_spawn(
-            sandbox_id,
-            Some(overlay_path),
-            artifacts,
-            expires_at_unix_ms,
-        )
-        .await;
+        // Disarm `cancel_guard` synchronously before awaiting so cancelling `spawn()` during
+        // teardown never runs a second concurrent `graceful_shutdown` from `Drop`.
         cancel_guard.armed = false;
+        cancel_guard.session = None;
+        let permit_slot = cancel_guard.permit.take();
+        let in_flight_guard = cancel_guard.in_flight_guard.take();
+        let warm_guard = cancel_guard.warm_guard.take();
+        let bundle_guard = cancel_guard.bundle_guard.take();
+        let work_dir = cancel_guard.work_dir.clone();
+        let spec = cancel_guard.spec.clone();
+
+        let active = Arc::clone(&self.active);
+        let manager_alive = Arc::clone(&self.alive);
+        let journal = self.journal.clone();
+        let overlay = Arc::clone(&self.overlay);
+        let config = self.config.clone();
+        let sandbox_id = sandbox_id.clone();
+        let overlay_path = overlay_path.to_path_buf();
+
+        let _ = tokio::spawn(async move {
+            let _permit = permit_slot;
+            let _in_flight_guard = in_flight_guard;
+            let _warm_guard = warm_guard;
+            let _bundle_guard = bundle_guard;
+
+            let graceful = session
+                .graceful_shutdown(config.graceful_shutdown_timeout)
+                .await
+                .unwrap_or(false);
+            let kill_res = if !graceful && session.is_alive() {
+                session.force_kill().await
+            } else {
+                Ok(())
+            };
+            if kill_res.is_err() && session.is_alive() {
+                if manager_alive.load(Ordering::Acquire) {
+                    if let Some(permit) = _permit {
+                        let reserved_rss_mb = permit.demand().rss_mb;
+                        let restored = ActiveSandbox {
+                            session,
+                            work_dir,
+                            overlay_path,
+                            artifact_paths: artifacts,
+                            network_policy: spec.network,
+                            expires_at: Instant::now(),
+                            reserved_rss_mb,
+                            host_rss_budget_mb: spec.budget.host_rss_budget_mb,
+                            host_storage_budget_mb: spec.budget.host_storage_budget_mb,
+                            egress_proxy: None,
+                            bundle_guard: _bundle_guard,
+                            permit,
+                        };
+                        lock_unpoisoned(&active).insert(sandbox_id, restored);
+                    }
+                }
+                return;
+            }
+            drop(session);
+            if manager_alive.load(Ordering::Acquire) {
+                rollback_spawn_with_deps(
+                    &journal,
+                    &overlay,
+                    &config,
+                    &sandbox_id,
+                    Some(&overlay_path),
+                    artifacts,
+                    expires_at_unix_ms,
+                )
+                .await;
+            }
+        })
+        .await;
     }
 
     async fn try_checkout_warm_entry(
@@ -1886,6 +2064,11 @@ impl LocalRuntimeManager {
         let journal = self.journal.clone();
         let overlay = Arc::clone(&self.overlay);
         let config = self.config.clone();
+        let abort_guard = OwnedAbortTransitionGuard::new(
+            warm_pool.clone(),
+            entry.sandbox_id.clone(),
+            abort_transitioning_dirty,
+        );
         tokio::spawn(async move {
             dispose_warm_entry_with_deps(
                 &warm_pool,
@@ -1895,7 +2078,7 @@ impl LocalRuntimeManager {
                 &overlay,
                 &config,
                 entry,
-                abort_transitioning_dirty,
+                abort_guard,
             )
             .await
         })
@@ -2639,23 +2822,8 @@ async fn dispose_warm_entry_with_deps(
     overlay: &Arc<dyn DiskOverlayPort>,
     config: &RuntimeManagerConfig,
     entry: WarmEntry,
-    is_dirty_checkout: bool,
+    mut abort_guard: OwnedAbortTransitionGuard,
 ) -> Result<(), SandboxError> {
-    struct AbortTransitionGuard<'a>(&'a WarmPoolStore, SandboxId, bool, bool);
-
-    impl Drop for AbortTransitionGuard<'_> {
-        fn drop(&mut self) {
-            if !self.3 {
-                return;
-            }
-            if self.2 {
-                self.0.abort_checkout(&self.1);
-            } else {
-                self.0.finish_eviction(&self.1);
-            }
-        }
-    }
-
     let WarmEntry {
         sandbox_id,
         key,
@@ -2669,12 +2837,17 @@ async fn dispose_warm_entry_with_deps(
         permit,
     } = entry;
 
-    let mut abort_guard = AbortTransitionGuard(warm_pool, sandbox_id.clone(), is_dirty_checkout, true);
+    // Bind in strict LIFO order so unwind/abort drops `session` -> `bundle_guard` ->
+    // `abort_guard` -> `permit_slot` and never re-opens admission before QEMU is terminated.
     let mut permit_slot = Some(permit);
+    let overlay_path = prepared.overlay_path;
+    let bundle_guard = prepared.bundle_guard;
+    let session = session;
+    let is_dirty_checkout = abort_guard.is_dirty_checkout;
 
     let merged = merge_artifact_paths(
         &artifact_paths,
-        std::slice::from_ref(&prepared.overlay_path),
+        std::slice::from_ref(&overlay_path),
         &work_dir,
     );
     let expires_ms = unix_now_ms();
@@ -2706,7 +2879,7 @@ async fn dispose_warm_entry_with_deps(
         let restored = ActiveSandbox {
             session,
             work_dir,
-            overlay_path: prepared.overlay_path,
+            overlay_path,
             artifact_paths: merged,
             network_policy: NetworkPolicy::Isolated,
             expires_at: Instant::now(),
@@ -2714,7 +2887,7 @@ async fn dispose_warm_entry_with_deps(
             host_rss_budget_mb: key.budget.host_rss_budget_mb,
             host_storage_budget_mb: key.budget.host_storage_budget_mb,
             egress_proxy: None,
-            bundle_guard: prepared.bundle_guard,
+            bundle_guard,
             permit,
         };
         {
@@ -2726,7 +2899,7 @@ async fn dispose_warm_entry_with_deps(
             } else {
                 warm_pool.finish_eviction(&sandbox_id);
             }
-            abort_guard.3 = false;
+            abort_guard.armed = false;
         }
         return kill_res;
     }
@@ -2739,14 +2912,14 @@ async fn dispose_warm_entry_with_deps(
             overlay,
             config,
             &sandbox_id,
-            Some(&prepared.overlay_path),
+            Some(&overlay_path),
             merged,
             expires_ms,
         )
         .await;
     }
 
-    drop(prepared.bundle_guard);
+    drop(bundle_guard);
     drop(abort_guard);
     drop(permit_slot.take());
     kill_res
@@ -5971,5 +6144,207 @@ mod tests {
         assert!(overlay.removed_paths().contains(&exited_overlay));
         assert_eq!(mgr.current_admission_usage().active_sandboxes, 0);
         assert!(mgr.journal.load_records().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_startup_skips_in_flight_destroy_sandboxes() {
+        let tmp = TestTempDir::new("mgr-reconcile-inflight-destroy");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mgr = LocalRuntimeManager::new(base_config(tmp.path().join("state")), overlay, vm.clone())
+            .unwrap();
+
+        let id = SandboxId::new("sbx-inflight-destroy");
+        let orphan_file = tmp.path().join("still-destroying.tmp");
+        fs::write(&orphan_file, b"keep").unwrap();
+        mgr.journal
+            .write_record(&JournalRecord {
+                sandbox_id: id.clone(),
+                state: JournalLifecycleState::Destroying,
+                pid: Some(4111),
+                start_token: Some(17),
+                artifact_paths: vec![orphan_file.clone()],
+                expires_at_unix_ms: 0,
+            })
+            .unwrap();
+        lock_unpoisoned(&vm.state).live_orphans.insert((4111, 17));
+        let (tx, _rx) = watch::channel(false);
+        lock_unpoisoned(&mgr.in_flight_destroys).insert(id.clone(), tx);
+
+        let skipped = mgr.reconcile_startup().await.unwrap();
+        assert_eq!(skipped.orphans_killed, 0);
+        assert_eq!(skipped.cleaned, 0);
+        assert!(orphan_file.exists(), "artifact owned by in-flight destroy must remain");
+        assert_eq!(mgr.journal.load_records().unwrap().len(), 1);
+
+        lock_unpoisoned(&mgr.in_flight_destroys).remove(&id);
+        let reaped = mgr.reconcile_startup().await.unwrap();
+        assert_eq!(reaped.orphans_killed, 1);
+        assert_eq!(reaped.cleaned, 1);
+        assert!(!orphan_file.exists());
+        assert!(mgr.journal.load_records().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_warm_pool_waits_for_transitioning_checkout_or_eviction() {
+        let tmp = TestTempDir::new("mgr-drain-waits-transitioning");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().join("state"));
+        cfg.warm_pool.target_size = 1;
+        cfg.warm_pool.template_spec = Some(valid_spec(Duration::from_secs(60)));
+        let mgr = Arc::new(LocalRuntimeManager::new(cfg, overlay, vm).unwrap());
+
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+        let transitioning_entry = mgr.warm_pool.pop_one_for_eviction().unwrap();
+
+        let mgr_drain = Arc::clone(&mgr);
+        let drain_task = tokio::spawn(async move { mgr_drain.drain_warm_pool().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain_task.is_finished(),
+            "drain_warm_pool must wait for active transitioning warm VM"
+        );
+
+        mgr.dispose_warm_entry(transitioning_entry).await;
+        let drained = tokio::time::timeout(Duration::from_secs(2), drain_task)
+            .await
+            .expect("drain_warm_pool unblocked once transitioning finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(drained, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_boot_waits_for_blocking_hook_completion_and_kills_late_pid() {
+        struct LatePidBlockingVm {
+            boot_started: Arc<tokio::sync::Notify>,
+            allow_late_pid: Arc<std::sync::atomic::AtomicBool>,
+            kills: Arc<Mutex<Vec<(u32, u64)>>>,
+        }
+        #[async_trait::async_trait]
+        impl VmRuntimePort for LatePidBlockingVm {
+            async fn boot_vm(&self, cfg: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+                let boot_started = Arc::clone(&self.boot_started);
+                let allow_late_pid = Arc::clone(&self.allow_late_pid);
+                tokio::task::spawn_blocking(move || {
+                    cfg.record_boot_progress(None, &[])?;
+                    boot_started.notify_one();
+                    while !allow_late_pid.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    // Delay briefly after cancel so `BootHookDoneGuard` holds `BootCancellationGuard`.
+                    std::thread::sleep(Duration::from_millis(30));
+                    cfg.record_boot_progress(Some((8888, 9999)), &[])?;
+                    unreachable!("cancelled progress hook must return Err")
+                })
+                .await
+                .map_err(|e| SandboxError::Internal(e.to_string()))?
+            }
+
+            async fn kill_orphan_process(&self, pid: u32, token: u64) -> Result<bool, SandboxError> {
+                lock_unpoisoned(&self.kills).push((pid, token));
+                Ok(true)
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-cancel-late-pid");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let boot_started = Arc::new(tokio::sync::Notify::new());
+        let allow_late_pid = Arc::new(AtomicBool::new(false));
+        let kills = Arc::new(Mutex::new(Vec::new()));
+        let vm = Arc::new(LatePidBlockingVm {
+            boot_started: Arc::clone(&boot_started),
+            allow_late_pid: Arc::clone(&allow_late_pid),
+            kills: Arc::clone(&kills),
+        });
+        let mgr = Arc::new(LocalRuntimeManager::new(base_config(tmp.path().join("state")), overlay, vm).unwrap());
+
+        let mgr_spawn = Arc::clone(&mgr);
+        let spawn_task = tokio::spawn(async move {
+            mgr_spawn.spawn(valid_spec(Duration::from_secs(60))).await
+        });
+        boot_started.notified().await;
+        spawn_task.abort();
+        let _ = spawn_task.await;
+
+        // While blocking boot hasn't finished, permit & cleanup remain held; release late PID now.
+        allow_late_pid.store(true, Ordering::Release);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !lock_unpoisoned(&kills).is_empty()
+                    && mgr.current_admission_usage().active_sandboxes == 0
+                    && mgr.journal.load_records().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled boot must wait for blocking thread, kill late PID, and rollback");
+        assert_eq!(lock_unpoisoned(&kills).as_slice(), &[(8888, 9999)]);
+    }
+
+    #[tokio::test]
+    async fn boot_vm_error_reaps_recorded_pid_and_preserves_journal_if_kill_fails() {
+        struct FailAfterPidVm {
+            fail_kill: AtomicBool,
+            kills: Arc<Mutex<Vec<(u32, u64)>>>,
+        }
+        #[async_trait::async_trait]
+        impl VmRuntimePort for FailAfterPidVm {
+            async fn boot_vm(&self, cfg: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+                cfg.record_boot_progress(Some((7777, 5555)), &[])?;
+                Err(SandboxError::Transport("simulated post-spawn handshake error".to_owned()))
+            }
+
+            async fn kill_orphan_process(&self, pid: u32, token: u64) -> Result<bool, SandboxError> {
+                lock_unpoisoned(&self.kills).push((pid, token));
+                if self.fail_kill.load(Ordering::Acquire) {
+                    Err(SandboxError::Transport("simulated EPERM".to_owned()))
+                } else {
+                    Ok(true)
+                }
+            }
+        }
+
+        // Case A: kill fails -> preserve Spawning journal with (7777, 5555) for startup reconciler.
+        let tmp_fail = TestTempDir::new("mgr-boot-err-kill-fails");
+        let vm_fail = Arc::new(FailAfterPidVm {
+            fail_kill: AtomicBool::new(true),
+            kills: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mgr_fail = LocalRuntimeManager::new(
+            base_config(tmp_fail.path().join("state")),
+            Arc::new(MockOverlayStore::default()),
+            vm_fail.clone(),
+        )
+        .unwrap();
+        assert!(mgr_fail.spawn(valid_spec(Duration::from_secs(60))).await.is_err());
+        assert_eq!(lock_unpoisoned(&vm_fail.kills).as_slice(), &[(7777, 5555)]);
+        let recs = mgr_fail.journal.load_records().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].pid, Some(7777));
+        assert_eq!(recs[0].start_token, Some(5555));
+
+        // Case B: kill succeeds -> overlay & journal are cleaned up cleanly.
+        let tmp_ok = TestTempDir::new("mgr-boot-err-kill-ok");
+        let overlay_ok = Arc::new(MockOverlayStore::default());
+        let vm_ok = Arc::new(FailAfterPidVm {
+            fail_kill: AtomicBool::new(false),
+            kills: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mgr_ok = LocalRuntimeManager::new(
+            base_config(tmp_ok.path().join("state")),
+            overlay_ok.clone(),
+            vm_ok.clone(),
+        )
+        .unwrap();
+        assert!(mgr_ok.spawn(valid_spec(Duration::from_secs(60))).await.is_err());
+        assert_eq!(lock_unpoisoned(&vm_ok.kills).as_slice(), &[(7777, 5555)]);
+        assert!(mgr_ok.journal.load_records().unwrap().is_empty());
+        assert!(!overlay_ok.removed_paths().is_empty());
     }
 }

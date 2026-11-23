@@ -137,8 +137,9 @@ impl OutboundQueue {
     pub(crate) fn send_stdin_credit(
         &self,
         stream_id: StreamId,
-        mut bytes: usize,
+        payload_len: usize,
     ) -> Result<(), ProtocolError> {
+        let mut bytes = stream_frame_credit_cost(payload_len);
         while bytes > 0 {
             let chunk = bytes.min(u32::MAX as usize);
             self.push_message(
@@ -196,18 +197,16 @@ impl OutboundQueue {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state
             .credits
-            .entry((stream_id, channel as u8))
-            .or_insert_with(|| u64::from(bytes));
+            .insert((stream_id, channel as u8), u64::from(bytes));
     }
 
     pub(crate) fn grant_credit(&self, stream_id: StreamId, channel: StreamChannel, bytes: u32) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .credits
-            .entry((stream_id, channel as u8))
-            .and_modify(|rem| *rem = rem.saturating_add(u64::from(bytes)))
-            .or_insert_with(|| u64::from(bytes));
-        self.cv.notify_all();
+        // Only top up active seeded streams so late or bogus `StreamCredit` frames never leak map entries.
+        if let Some(rem) = state.credits.get_mut(&(stream_id, channel as u8)) {
+            *rem = rem.saturating_add(u64::from(bytes));
+            self.cv.notify_all();
+        }
     }
 
     pub(crate) fn abort_stream(&self, stream_id: StreamId) {
@@ -384,6 +383,20 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
     writer: &mut W,
     guest_exec_pids_max: Option<u32>,
 ) -> Result<(), ProtocolError> {
+    serve_session_with_initial_stdout_credit(
+        reader,
+        writer,
+        guest_exec_pids_max,
+        INITIAL_STREAM_CREDIT_BYTES,
+    )
+}
+
+fn serve_session_with_initial_stdout_credit<R: Read + Send, W: Write + Send>(
+    reader: &mut R,
+    writer: &mut W,
+    guest_exec_pids_max: Option<u32>,
+    initial_stdout_credit: u32,
+) -> Result<(), ProtocolError> {
     // Guest initiates handshake so virtio-serial never drops early host frames before port open.
     send_message(
         writer,
@@ -497,7 +510,7 @@ pub fn serve_session<R: Read + Send, W: Write + Send>(
                     outbound.seed_default_credit(
                         stream_id,
                         StreamChannel::Stdout,
-                        INITIAL_STREAM_CREDIT_BYTES,
+                        initial_stdout_credit,
                     );
                     outbound.seed_default_credit(
                         stream_id,
@@ -1079,8 +1092,25 @@ mod tests {
         ChannelWriter,
         thread::JoinHandle<Result<(), ProtocolError>>,
     ) {
+        start_test_session_with_stdout_credit(INITIAL_STREAM_CREDIT_BYTES)
+    }
+
+    fn start_test_session_with_stdout_credit(
+        initial_stdout_credit: u32,
+    ) -> (
+        ChannelReader,
+        ChannelWriter,
+        thread::JoinHandle<Result<(), ProtocolError>>,
+    ) {
         let ((mut host_rx, mut host_tx), (mut agent_rx, mut agent_tx)) = duplex_pair();
-        let agent = thread::spawn(move || serve_session(&mut agent_rx, &mut agent_tx, None));
+        let agent = thread::spawn(move || {
+            serve_session_with_initial_stdout_credit(
+                &mut agent_rx,
+                &mut agent_tx,
+                None,
+                initial_stdout_credit,
+            )
+        });
 
         let hello = read_frame(&mut host_rx).expect("guest must emit Hello first");
         assert_eq!(hello.header.stream_id, StreamId(0));
@@ -1918,19 +1948,9 @@ mod tests {
 
     #[test]
     fn stream_credit_enforces_stdout_backpressure() {
-        let (mut host_rx, mut host_tx, agent) = start_test_session();
-
-        // Opt into credit flow control for StreamId(30) Stdout allowing one 10-byte chunk
-        // (`STREAM_FRAME_OVERHEAD_BYTES` + 10 payload bytes).
-        send_message(
-            &mut host_tx,
-            StreamId(30),
-            &Message::StreamCredit {
-                channel: StreamChannel::Stdout,
-                bytes: stream_frame_credit_cost(10) as u32,
-            },
-        )
-        .unwrap();
+        // Opt into credit flow control allowing one 10-byte chunk (`STREAM_FRAME_OVERHEAD_BYTES` + 10).
+        let (mut host_rx, mut host_tx, agent) =
+            start_test_session_with_stdout_credit(stream_frame_credit_cost(10) as u32);
 
         #[cfg(windows)]
         let script = "echo 0123456789abcdefghij";
@@ -2741,5 +2761,51 @@ mod tests {
         assert_eq!(extra.header.stream_id, stream_id);
         worker.join().unwrap();
         outbound.finish_and_drain();
+    }
+
+    #[test]
+    fn grant_credit_ignores_unknown_and_cleared_streams_and_send_stdin_credit_adds_overhead() {
+        let outbound = OutboundQueue::new();
+        let bogon = StreamId(999);
+        outbound.grant_credit(bogon, StreamChannel::Stdout, 4096);
+        assert!(
+            outbound.state.lock().unwrap().credits.is_empty(),
+            "StreamCredit for unseeded/unknown stream must not insert credits"
+        );
+
+        let sid = StreamId(34);
+        outbound.seed_default_credit(sid, StreamChannel::Stdout, 100);
+        outbound.grant_credit(sid, StreamChannel::Stdout, 50);
+        assert_eq!(
+            outbound
+                .state
+                .lock()
+                .unwrap()
+                .credits
+                .get(&(sid, StreamChannel::Stdout as u8))
+                .copied(),
+            Some(150)
+        );
+        outbound.clear_stream(sid);
+        outbound.grant_credit(sid, StreamChannel::Stdout, 500);
+        assert!(
+            outbound.state.lock().unwrap().credits.is_empty(),
+            "late StreamCredit after clear_stream must not re-insert stream entry"
+        );
+
+        outbound.send_stdin_credit(sid, 0).unwrap();
+        outbound.send_stdin_credit(sid, 10).unwrap();
+        outbound.finish_and_drain();
+        let frame = outbound
+            .pop_for_writer()
+            .expect("non-zero payload must emit StreamCredit");
+        assert_eq!(
+            frame.decode_message().unwrap(),
+            Message::StreamCredit {
+                channel: StreamChannel::Stdin,
+                bytes: stream_frame_credit_cost(10) as u32,
+            }
+        );
+        assert!(outbound.pop_for_writer().is_none());
     }
 }

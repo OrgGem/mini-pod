@@ -10,7 +10,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use sandbox_protocol::{Message, ProtocolError, StreamChannel, StreamId, StreamTargetWire};
+use sandbox_protocol::{
+    stream_frame_credit_cost, Message, ProtocolError, StreamChannel, StreamId, StreamTargetWire,
+};
 
 use crate::podman::PodmanServiceManager;
 use crate::OutboundQueue;
@@ -89,10 +91,13 @@ impl ActiveTunnel {
     }
 
     pub(crate) fn push_stdin(&self, data: Vec<u8>, eof: bool, outbound: &OutboundQueue) {
-        let len = data.len();
-        let prev = self.queued_stdin_bytes.fetch_add(len, Ordering::AcqRel);
-        if prev.saturating_add(len) > MAX_TUNNEL_STDIN_BUFFER_BYTES {
-            self.queued_stdin_bytes.fetch_sub(len, Ordering::AcqRel);
+        if data.is_empty() && !eof {
+            return;
+        }
+        let cost = stream_frame_credit_cost(data.len());
+        let prev = self.queued_stdin_bytes.fetch_add(cost, Ordering::AcqRel);
+        if prev.saturating_add(cost) > MAX_TUNNEL_STDIN_BUFFER_BYTES {
+            self.queued_stdin_bytes.fetch_sub(cost, Ordering::AcqRel);
             self.close(outbound);
             let _ = outbound.push_message(self.stream_id, &Message::StreamClose);
             return;
@@ -112,14 +117,15 @@ impl ActiveTunnel {
             Some(tx) => tx.send(TunnelInput::Data { data, eof }).is_ok(),
             None => false,
         };
-        if !sent {
-            self.queued_stdin_bytes.fetch_sub(len, Ordering::AcqRel);
+        if !sent && cost > 0 {
+            self.queued_stdin_bytes.fetch_sub(cost, Ordering::AcqRel);
         }
     }
 
     fn release_stdin_bytes(&self, len: usize) {
-        if len > 0 {
-            self.queued_stdin_bytes.fetch_sub(len, Ordering::AcqRel);
+        let cost = stream_frame_credit_cost(len);
+        if cost > 0 {
+            self.queued_stdin_bytes.fetch_sub(cost, Ordering::AcqRel);
         }
     }
 
@@ -800,6 +806,29 @@ mod tests {
         assert!(
             close_idx > eof_idx,
             "StreamClose ({close_idx}) must arrive after Stdout EOF ({eof_idx})"
+        );
+    }
+
+    #[test]
+    fn active_tunnel_ignores_empty_non_eof_and_accounts_small_frame_overhead() {
+        let outbound = OutboundQueue::new();
+        let stream_id = StreamId(100);
+        let (handle, stdin_rx) = ActiveTunnel::new(stream_id);
+
+        handle.push_stdin(Vec::new(), false, &outbound);
+        assert!(stdin_rx.try_recv().is_err(), "empty non-EOF frame must be ignored");
+        assert_eq!(handle.queued_stdin_bytes.load(Ordering::Acquire), 0);
+
+        // 32,768 chunks of 1 byte cost 65 bytes each (= 2,129,920 > 2 MiB) so cap must trip.
+        for _ in 0..32_768 {
+            handle.push_stdin(vec![b'x'], false, &outbound);
+            if handle.is_closed() {
+                break;
+            }
+        }
+        assert!(
+            handle.is_closed(),
+            "tiny-chunk Stdin flood must trip 2 MiB cap via per-frame overhead"
         );
     }
 }
