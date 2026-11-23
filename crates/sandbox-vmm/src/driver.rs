@@ -440,6 +440,7 @@ fn configure_guest_network(stream: &mut IpcStream, proxy_port: u16) -> Result<u1
 
 struct OutboundQueueState {
     queue: PriorityFrameQueue,
+    data_queued_by_stream: HashMap<StreamId, usize>,
     closed: bool,
     error: Option<String>,
 }
@@ -456,6 +457,7 @@ impl OutboundQueue {
         Self {
             state: Mutex::new(OutboundQueueState {
                 queue: PriorityFrameQueue::new(),
+                data_queued_by_stream: HashMap::new(),
                 closed: false,
                 error: None,
             }),
@@ -522,9 +524,36 @@ impl OutboundQueue {
                 if guard.queue.data_len() == 0
                     || guard.queue.data_bytes() < MAX_OUTBOUND_DATA_QUEUE_BYTES
                 {
-                    guard.queue.push(pending.take().expect("frame present"));
+                    let frame = pending.take().expect("frame present");
+                    *guard
+                        .data_queued_by_stream
+                        .entry(frame.header.stream_id)
+                        .or_insert(0) += 1;
+                    guard.queue.push(frame);
                     self.cv.notify_one();
                     return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_stream_data_flushed(&self, stream_id: StreamId) {
+        loop {
+            let notified = self.space_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let guard = lock_unpoisoned(&self.state);
+                if guard.closed
+                    || guard
+                        .data_queued_by_stream
+                        .get(&stream_id)
+                        .copied()
+                        .unwrap_or(0)
+                        == 0
+                {
+                    return;
                 }
             }
             notified.await;
@@ -547,6 +576,15 @@ impl OutboundQueue {
         loop {
             if let Some(frame) = guard.queue.pop() {
                 let was_data = frame.header.lane == Lane::Data;
+                if was_data {
+                    let sid = frame.header.stream_id;
+                    if let Some(count) = guard.data_queued_by_stream.get_mut(&sid) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            guard.data_queued_by_stream.remove(&sid);
+                        }
+                    }
+                }
                 drop(guard);
                 if was_data {
                     self.space_notify.notify_waiters();
@@ -874,6 +912,7 @@ impl QemuVmSession {
                     reader_active_guest_egress,
                     reader_session_closed,
                     tokio_handle,
+                    io_timeout,
                 );
             })
             .map_err(|err| SandboxError::Internal(format!("spawn VMM reader thread: {err}")))?;
@@ -1261,6 +1300,7 @@ impl VmSessionPort for QemuVmSession {
             stdin_credits,
             tunnel_handle,
             self.session_closed_tx.subscribe(),
+            self.io_timeout,
         );
 
         Ok(tunnel_stream)
@@ -1648,7 +1688,21 @@ impl VmSessionPort for QemuVmSession {
             let _ = shutdown_half.shutdown();
         }
 
-        let guard = Arc::clone(&self.shutdown_lock).lock_owned().await;
+        let guard = match Arc::clone(&self.shutdown_lock).try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Wake any hung `graceful_shutdown::wait_timeout` immediately before waiting for `shutdown_lock`.
+                if self.has_process && self.alive.load(Ordering::Acquire) {
+                    let pid = self.pid;
+                    let start_token = self.start_token;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        kill_verified_orphan_process(pid, start_token)
+                    })
+                    .await;
+                }
+                Arc::clone(&self.shutdown_lock).lock_owned().await
+            }
+        };
         let (kill_res, exited) = if self.has_process {
             let proc_slot = Arc::clone(&self.process);
             let alive_flag = Arc::clone(&self.alive);
@@ -1903,6 +1957,7 @@ fn spawn_tunnel_pumps(
     stdin_credits: Arc<StdinCreditWindow>,
     tunnel_handle: TunnelStreamHandle,
     session_closed_rx: watch::Receiver<Option<String>>,
+    io_timeout: Duration,
 ) {
     let (remote_eof_tx, remote_eof_rx) = oneshot::channel();
     let (remote_abort_tx, remote_abort_rx) = oneshot::channel();
@@ -1933,6 +1988,7 @@ fn spawn_tunnel_pumps(
             remote_eof_rx,
             remote_abort_rx,
             session_closed_rx,
+            io_timeout,
         )
         .await;
     });
@@ -1946,10 +2002,11 @@ async fn pump_tunnel_inbound(
     queued_bytes: Arc<AtomicUsize>,
     mut write_half: WriteHalf<DuplexStream>,
     remote_eof_tx: oneshot::Sender<()>,
-    remote_abort_tx: oneshot::Sender<()>,
+    remote_abort_tx: oneshot::Sender<bool>,
     mut session_closed_rx: watch::Receiver<Option<String>>,
 ) {
     let mut remote_eof_tx = Some(remote_eof_tx);
+    let mut write_broken = false;
     loop {
         if session_closed_rx.borrow().is_some() {
             break;
@@ -1977,6 +2034,7 @@ async fn pump_tunnel_inbound(
                     };
                     queued_bytes.fetch_sub(cost, Ordering::AcqRel);
                     if write_res.is_err() {
+                        write_broken = true;
                         break;
                     }
                     send_stream_credit(&outbound, stream_id, StreamChannel::Stdout, cost);
@@ -1989,7 +2047,7 @@ async fn pump_tunnel_inbound(
                 }
             }
             TunnelInbound::RemoteClose => {
-                let _ = remote_abort_tx.send(());
+                let _ = remote_abort_tx.send(false);
                 let _ = write_half.shutdown().await;
                 return;
             }
@@ -1997,7 +2055,7 @@ async fn pump_tunnel_inbound(
     }
     let _ = write_half.shutdown().await;
     if remote_eof_tx.is_some() {
-        let _ = remote_abort_tx.send(());
+        let _ = remote_abort_tx.send(write_broken);
     }
 }
 
@@ -2010,12 +2068,18 @@ async fn pump_tunnel_outbound(
     mut read_half: ReadHalf<DuplexStream>,
     drop_rx: oneshot::Receiver<bool>,
     remote_eof_rx: oneshot::Receiver<()>,
-    mut remote_abort_rx: oneshot::Receiver<()>,
+    mut remote_abort_rx: oneshot::Receiver<bool>,
     mut session_closed_rx: watch::Receiver<Option<String>>,
+    io_timeout: Duration,
 ) {
     let mut buf = vec![0u8; MAX_HOST_STREAM_CHUNK_BYTES];
     let mut stdin_eof = false;
     let mut remote_eof = false;
+    let mut host_dropped = false;
+    let mut need_stream_close = false;
+    let mut remote_abort_done = false;
+    let mut linger_deadline: Option<tokio::time::Instant> = None;
+    let linger_duration = io_timeout.min(Duration::from_secs(5));
     let mut drop_rx = Some(drop_rx);
     let mut remote_eof_rx = Some(remote_eof_rx);
 
@@ -2028,7 +2092,26 @@ async fn pump_tunnel_outbound(
             _ = session_closed_rx.changed() => {
                 break;
             }
-            _ = &mut remote_abort_rx => {
+            res = &mut remote_abort_rx, if !remote_abort_done => {
+                remote_abort_done = true;
+                match res {
+                    Ok(true) => {
+                        need_stream_close = true;
+                        remote_eof = true;
+                        if stdin_eof || !host_dropped {
+                            break;
+                        }
+                    }
+                    Ok(false) | Err(_) => break,
+                }
+            }
+            _ = async {
+                match linger_deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if linger_deadline.is_some() && !remote_eof => {
+                need_stream_close = true;
                 break;
             }
             _ = async {
@@ -2049,10 +2132,11 @@ async fn pump_tunnel_outbound(
                 }
             }, if drop_rx.is_some() => {
                 drop_rx = None;
+                host_dropped = true;
                 let graceful_write = matches!(res, Ok(true));
-                // Only abort with `StreamClose` on ungraceful drop without write `shutdown()`.
-                // When the host called `shutdown()` before dropping (e.g., HTTP proxy response
-                // before client TCP FIN), keep draining `read_half` until `stdin_eof`.
+                // Only abort with `StreamClose` immediately on ungraceful drop without write
+                // `shutdown()`. On graceful write shutdown, drain remaining `read_half` data and
+                // bound waiting for remote EOF so abandoned connections release egress permits.
                 if !graceful_write {
                     stdin_credits.close();
                     lock_unpoisoned(&ops).remove(&stream_id);
@@ -2060,6 +2144,9 @@ async fn pump_tunnel_outbound(
                         let _ = outbound.enqueue_control(frame);
                     }
                     return;
+                }
+                if stdin_eof && !remote_eof {
+                    linger_deadline = Some(tokio::time::Instant::now() + linger_duration);
                 }
             }
             read_res = async {
@@ -2080,6 +2167,12 @@ async fn pump_tunnel_outbound(
                             let _ = outbound.enqueue_data(frame).await;
                         }
                         stdin_eof = true;
+                        if need_stream_close {
+                            break;
+                        }
+                        if host_dropped && !remote_eof && linger_deadline.is_none() {
+                            linger_deadline = Some(tokio::time::Instant::now() + linger_duration);
+                        }
                     }
                     Some(Ok(n)) => {
                         stdin_credits.consume(n);
@@ -2103,7 +2196,44 @@ async fn pump_tunnel_outbound(
     }
 
     stdin_credits.close();
+    if need_stream_close {
+        // Wait for queued `Lane::Data` Stdin frames to hit the wire before sending `StreamClose`.
+        outbound.wait_stream_data_flushed(stream_id).await;
+        if let Ok(frame) = Frame::from_message(stream_id, &Message::StreamClose) {
+            let _ = outbound.enqueue_control(frame);
+        }
+    }
     lock_unpoisoned(&ops).remove(&stream_id);
+}
+
+async fn enqueue_exec_stdin_frame(
+    stream_id: StreamId,
+    outbound: &OutboundQueue,
+    frame: Frame,
+    cancel_rx: &mut mpsc::Receiver<()>,
+    cancel_open: &mut bool,
+    done_rx: &mut oneshot::Receiver<()>,
+) -> bool {
+    let mut enqueue_fut = std::pin::pin!(outbound.enqueue_data(frame));
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut *done_rx => return false,
+            maybe_cancel = cancel_rx.recv(), if *cancel_open => {
+                match maybe_cancel {
+                    Some(()) => {
+                        if let Ok(cancel) = Frame::from_message(stream_id, &Message::ExecCancel) {
+                            if outbound.enqueue_control(cancel).is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                    None => *cancel_open = false,
+                }
+            }
+            res = &mut enqueue_fut => return res.is_ok(),
+        }
+    }
 }
 
 async fn pump_exec_stdin_and_cancel(
@@ -2181,7 +2311,16 @@ async fn pump_exec_stdin_and_cancel(
                             ) else {
                                 return;
                             };
-                            if outbound.enqueue_data(frame).await.is_err() {
+                            if !enqueue_exec_stdin_frame(
+                                stream_id,
+                                &outbound,
+                                frame,
+                                cancel_rx,
+                                &mut cancel_open,
+                                &mut done_rx,
+                            )
+                            .await
+                            {
                                 return;
                             }
                             offset = end;
@@ -2197,7 +2336,18 @@ async fn pump_exec_stdin_and_cancel(
                                 data: Vec::new(),
                             },
                         ) {
-                            let _ = outbound.enqueue_data(frame).await;
+                            if !enqueue_exec_stdin_frame(
+                                stream_id,
+                                &outbound,
+                                frame,
+                                cancel_rx,
+                                &mut cancel_open,
+                                &mut done_rx,
+                            )
+                            .await
+                            {
+                                return;
+                            }
                         }
                         if !cancel_open {
                             break;
@@ -2241,6 +2391,7 @@ fn run_reader_loop(
     active_guest_egress: Arc<AtomicUsize>,
     session_closed_tx: watch::Sender<Option<String>>,
     tokio_handle: Option<tokio::runtime::Handle>,
+    io_timeout: Duration,
 ) {
     loop {
         let frame = match read_frame(&mut read_half) {
@@ -2588,6 +2739,7 @@ fn run_reader_loop(
                     &tokio_handle,
                     &outbound,
                     &ops,
+                    io_timeout,
                 );
             }
             Message::ConfigureNetworkAck { proxy_port } if stream_id == StreamId(0) => {
@@ -2647,6 +2799,7 @@ fn run_reader_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_egress_open(
     stream_id: StreamId,
     egress_tx: &Mutex<Option<mpsc::Sender<TunnelStream>>>,
@@ -2655,6 +2808,7 @@ fn handle_egress_open(
     tokio_handle: &Option<tokio::runtime::Handle>,
     outbound: &Arc<OutboundQueue>,
     ops: &Arc<Mutex<HashMap<StreamId, StreamHandler>>>,
+    io_timeout: Duration,
 ) {
     let reject = |msg: String| {
         if let Ok(frame) = Frame::from_message(stream_id, &Message::ConnectError { message: msg }) {
@@ -2724,6 +2878,7 @@ fn handle_egress_open(
                 stdin_credits,
                 tunnel_handle,
                 session_closed_tx.subscribe(),
+                io_timeout,
             );
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -5012,5 +5167,213 @@ mod tests {
         );
 
         peer_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn force_kill_wakes_hung_graceful_shutdown_promptly() {
+        #[cfg(windows)]
+        let launch = ProcessLaunchSpec::new(
+            "cmd.exe",
+            vec![
+                std::ffi::OsString::from("/C"),
+                std::ffi::OsString::from("ping -n 15 127.0.0.1 >NUL"),
+            ],
+        );
+        #[cfg(unix)]
+        let launch = ProcessLaunchSpec::new(
+            "/bin/sh",
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("sleep 15"),
+            ],
+        );
+        let proc_handle = ConfinedProcess::spawn(launch).expect("spawn sleeping child");
+        let pid = proc_handle.id();
+        let start_token = proc_handle.start_identity().start_token;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-force-kill-wake").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+        let peer_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let session = QemuVmSession::start(
+            Some(proc_handle),
+            None,
+            host_stream,
+            Vec::new(),
+            Duration::from_secs(2),
+            pid,
+            start_token,
+            None,
+        )
+        .unwrap();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(40),
+            session.graceful_shutdown(Duration::from_secs(5)),
+        )
+        .await;
+        assert!(cancelled.is_err());
+
+        let start = Instant::now();
+        session.force_kill().await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "force_kill must wake hung 5s graceful_shutdown wait immediately, elapsed={:?}",
+            start.elapsed()
+        );
+        peer_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn egress_graceful_drop_reaps_permit_on_abandoned_and_flooding_guest_streams() {
+        use sandbox_protocol::GUEST_STREAM_ID_BIT;
+
+        let listener = AgentIpcEndpoint::bind_temp("drv-egress-reap").unwrap();
+        let sock_path = listener.socket_path().to_path_buf();
+
+        let guest_thread = thread::spawn(move || {
+            let mut client = IpcStream::connect(&sock_path).unwrap();
+
+            // 1. Abandoned guest socket: never sends Stdout EOF after host drops TunnelStream.
+            let sid1 = StreamId(GUEST_STREAM_ID_BIT | 1);
+            write_frame(&mut client, &Frame::from_message(sid1, &Message::EgressOpen).unwrap())
+                .unwrap();
+            assert_eq!(read_frame(&mut client).unwrap().decode_message().unwrap(), Message::ConnectAck);
+            // Expect StreamClose once host linger deadline elapses.
+            loop {
+                let f = read_frame(&mut client).unwrap();
+                match f.decode_message().unwrap() {
+                    Message::StreamClose => {
+                        assert_eq!(f.header.stream_id, sid1);
+                        break;
+                    }
+                    Message::StreamData { channel: StreamChannel::Stdin, .. } => {}
+                    other => panic!("unexpected frame on sid1: {other:?}"),
+                }
+            }
+
+            // 2. Guest keeps flooding data after host graceful shutdown + drop -> receives StreamClose.
+            let sid2 = StreamId(GUEST_STREAM_ID_BIT | 2);
+            write_frame(&mut client, &Frame::from_message(sid2, &Message::EgressOpen).unwrap())
+                .unwrap();
+            assert_eq!(read_frame(&mut client).unwrap().decode_message().unwrap(), Message::ConnectAck);
+            for _ in 0..8 {
+                if write_frame(
+                    &mut client,
+                    &Frame::from_message(
+                        sid2,
+                        &Message::StreamData {
+                            channel: StreamChannel::Stdout,
+                            eof: false,
+                            data: vec![b'y'; 4096],
+                        },
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            loop {
+                let f = read_frame(&mut client).unwrap();
+                if matches!(f.decode_message(), Ok(Message::StreamClose)) {
+                    assert_eq!(f.header.stream_id, sid2);
+                    break;
+                }
+            }
+            while read_frame(&mut client).is_ok() {}
+        });
+
+        let host_stream = listener.accept_timeout(Duration::from_secs(2)).unwrap();
+        let (session, mut egress_rx) =
+            QemuVmSession::from_test_stream_with_egress(host_stream, Duration::from_millis(150))
+                .unwrap();
+
+        // Stream 1: call shutdown() and drop immediately without reading/closing remotely.
+        let mut s1 = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        s1.shutdown().await.unwrap();
+        drop(s1);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.active_guest_egress_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("abandoned egress permit must be reaped after graceful shutdown+drop");
+
+        // Stream 2: call shutdown() and drop while guest writes to trigger BrokenPipe abort path.
+        let mut s2 = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        s2.shutdown().await.unwrap();
+        drop(s2);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.active_guest_egress_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flooding egress permit must be reaped after host drop");
+
+        session.force_kill().await.unwrap();
+        guest_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_cancel_preempts_full_outbound_data_queue() {
+        let outbound = Arc::new(OutboundQueue::new());
+        // Fill Data lane above MAX_OUTBOUND_DATA_QUEUE_BYTES so the next enqueue_data waits.
+        let filler = Frame::from_message(
+            StreamId(1),
+            &Message::StreamData {
+                channel: StreamChannel::Stdin,
+                eof: false,
+                data: vec![b'd'; 1024 * 1024 - 2],
+            },
+        )
+        .unwrap();
+        for _ in 0..5 {
+            outbound.enqueue_data(filler.clone()).await.unwrap();
+        }
+
+        let stdin_credits = Arc::new(StdinCreditWindow::new(INITIAL_STREAM_CREDIT_BYTES));
+        let (stdin_tx, mut stdin_rx) = mpsc::channel(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(4);
+        let (_done_tx, done_rx) = oneshot::channel();
+        let pump_outbound = Arc::clone(&outbound);
+        let pump = tokio::spawn(async move {
+            pump_exec_stdin_and_cancel(
+                StreamId(2),
+                pump_outbound,
+                stdin_credits,
+                &mut stdin_rx,
+                &mut cancel_rx,
+                done_rx,
+            )
+            .await;
+        });
+
+        stdin_tx.send(vec![b'z'; 32]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel_tx.send(()).await.unwrap();
+
+        let popped = tokio::task::spawn_blocking(move || outbound.pop_blocking().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(popped.header.stream_id, StreamId(2));
+        assert_eq!(popped.decode_message().unwrap(), Message::ExecCancel);
+        pump.abort();
     }
 }

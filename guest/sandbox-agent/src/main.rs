@@ -551,12 +551,14 @@ fn serve_session_with_initial_stdout_credit<R: Read + Send, W: Write + Send>(
                     }));
                 }
                 Message::ExecCancel => {
-                    outbound.abort_stream(stream_id);
-                    let handle = active_execs
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&stream_id)
-                        .cloned();
+                    let handle = {
+                        let guard = active_execs.lock().unwrap_or_else(|e| e.into_inner());
+                        let handle = guard.get(&stream_id).cloned();
+                        if handle.is_some() {
+                            outbound.abort_stream(stream_id);
+                        }
+                        handle
+                    };
                     if let Some(handle) = handle {
                         handle.cancel(&outbound);
                     }
@@ -812,15 +814,15 @@ fn serve_session_with_initial_stdout_credit<R: Read + Send, W: Write + Send>(
 
         egress_proxy.shutdown();
 
-        if shutdown_requested || session_res.is_err() || outbound.is_closed() {
-            cancel_all_active(
-                &active_execs,
-                &active_copy_ins,
-                &active_copy_outs,
-                &active_tunnels,
-                &outbound,
-            );
-        }
+        // Always cancel remaining active streams when reader exits (including abrupt Host EOF),
+        // otherwise `workers.join()` deadlocks on CopyIn/Tunnel/Exec workers waiting for Host input.
+        cancel_all_active(
+            &active_execs,
+            &active_copy_ins,
+            &active_copy_outs,
+            &active_tunnels,
+            &outbound,
+        );
 
         for handle in workers {
             let _ = handle.join();
@@ -2807,5 +2809,33 @@ mod tests {
             }
         );
         assert!(outbound.pop_for_writer().is_none());
+    }
+
+    #[test]
+    fn clean_eof_with_inflight_copy_in_cancels_workers_without_hanging() {
+        let tmp = TestTempDir::new("clean-eof-cancels-copy-in");
+        let (mut host_rx, mut host_tx, agent) = start_test_session();
+
+        send_message(
+            &mut host_tx,
+            StreamId(41),
+            &Message::CopyInStart {
+                dst_guest: tmp.path().to_string_lossy().into_owned(),
+                max_bytes: 65_536,
+            },
+        )
+        .unwrap();
+        // Ping barrier ensures CopyInStart is registered in `active_copy_ins` before abrupt EOF.
+        send_message(&mut host_tx, StreamId(0), &Message::Ping { seq: 11 }).unwrap();
+        let pong = read_frame(&mut host_rx).unwrap();
+        assert_eq!(pong.decode_message().unwrap(), Message::Pong { seq: 11 });
+
+        // Abrupt transport close without Shutdown must still cancel active workers and return Ok.
+        drop(host_tx);
+        while read_frame(&mut host_rx).is_ok() {}
+        agent
+            .join()
+            .expect("agent thread must not panic")
+            .expect("clean EOF with in-flight CopyIn must exit cleanly");
     }
 }

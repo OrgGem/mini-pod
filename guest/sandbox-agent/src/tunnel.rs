@@ -262,6 +262,7 @@ pub(crate) fn run_tunnel(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&stream_id);
     handle.close_stdin_only();
+    outbound.clear_stream(stream_id);
 
     if let Err(err) = res {
         eprintln!("[sandbox-agent] tunnel stream {stream_id} transport error: {err}");

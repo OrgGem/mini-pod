@@ -222,6 +222,7 @@ pub(crate) fn run_exec(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&stream_id);
     handle.close_stdin();
+    outbound.clear_stream(stream_id);
 
     if let Err(err) = res {
         eprintln!("[sandbox-agent] exec stream {stream_id} transport error: {err}");

@@ -317,8 +317,8 @@ fn spawn_egress_connection(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&guest_sid);
-        outbound.clear_stream(guest_sid);
         handle.close(outbound);
+        outbound.clear_stream(guest_sid);
         return None;
     }
 
@@ -354,6 +354,7 @@ fn spawn_egress_connection(
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&guest_sid);
             relay_handle.close_stdin_only();
+            relay_outbound.clear_stream(guest_sid);
 
             if let Err(err) = res {
                 eprintln!("[sandbox-agent] egress stream {guest_sid} transport error: {err}");
@@ -368,6 +369,7 @@ fn spawn_egress_connection(
                 .remove(&guest_sid);
             handle.close(outbound);
             let _ = outbound.push_message(guest_sid, &Message::StreamClose);
+            outbound.clear_stream(guest_sid);
             None
         }
     }
@@ -542,5 +544,16 @@ mod tests {
         );
 
         manager.shutdown();
+        let st = outbound.state.lock().unwrap();
+        assert!(
+            st.credits.is_empty(),
+            "rejected EgressOpen must clear seeded stream credits: {:?}",
+            st.credits
+        );
+        assert!(
+            st.aborted_streams.is_empty(),
+            "rejected EgressOpen must clear aborted_streams entry: {:?}",
+            st.aborted_streams
+        );
     }
 }
