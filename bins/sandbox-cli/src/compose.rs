@@ -414,7 +414,8 @@ pub async fn compose_up_in_sandbox(
     let mut summaries = Vec::with_capacity(spec.startup_order.len());
     for svc_name in &spec.startup_order {
         let svc = &spec.services[svc_name];
-        remove_container_if_exists(&docker_ep, &svc.container_name).await?;
+        remove_container_if_exists(&docker_ep, &spec.project_name, &svc.name, &svc.container_name)
+            .await?;
 
         let create_payload = build_container_create_payload(spec, svc);
         let create_path = format!(
@@ -521,61 +522,133 @@ pub async fn compose_down_in_sandbox(
 
     let containers = list_project_containers(&docker_ep, project_name).await?;
     let mut removed_containers = 0u64;
-    // Tear down in reverse order.
+    let mut errors: Vec<SandboxError> = Vec::new();
+    // Tear down in reverse order, continuing across individual failures so remaining resources
+    // still get cleaned up before reporting any non-404 errors.
     for row in containers.iter().rev() {
-        if let Some(id) = row["id"].as_str() {
-            let stop_path = format!("/containers/{}/stop?t=3", percent_encode_component(id));
-            let _ = docker_json_request(&docker_ep, "POST", &stop_path, None).await?;
-            let del_path = format!("/containers/{}?force=true", percent_encode_component(id));
-            let (st, _) = docker_json_request(&docker_ep, "DELETE", &del_path, None).await?;
-            if (200..300).contains(&st) || st == 404 {
-                removed_containers += 1;
+        if let Some(id) = row["id"].as_str().filter(|id| !id.is_empty()) {
+            let enc_id = percent_encode_component(id);
+            let stop_path = format!("/containers/{enc_id}/stop?t=3");
+            let _ = docker_json_request(&docker_ep, "POST", &stop_path, None).await;
+            let del_path = format!("/containers/{enc_id}?force=true");
+            match docker_json_request(&docker_ep, "DELETE", &del_path, None).await {
+                Ok((st, _)) if (200..300).contains(&st) || st == 404 => {
+                    removed_containers += 1;
+                }
+                Ok((st, body)) => {
+                    errors.push(docker_http_error(
+                        &format!("remove container '{id}'"),
+                        st,
+                        &body,
+                    ));
+                }
+                Err(err) => errors.push(err),
             }
         }
     }
 
     let mut removed_networks = 0u64;
-    let (net_st, net_body) = docker_json_request(&docker_ep, "GET", "/networks", None).await?;
-    if net_st == 200 {
-        if let Ok(Value::Array(nets)) = serde_json::from_slice::<Value>(&net_body) {
-            for net in nets {
-                let matches_label = net["Labels"][LABEL_PROJECT].as_str() == Some(project_name);
-                if matches_label {
-                    if let Some(name) = net["Name"].as_str() {
-                        let path = format!("/networks/{}", percent_encode_component(name));
-                        let (st, _) = docker_json_request(&docker_ep, "DELETE", &path, None).await?;
-                        if (200..300).contains(&st) {
-                            removed_networks += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut removed_volumes = 0u64;
-    if remove_volumes {
-        let (vol_st, vol_body) = docker_json_request(&docker_ep, "GET", "/volumes", None).await?;
-        if vol_st == 200 {
-            if let Ok(parsed) = serde_json::from_slice::<Value>(&vol_body) {
-                if let Some(vols) = parsed["Volumes"].as_array() {
-                    for vol in vols {
-                        let matches_label =
-                            vol["Labels"][LABEL_PROJECT].as_str() == Some(project_name);
-                        if matches_label {
-                            if let Some(name) = vol["Name"].as_str() {
-                                let path = format!("/volumes/{}", percent_encode_component(name));
-                                let (st, _) =
-                                    docker_json_request(&docker_ep, "DELETE", &path, None).await?;
-                                if (200..300).contains(&st) {
-                                    removed_volumes += 1;
+    match docker_json_request(&docker_ep, "GET", "/networks", None).await {
+        Ok((200, net_body)) => match serde_json::from_slice::<Vec<Value>>(&net_body) {
+            Ok(nets) => {
+                for net in nets {
+                    let matches_label =
+                        net["Labels"][LABEL_PROJECT].as_str() == Some(project_name);
+                    if matches_label {
+                        if let Some(name) = net["Name"].as_str().filter(|n| !n.is_empty()) {
+                            let path = format!("/networks/{}", percent_encode_component(name));
+                            match docker_json_request(&docker_ep, "DELETE", &path, None).await {
+                                Ok((st, _)) if (200..300).contains(&st) => {
+                                    removed_networks += 1;
                                 }
+                                Ok((404, _)) => {}
+                                Ok((st, body)) => errors.push(docker_http_error(
+                                    &format!("remove network '{name}'"),
+                                    st,
+                                    &body,
+                                )),
+                                Err(err) => errors.push(err),
                             }
                         }
                     }
                 }
             }
+            Err(err) => errors.push(SandboxError::Transport(format!(
+                "invalid /networks response JSON: {err}"
+            ))),
+        },
+        Ok((net_st, net_body)) => {
+            errors.push(docker_http_error("list networks", net_st, &net_body));
         }
+        Err(err) => errors.push(err),
+    }
+
+    let mut removed_volumes = 0u64;
+    if remove_volumes {
+        match docker_json_request(&docker_ep, "GET", "/volumes", None).await {
+            Ok((200, vol_body)) => match serde_json::from_slice::<Value>(&vol_body) {
+                Ok(parsed) => match parsed.get("Volumes") {
+                    Some(Value::Array(vols)) => {
+                        for vol in vols {
+                            let matches_label =
+                                vol["Labels"][LABEL_PROJECT].as_str() == Some(project_name);
+                            if matches_label {
+                                if let Some(name) = vol["Name"].as_str().filter(|n| !n.is_empty())
+                                {
+                                    let path =
+                                        format!("/volumes/{}", percent_encode_component(name));
+                                    match docker_json_request(&docker_ep, "DELETE", &path, None)
+                                        .await
+                                    {
+                                        Ok((st, _)) if (200..300).contains(&st) => {
+                                            removed_volumes += 1;
+                                        }
+                                        Ok((404, _)) => {}
+                                        Ok((st, body)) => errors.push(docker_http_error(
+                                            &format!("remove volume '{name}'"),
+                                            st,
+                                            &body,
+                                        )),
+                                        Err(err) => errors.push(err),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None | Some(Value::Null) => {}
+                    Some(_) => errors.push(SandboxError::Transport(
+                        "invalid /volumes response JSON: 'Volumes' must be an array or null"
+                            .to_owned(),
+                    )),
+                },
+                Err(err) => errors.push(SandboxError::Transport(format!(
+                    "invalid /volumes response JSON: {err}"
+                ))),
+            },
+            Ok((vol_st, vol_body)) => {
+                errors.push(docker_http_error("list volumes", vol_st, &vol_body));
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    if !errors.is_empty() {
+        if errors.len() == 1 {
+            return Err(errors.pop().expect("errors verified non-empty"));
+        }
+        let has_policy = errors
+            .iter()
+            .any(|err| matches!(err, SandboxError::PolicyViolation(_)));
+        let combined = errors
+            .into_iter()
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(if has_policy {
+            SandboxError::PolicyViolation(combined)
+        } else {
+            SandboxError::Transport(combined)
+        });
     }
 
     Ok(json!({
@@ -2288,17 +2361,61 @@ async fn ensure_volume(
 
 async fn remove_container_if_exists(
     docker_ep: &ControlEndpoint,
+    project_name: &str,
+    service_name: &str,
     container_name: &str,
 ) -> Result<(), SandboxError> {
-    let enc = percent_encode_component(container_name);
-    let (st, _) = docker_json_request(docker_ep, "GET", &format!("/containers/{enc}/json"), None).await?;
+    let enc_name = percent_encode_component(container_name);
+    let (st, ibody) =
+        docker_json_request(docker_ep, "GET", &format!("/containers/{enc_name}/json"), None)
+            .await?;
     if st == 404 {
         return Ok(());
     }
-    let _ = docker_json_request(docker_ep, "POST", &format!("/containers/{enc}/stop?t=2"), None).await?;
-    let (dst, dbody) =
-        docker_json_request(docker_ep, "DELETE", &format!("/containers/{enc}?force=true"), None)
-            .await?;
+    if st != 200 {
+        return Err(docker_http_error(
+            &format!("inspect existing container '{container_name}'"),
+            st,
+            &ibody,
+        ));
+    }
+    let inspect: Value = serde_json::from_slice(&ibody).map_err(|err| {
+        SandboxError::Transport(format!(
+            "invalid inspect container JSON for '{container_name}': {err}"
+        ))
+    })?;
+    let labels = inspect["Config"]["Labels"]
+        .as_object()
+        .or_else(|| inspect["Labels"].as_object());
+    let actual_project = labels
+        .and_then(|map| map.get(LABEL_PROJECT))
+        .and_then(Value::as_str);
+    let actual_service = labels
+        .and_then(|map| map.get(LABEL_SERVICE))
+        .and_then(Value::as_str);
+    if actual_project != Some(project_name) || actual_service != Some(service_name) {
+        return Err(SandboxError::PolicyViolation(format!(
+            "refusing to replace existing container '{container_name}': owned by project={actual_project:?} service={actual_service:?} (expected project='{project_name}', service='{service_name}')"
+        )));
+    }
+    let inspected_id = inspect["Id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            SandboxError::Transport(format!(
+                "inspect container '{container_name}' response missing 'Id'"
+            ))
+        })?;
+    let enc_id = percent_encode_component(inspected_id);
+    let _ = docker_json_request(docker_ep, "POST", &format!("/containers/{enc_id}/stop?t=2"), None)
+        .await?;
+    let (dst, dbody) = docker_json_request(
+        docker_ep,
+        "DELETE",
+        &format!("/containers/{enc_id}?force=true"),
+        None,
+    )
+    .await?;
     if (200..300).contains(&dst) || dst == 404 {
         return Ok(());
     }
@@ -2675,6 +2792,7 @@ async fn read_http_line_bounded<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn parses_compose_yaml_toposorts_depends_on_and_builds_safe_docker_payloads() {
@@ -3043,5 +3161,485 @@ services:
         assert_eq!(rich_env["SINGLE_LIT"], "a\\nb # stay");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    type MockDockerHandler = Arc<dyn Fn(&str, &str) -> (u16, String) + Send + Sync>;
+
+    async fn serve_mock_docker_conn<S>(
+        mut stream: S,
+        recorded: Arc<std::sync::Mutex<Vec<String>>>,
+        handler: MockDockerHandler,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut reader = BufReader::new(&mut stream);
+        let mut req_line = String::new();
+        if reader.read_line(&mut req_line).await.unwrap_or(0) == 0 {
+            return;
+        }
+        let mut parts = req_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_owned();
+        let target = parts.next().unwrap_or("").to_owned();
+        let mut content_len = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_len = v.trim().parse::<usize>().unwrap_or(0);
+                }
+            }
+        }
+        if content_len > 0 {
+            let mut body = vec![0u8; content_len];
+            let _ = reader.read_exact(&mut body).await;
+        }
+
+        recorded
+            .lock()
+            .unwrap()
+            .push(format!("{method} {target}"));
+        let (status, resp_body) = handler(&method, &target);
+        let reason = match status {
+            200 => "OK",
+            201 => "Created",
+            204 => "No Content",
+            404 => "Not Found",
+            409 => "Conflict",
+            _ => "Error",
+        };
+        let mut resp = format!(
+            "HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            resp_body.len()
+        );
+        if !resp_body.is_empty() {
+            resp.push_str("Content-Type: application/json\r\n");
+        }
+        resp.push_str("\r\n");
+        resp.push_str(&resp_body);
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
+    struct MockDockerServer {
+        endpoint_uri: String,
+        recorded: Arc<std::sync::Mutex<Vec<String>>>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+        #[cfg(unix)]
+        socket_path: PathBuf,
+    }
+
+    impl MockDockerServer {
+        async fn start<F>(label: &str, handler: F) -> Self
+        where
+            F: Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+        {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handler: MockDockerHandler = Arc::new(handler);
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+            #[cfg(windows)]
+            let (endpoint_uri, task) = {
+                use tokio::net::windows::named_pipe::ServerOptions;
+                let pipe_path = format!(
+                    r"\\.\pipe\minipod-compose-test-{label}-{}-{seq}",
+                    std::process::id()
+                );
+                let srv_pipe = pipe_path.clone();
+                let rec = Arc::clone(&recorded);
+                let h = Arc::clone(&handler);
+                let mut server = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&srv_pipe)
+                    .expect("bind mock docker pipe");
+                let task = tokio::spawn(async move {
+                    loop {
+                        let res = tokio::select! {
+                            biased;
+                            _ = shutdown_rx.wait_for(|done| *done) => break,
+                            res = server.connect() => res,
+                        };
+                        match res {
+                            Ok(()) => {
+                                let next = ServerOptions::new()
+                                    .create(&srv_pipe)
+                                    .expect("create next mock docker pipe");
+                                let connected = std::mem::replace(&mut server, next);
+                                let rec_c = Arc::clone(&rec);
+                                let h_c = Arc::clone(&h);
+                                tokio::spawn(serve_mock_docker_conn(connected, rec_c, h_c));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                (pipe_path, task)
+            };
+
+            #[cfg(unix)]
+            let (endpoint_uri, socket_path, task) = {
+                let sock_path = std::env::temp_dir().join(format!(
+                    "mp-cmp-{label}-{}-{seq}.sock",
+                    std::process::id()
+                ));
+                let _ = fs::remove_file(&sock_path);
+                let listener =
+                    tokio::net::UnixListener::bind(&sock_path).expect("bind mock docker socket");
+                let endpoint_uri = format!("unix://{}", sock_path.display());
+                let rec = Arc::clone(&recorded);
+                let h = Arc::clone(&handler);
+                let task = tokio::spawn(async move {
+                    loop {
+                        let res = tokio::select! {
+                            biased;
+                            _ = shutdown_rx.wait_for(|done| *done) => break,
+                            res = listener.accept() => res,
+                        };
+                        match res {
+                            Ok((stream, _)) => {
+                                let rec_c = Arc::clone(&rec);
+                                let h_c = Arc::clone(&h);
+                                tokio::spawn(serve_mock_docker_conn(stream, rec_c, h_c));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                (endpoint_uri, sock_path, task)
+            };
+
+            Self {
+                endpoint_uri,
+                recorded,
+                shutdown_tx,
+                task,
+                #[cfg(unix)]
+                socket_path,
+            }
+        }
+
+        fn recorded_requests(&self) -> Vec<String> {
+            self.recorded.lock().unwrap().clone()
+        }
+
+        async fn stop(self) {
+            let _ = self.shutdown_tx.send(true);
+            let _ = self.task.await;
+            #[cfg(unix)]
+            let _ = fs::remove_file(&self.socket_path);
+        }
+    }
+
+    fn mock_compose_sandbox_client(docker_uri: String) -> SandboxClient {
+        use sandbox_client::{
+            read_control_frame, write_control_frame, ControlRequest, ControlResponse, ExecWireEvent,
+        };
+        use sandbox_core::ExecExitStatus;
+
+        let uri = Arc::new(docker_uri);
+        SandboxClient::with_connector(ControlEndpoint::NamedPipe("unused".to_owned()), move |_| {
+            let uri = Arc::clone(&uri);
+            async move {
+                let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+                tokio::spawn(async move {
+                    let Ok(Some(raw)) = read_control_frame(&mut server_io).await else {
+                        return;
+                    };
+                    let Ok(req) = ControlRequest::from_json_bytes(&raw) else {
+                        return;
+                    };
+                    match req {
+                        ControlRequest::EnableDockerCompat { .. } => {
+                            let resp = ControlResponse::DockerCompatEndpoint {
+                                uri: (*uri).clone(),
+                            }
+                            .to_json_bytes()
+                            .unwrap();
+                            let _ = write_control_frame(&mut server_io, &resp).await;
+                        }
+                        ControlRequest::ExecStart { .. } => {
+                            let started = ControlResponse::ExecStarted { stream_id: 1 }
+                                .to_json_bytes()
+                                .unwrap();
+                            let _ = write_control_frame(&mut server_io, &started).await;
+                            let exit = ExecWireEvent::Exit(ExecExitStatus {
+                                code: Some(0),
+                                timed_out: false,
+                                stdout_truncated: false,
+                                stderr_truncated: false,
+                            })
+                            .to_json_bytes()
+                            .unwrap();
+                            let _ = write_control_frame(&mut server_io, &exit).await;
+                        }
+                        _ => {}
+                    }
+                });
+                Ok(client_io)
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn compose_up_verifies_container_ownership_and_targets_inspected_id() {
+        let foreign_server = MockDockerServer::start("foreign", |method, target| match (method, target) {
+            ("GET", "/networks/demo_default") => (200, r#"{"Name":"demo_default"}"#.to_owned()),
+            ("GET", "/containers/shared-web/json") => (
+                200,
+                json!({
+                    "Id": "foreign-id-999",
+                    "Config": {
+                        "Labels": {
+                            LABEL_PROJECT: "other-project",
+                            LABEL_SERVICE: "web",
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            _ => (500, format!("unexpected {method} {target}")),
+        })
+        .await;
+        let spec = parse_compose_yaml(
+            "services:\n  web:\n    image: alpine:latest\n    container_name: shared-web\n",
+            Path::new("."),
+            Some("demo"),
+        )
+        .unwrap();
+        let foreign_client = mock_compose_sandbox_client(foreign_server.endpoint_uri.clone());
+        let err = compose_up_in_sandbox(
+            &foreign_client,
+            &SandboxId::new("sb-1"),
+            &spec,
+            false,
+            Duration::from_secs(10),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::PolicyViolation(_)), "got {err:?}");
+        let reqs = foreign_server.recorded_requests();
+        assert!(
+            !reqs.iter().any(|r| r.contains("/stop") || r.starts_with("DELETE ")),
+            "must never stop or delete container owned by another project: {reqs:?}"
+        );
+        foreign_server.stop().await;
+
+        let wrong_svc_server =
+            MockDockerServer::start("wrongsvc", |method, target| match (method, target) {
+                ("GET", "/networks/demo_default") => (200, r#"{"Name":"demo_default"}"#.to_owned()),
+                ("GET", "/containers/shared-web/json") => (
+                    200,
+                    json!({
+                        "Id": "same-proj-other-svc-1",
+                        "Config": {
+                            "Labels": {
+                                LABEL_PROJECT: "demo",
+                                LABEL_SERVICE: "api",
+                            }
+                        }
+                    })
+                    .to_string(),
+                ),
+                _ => (500, format!("unexpected {method} {target}")),
+            })
+            .await;
+        let wrong_svc_client = mock_compose_sandbox_client(wrong_svc_server.endpoint_uri.clone());
+        let wrong_svc_err = compose_up_in_sandbox(
+            &wrong_svc_client,
+            &SandboxId::new("sb-1"),
+            &spec,
+            false,
+            Duration::from_secs(10),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(wrong_svc_err, SandboxError::PolicyViolation(_)));
+        assert!(!wrong_svc_server
+            .recorded_requests()
+            .iter()
+            .any(|r| r.contains("/stop") || r.starts_with("DELETE ")));
+        wrong_svc_server.stop().await;
+
+        let owned_server = MockDockerServer::start("owned", |method, target| match (method, target) {
+            ("GET", "/networks/demo_default") => (200, r#"{"Name":"demo_default"}"#.to_owned()),
+            ("GET", "/containers/shared-web/json") => (
+                200,
+                json!({
+                    "Id": "owned-id-1234567890abcdef",
+                    "Config": {
+                        "Labels": {
+                            LABEL_PROJECT: "demo",
+                            LABEL_SERVICE: "web",
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            ("POST", "/containers/owned-id-1234567890abcdef/stop?t=2") => (204, String::new()),
+            ("DELETE", "/containers/owned-id-1234567890abcdef?force=true") => (204, String::new()),
+            ("POST", "/containers/create?name=shared-web") => {
+                (201, r#"{"Id":"new-id-abcdef123456"}"#.to_owned())
+            }
+            ("POST", "/containers/new-id-abcdef123456/start") => (204, String::new()),
+            ("GET", "/containers/new-id-abcdef123456/json") => {
+                (200, r#"{"Id":"new-id-abcdef123456","NetworkSettings":{"Ports":{}}}"#.to_owned())
+            }
+            _ => (500, format!("unexpected {method} {target}")),
+        })
+        .await;
+        let owned_client = mock_compose_sandbox_client(owned_server.endpoint_uri.clone());
+        let started = compose_up_in_sandbox(
+            &owned_client,
+            &SandboxId::new("sb-1"),
+            &spec,
+            false,
+            Duration::from_secs(10),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].container_id, "new-id-abcde");
+        let owned_reqs = owned_server.recorded_requests();
+        assert!(owned_reqs
+            .contains(&"POST /containers/owned-id-1234567890abcdef/stop?t=2".to_owned()));
+        assert!(owned_reqs
+            .contains(&"DELETE /containers/owned-id-1234567890abcdef?force=true".to_owned()));
+        assert!(!owned_reqs.iter().any(|r| {
+            r == "POST /containers/shared-web/stop?t=2"
+                || r == "DELETE /containers/shared-web?force=true"
+        }));
+        owned_server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn compose_down_continues_cleanup_across_errors_tolerates_404_and_returns_error() {
+        let server = MockDockerServer::start("down409", |method, target| match (method, target) {
+            ("GET", "/containers/json?all=true") => (
+                200,
+                json!([
+                    {
+                        "Id": "ctr-1",
+                        "Names": ["/demo-db-1"],
+                        "Image": "postgres:16",
+                        "State": "running",
+                        "Status": "Up",
+                        "Labels": {
+                            LABEL_PROJECT: "demo",
+                            LABEL_SERVICE: "db",
+                        }
+                    },
+                    {
+                        "Id": "ctr-2",
+                        "Names": ["/demo-web-1"],
+                        "Image": "alpine:latest",
+                        "State": "running",
+                        "Status": "Up",
+                        "Labels": {
+                            LABEL_PROJECT: "demo",
+                            LABEL_SERVICE: "web",
+                        }
+                    }
+                ])
+                .to_string(),
+            ),
+            ("POST", "/containers/ctr-2/stop?t=3") => (204, String::new()),
+            ("DELETE", "/containers/ctr-2?force=true") => {
+                (409, r#"{"message":"container in use"}"#.to_owned())
+            }
+            ("POST", "/containers/ctr-1/stop?t=3") => (204, String::new()),
+            ("DELETE", "/containers/ctr-1?force=true") => (204, String::new()),
+            ("GET", "/networks") => (
+                200,
+                json!([
+                    { "Name": "demo_default", "Labels": { LABEL_PROJECT: "demo" } }
+                ])
+                .to_string(),
+            ),
+            ("DELETE", "/networks/demo_default") => (204, String::new()),
+            ("GET", "/volumes") => (
+                200,
+                json!({
+                    "Volumes": [
+                        { "Name": "demo_data", "Labels": { LABEL_PROJECT: "demo" } }
+                    ]
+                })
+                .to_string(),
+            ),
+            ("DELETE", "/volumes/demo_data") => (404, r#"{"message":"no such volume"}"#.to_owned()),
+            _ => (500, format!("unexpected {method} {target}")),
+        })
+        .await;
+
+        let client = mock_compose_sandbox_client(server.endpoint_uri.clone());
+        let err = execute_compose(
+            &client,
+            &SandboxId::new("sb-1"),
+            true,
+            ComposeAction::Down {
+                file: None,
+                project: Some("demo".to_owned()),
+                volumes: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(_)), "got {err:?}");
+
+        let reqs = server.recorded_requests();
+        assert!(reqs.contains(&"DELETE /containers/ctr-2?force=true".to_owned()));
+        assert!(reqs.contains(&"DELETE /containers/ctr-1?force=true".to_owned()));
+        assert!(reqs.contains(&"DELETE /networks/demo_default".to_owned()));
+        assert!(reqs.contains(&"DELETE /volumes/demo_data".to_owned()));
+        server.stop().await;
+
+        let ok_server = MockDockerServer::start("down404ok", |method, target| match (method, target) {
+            ("GET", "/containers/json?all=true") => (
+                200,
+                json!([
+                    {
+                        "Id": "ctr-gone",
+                        "Names": ["/demo-web-1"],
+                        "Image": "alpine:latest",
+                        "State": "exited",
+                        "Status": "Exited",
+                        "Labels": {
+                            LABEL_PROJECT: "demo",
+                            LABEL_SERVICE: "web",
+                        }
+                    }
+                ])
+                .to_string(),
+            ),
+            ("POST", "/containers/ctr-gone/stop?t=3") => (404, String::new()),
+            ("DELETE", "/containers/ctr-gone?force=true") => (404, String::new()),
+            ("GET", "/networks") => (
+                200,
+                json!([{ "Name": "demo_default", "Labels": { LABEL_PROJECT: "demo" } }]).to_string(),
+            ),
+            ("DELETE", "/networks/demo_default") => (404, String::new()),
+            ("GET", "/volumes") => (200, json!({ "Volumes": null }).to_string()),
+            _ => (500, format!("unexpected {method} {target}")),
+        })
+        .await;
+        let ok_client = mock_compose_sandbox_client(ok_server.endpoint_uri.clone());
+        let summary = compose_down_in_sandbox(&ok_client, &SandboxId::new("sb-1"), "demo", true)
+            .await
+            .unwrap();
+        assert_eq!(summary["removed_containers"], 1);
+        assert_eq!(summary["removed_networks"], 0);
+        assert_eq!(summary["removed_volumes"], 0);
+        ok_server.stop().await;
     }
 }

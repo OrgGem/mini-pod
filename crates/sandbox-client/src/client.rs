@@ -460,16 +460,32 @@ impl ClientExecStream {
         if let Some(res) = &self.cached_exit {
             return res.clone();
         }
-        let Some(mut rx) = self.exit_rx.take() else {
+        if self.exit_rx.is_none() {
             return Err(SandboxError::Internal(
                 "execution exit status receiver unavailable".to_owned(),
             ));
-        };
+        }
 
+        let mut output_open = true;
         let exit_res = loop {
-            tokio::select! {
+            enum Step {
+                Exit(Result<Result<ExecExitStatus, SandboxError>, oneshot::error::RecvError>),
+                OutputClosed,
+                Continue,
+            }
+
+            let rx = self.exit_rx.as_mut().expect("exit_rx verified present");
+            let step = tokio::select! {
                 biased;
-                res = &mut rx => {
+                res = rx => Step::Exit(res),
+                chunk = self.output_rx.recv(), if output_open => match chunk {
+                    Some(_) => Step::Continue,
+                    None => Step::OutputClosed,
+                },
+            };
+            match step {
+                Step::Exit(res) => {
+                    self.exit_rx = None;
                     break match res {
                         Ok(status) => status,
                         Err(_) => Err(SandboxError::Transport(
@@ -477,16 +493,10 @@ impl ClientExecStream {
                         )),
                     };
                 }
-                chunk = self.output_rx.recv() => {
-                    if chunk.is_none() {
-                        break match rx.await {
-                            Ok(status) => status,
-                            Err(_) => Err(SandboxError::Transport(
-                                "execution stream terminated before reporting exit status".to_owned(),
-                            )),
-                        };
-                    }
+                Step::OutputClosed => {
+                    output_open = false;
                 }
+                Step::Continue => {}
             }
         };
 
@@ -1620,6 +1630,61 @@ mod tests {
             .unwrap();
         let exit = flood_stream.wait_exit().await.unwrap();
         assert_eq!(exit.code, Some(0));
+
+        join_server_tasks(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn client_exec_stream_wait_exit_remains_usable_after_caller_cancellation() {
+        let exit_gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_srv = Arc::clone(&exit_gate);
+        let (client, tasks) = make_mock_client(move |mut stream| {
+            let gate = Arc::clone(&gate_for_srv);
+            async move {
+                let _ = read_control_frame(&mut stream).await.unwrap().unwrap();
+                write_control_frame(
+                    &mut stream,
+                    &ControlResponse::ExecStarted { stream_id: 44 }
+                        .to_json_bytes()
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+                gate.notified().await;
+                write_control_frame(
+                    &mut stream,
+                    &ExecWireEvent::Exit(ExecExitStatus {
+                        code: Some(0),
+                        timed_out: false,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    })
+                    .to_json_bytes()
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let mut exec = client
+            .exec_stream(&SandboxId::new("sb-1"), test_exec_req())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), exec.wait_exit())
+                .await
+                .is_err(),
+            "first wait_exit should time out while exit frame is still pending"
+        );
+
+        exit_gate.notify_one();
+        let exit = exec
+            .wait_exit()
+            .await
+            .expect("second wait_exit after cancellation must still receive exit status");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(exec.wait_exit().await.unwrap().code, Some(0));
 
         join_server_tasks(tasks).await;
     }

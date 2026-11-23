@@ -410,19 +410,37 @@ async fn export_image_to_host_tar(
                 output_tar.display()
             ))
         })?;
-    let seq = BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
-    let mut tmp_guard = TempFileGuard(Some(tmp_path.clone()));
-
     let mut tmp_opts = OpenOptions::new();
     tmp_opts.write(true).create_new(true);
     apply_open_no_follow(&mut tmp_opts);
-    let mut tmp_file = tmp_opts.open(&tmp_path).map_err(|err| {
-        SandboxError::Transport(format!(
-            "failed creating temporary archive '{}': {err}",
-            tmp_path.display()
-        ))
-    })?;
+    let mut tmp_guard = TempFileGuard(None);
+    let (mut tmp_file, tmp_path) = {
+        let mut created = None;
+        for _ in 0..16 {
+            let seq = BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+            match tmp_opts.open(&candidate) {
+                Ok(file) => {
+                    tmp_guard.0 = Some(candidate.clone());
+                    created = Some((file, candidate));
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(SandboxError::Transport(format!(
+                        "failed creating temporary archive '{}': {err}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+        created.ok_or_else(|| {
+            SandboxError::Transport(format!(
+                "exhausted temporary archive filenames for '{}'",
+                output_tar.display()
+            ))
+        })?
+    };
     let open_meta = tmp_file.metadata().map_err(|err| {
         SandboxError::Transport(format!(
             "failed inspecting temporary archive '{}': {err}",
@@ -632,6 +650,67 @@ mod tests {
                 .await,
                 Err(SandboxError::PolicyViolation(_))
             ));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn export_image_to_host_tar_preserves_preexisting_temp_files_on_collision() {
+        let dir = std::env::temp_dir().join(format!(
+            "mp-img-export-collide-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let client = SandboxClient::with_connector(
+            sandbox_client::ControlEndpoint::NamedPipe("unused".to_owned()),
+            |_| async { Err::<tokio::io::DuplexStream, _>(SandboxError::Transport("stub".to_owned())) },
+        );
+
+        // 1. Single collision skips the pre-existing file without deleting it and uses the next seq.
+        let collide_tar = dir.join("collide.tar");
+        let next_seq = BUILD_SEQ.load(Ordering::Acquire);
+        let existing_tmp = dir.join(format!(".collide.tar.tmp.{}.{next_seq}", std::process::id()));
+        fs::write(&existing_tmp, b"keep-me-1").unwrap();
+        let err = export_image_to_host_tar(
+            &client,
+            &SandboxId::new("sb-1"),
+            "demo:1",
+            &collide_tar,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(_)), "got {err:?}");
+        assert_eq!(fs::read(&existing_tmp).unwrap(), b"keep-me-1");
+
+        // 2. Exhausting all 16 candidates leaves every pre-existing temp file untouched.
+        let exhaust_tar = dir.join("exhaust.tar");
+        let base_seq = BUILD_SEQ.load(Ordering::Acquire);
+        let mut pre_existing = Vec::new();
+        for offset in 0..16u64 {
+            let p = dir.join(format!(
+                ".exhaust.tar.tmp.{}.{}",
+                std::process::id(),
+                base_seq + offset
+            ));
+            fs::write(&p, format!("pre-{offset}").as_bytes()).unwrap();
+            pre_existing.push((offset, p));
+        }
+        let err = export_image_to_host_tar(
+            &client,
+            &SandboxId::new("sb-1"),
+            "demo:1",
+            &exhaust_tar,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(_)), "got {err:?}");
+        for (offset, p) in pre_existing {
+            assert_eq!(fs::read(&p).unwrap(), format!("pre-{offset}").as_bytes());
         }
 
         let _ = fs::remove_dir_all(&dir);

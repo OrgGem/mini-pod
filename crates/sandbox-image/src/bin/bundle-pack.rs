@@ -386,14 +386,31 @@ fn write_atomic_synced(
         Err(err) => return Err(map_io_error(target_path, "inspect output path", err)),
     }
 
-    let tmp_path = parent.join(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut tmp_guard = TempFileGuard(Some(tmp_path.clone()));
+    let mut tmp_guard = TempFileGuard(None);
+    let tmp_path = {
+        let mut chosen = None;
+        for _ in 0..16 {
+            let candidate = parent.join(format!(
+                ".{file_name}.tmp-{}-{}",
+                std::process::id(),
+                NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            if fs::symlink_metadata(&candidate).is_ok() {
+                continue;
+            }
+            chosen = Some(candidate);
+            break;
+        }
+        chosen.ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "exhausted temporary output filenames for '{}'",
+                target_path.display()
+            ))
+        })?
+    };
 
     let mut file = create_new_temp_output_file(&tmp_path, restrict_owner_only)?;
+    tmp_guard.0 = Some(tmp_path.clone());
     file.write_all(bytes)
         .map_err(|err| map_io_error(&tmp_path, "write temporary output file", err))?;
     file.sync_all()

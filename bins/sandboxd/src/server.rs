@@ -923,10 +923,6 @@ fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), Sandbo
                 path.display()
             ))
         })?;
-    let seq = NEXT_READY_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
-    let mut guard = TempFileGuard(Some(tmp_path.clone()));
-
     let payload = serde_json::to_vec(&json!({
         "endpoint": endpoint_uri,
         "pid": std::process::id(),
@@ -937,12 +933,34 @@ fn write_ready_file_atomic(path: &Path, endpoint_uri: &str) -> Result<(), Sandbo
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     apply_open_no_follow(&mut opts);
-    let mut file = opts.open(&tmp_path).map_err(|err| {
-        SandboxError::Transport(format!(
-            "failed to open temporary ready-file '{}': {err}",
-            tmp_path.display()
-        ))
-    })?;
+    let mut guard = TempFileGuard(None);
+    let (mut file, tmp_path) = {
+        let mut created = None;
+        for _ in 0..16 {
+            let seq = NEXT_READY_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+            match opts.open(&candidate) {
+                Ok(file) => {
+                    guard.0 = Some(candidate.clone());
+                    created = Some((file, candidate));
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(SandboxError::Transport(format!(
+                        "failed to open temporary ready-file '{}': {err}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+        created.ok_or_else(|| {
+            SandboxError::Transport(format!(
+                "exhausted temporary ready-file filenames for '{}'",
+                path.display()
+            ))
+        })?
+    };
     let open_meta = file.metadata().map_err(|err| {
         SandboxError::Transport(format!(
             "failed to inspect temporary ready-file '{}': {err}",
@@ -2536,7 +2554,11 @@ mod tests {
             .spawn_keyed("00000000-0000-4000-8000-000000000011".to_owned(), spec)
             .await
             .unwrap();
-        assert_eq!(new_lease.id.as_str(), old_id, "the stub models PID-derived ID reuse");
+        assert_ne!(
+            new_lease.id.as_str(),
+            old_id,
+            "reconstructed daemon allocates randomized sandbox IDs across restarts"
+        );
         assert!(matches!(
             client_after_restart
                 .spawn_keyed(operation_id, sample_spec(NetworkPolicy::Isolated))
@@ -2600,10 +2622,9 @@ mod tests {
             .spawn_keyed("00000000-0000-4000-8000-000000000007".to_owned(), spec)
             .await
             .unwrap();
-        // The stub runtime derives IDs from its PID counter, which is reset on
-        // daemon reconstruction. This models OS PID reuse: a fresh operation
-        // may get the same printable ID, but an old receipt must stay expired.
-        assert_eq!(new_lease.id, old_lease.id);
+        // Reconstructed daemons allocate fresh randomized sandbox IDs even under identical OS PIDs,
+        // so late operations or destroys targeting `old_lease.id` can never cancel `new_lease.id`.
+        assert_ne!(new_lease.id, old_lease.id);
         assert!(matches!(
             client_after_restart
                 .spawn_keyed(operation_id, sample_spec(NetworkPolicy::Isolated))

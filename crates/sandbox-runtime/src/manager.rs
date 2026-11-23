@@ -355,7 +355,7 @@ impl LocalRuntimeManager {
         let warm_pool = WarmPoolStore::new();
         let active_for_rss = Arc::downgrade(&active);
         let warm_pool_for_rss = warm_pool.downgrade();
-        let observed_rss_fn = Arc::new(move || -> u64 {
+        let observed_rss_overage_fn = Arc::new(move || -> u64 {
             let mut collected: Vec<(Arc<dyn VmSessionPort>, u64)> = Vec::new();
             if let Some(active_arc) = active_for_rss.upgrade() {
                 let guard = lock_unpoisoned(&active_arc);
@@ -377,11 +377,11 @@ impl LocalRuntimeManager {
                         .current_rss_bytes()
                         .map(bytes_to_mib_ceil)
                         .unwrap_or(0);
-                    reserved_mb.max(live_mb)
+                    live_mb.saturating_sub(reserved_mb)
                 })
-                .sum()
+                .fold(0u64, u64::saturating_add)
         });
-        let admission = AdmissionController::new(config.admission.clone(), observed_rss_fn);
+        let admission = AdmissionController::new(config.admission.clone(), observed_rss_overage_fn);
 
         Ok(Self {
             config,
@@ -423,6 +423,32 @@ impl LocalRuntimeManager {
 
     pub fn config(&self) -> &RuntimeManagerConfig {
         &self.config
+    }
+
+    fn allocate_sandbox_id(&self) -> Result<SandboxId, SandboxError> {
+        for _ in 0..8 {
+            let mut entropy = [0u8; 12];
+            getrandom::getrandom(&mut entropy).map_err(|err| {
+                SandboxError::Internal(format!("failed generating random sandbox ID: {err}"))
+            })?;
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let mut rand_hex = String::with_capacity(24);
+            for byte in entropy {
+                use std::fmt::Write as _;
+                let _ = write!(&mut rand_hex, "{byte:02x}");
+            }
+            let candidate = SandboxId::new(format!("mp-{rand_hex}-{seq}"));
+            let in_use = lock_unpoisoned(&self.active).contains_key(&candidate)
+                || self.warm_pool.contains_live_id(&candidate)
+                || self.is_in_flight_spawn(&candidate)
+                || lock_unpoisoned(&self.in_flight_destroys).contains_key(&candidate);
+            if !in_use {
+                return Ok(candidate);
+            }
+        }
+        Err(SandboxError::Internal(
+            "failed to allocate non-colliding sandbox ID".to_owned(),
+        ))
     }
 
     /// Returns a snapshot of current host admission reservations and effective live RSS.
@@ -568,8 +594,7 @@ impl LocalRuntimeManager {
             let Some(permit) = self.admission.try_acquire_background(&boot_spec) else {
                 break;
             };
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
+            let sandbox_id = self.allocate_sandbox_id()?;
             let Some(guard) = self
                 .warm_pool
                 .try_begin_replenish(target_size, sandbox_id.clone())
@@ -2193,8 +2218,7 @@ impl RuntimeManager for LocalRuntimeManager {
 
         let permit = self.admission.acquire(&spec).await?;
 
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let sandbox_id = SandboxId::new(format!("mp-{}-{seq}", std::process::id()));
+        let sandbox_id = self.allocate_sandbox_id()?;
         let spawn_guard = self.begin_cold_spawn(&sandbox_id);
 
         let (booted, permit, spawn_guard, _) = self
@@ -6500,5 +6524,153 @@ mod tests {
         );
         mgr.warm_pool.end_drain();
         assert!(!mgr.warm_pool.is_draining());
+    }
+
+    #[tokio::test]
+    async fn sandbox_ids_stay_unique_across_manager_restarts_with_same_pid() {
+        let tmp = TestTempDir::new("mgr-restart-unique-ids");
+        let state_dir = tmp.path().join("state");
+        let spec = valid_spec(Duration::from_secs(60));
+
+        let mut cfg1 = base_config(state_dir.clone());
+        cfg1.warm_pool.target_size = 1;
+        cfg1.warm_pool.template_spec = Some(spec.clone());
+        let mgr1 = LocalRuntimeManager::new(
+            cfg1,
+            Arc::new(MockOverlayStore::default()),
+            Arc::new(MockVmRuntime::new(true)),
+        )
+        .unwrap();
+        assert_eq!(mgr1.warm_up().await.unwrap(), 1);
+        let warm_lease1 = mgr1.spawn(spec.clone()).await.unwrap();
+        let cold_lease1 = mgr1.spawn(spec.clone()).await.unwrap();
+        mgr1.destroy(&warm_lease1.id).await.unwrap();
+        mgr1.destroy(&cold_lease1.id).await.unwrap();
+        mgr1.drain_warm_pool().await.unwrap();
+        drop(mgr1);
+
+        let mut cfg2 = base_config(state_dir);
+        cfg2.warm_pool.target_size = 1;
+        cfg2.warm_pool.template_spec = Some(spec.clone());
+        let mgr2 = LocalRuntimeManager::new(
+            cfg2,
+            Arc::new(MockOverlayStore::default()),
+            Arc::new(MockVmRuntime::new(true)),
+        )
+        .unwrap();
+        assert_eq!(mgr2.warm_up().await.unwrap(), 1);
+        let warm_lease2 = mgr2.spawn(spec.clone()).await.unwrap();
+        let cold_lease2 = mgr2.spawn(spec).await.unwrap();
+
+        assert_ne!(warm_lease2.id, warm_lease1.id);
+        assert_ne!(cold_lease2.id, cold_lease1.id);
+        assert_ne!(warm_lease2.id, cold_lease2.id);
+
+        // A late destroy carrying an old sandbox ID must never affect the restarted manager's sandboxes.
+        mgr2.destroy(&warm_lease1.id).await.unwrap();
+        mgr2.destroy(&cold_lease1.id).await.unwrap();
+        assert!(mgr2.active_sandbox_network(&warm_lease2.id).is_ok());
+        assert!(mgr2.active_sandbox_network(&cold_lease2.id).is_ok());
+
+        mgr2.destroy(&warm_lease2.id).await.unwrap();
+        mgr2.destroy(&cold_lease2.id).await.unwrap();
+        mgr2.drain_warm_pool().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn booting_vm_rss_reservation_cannot_be_masked_by_running_vm_overage() {
+        struct PausedSecondBootVm {
+            calls: AtomicU64,
+            boot2_entered: tokio::sync::Notify,
+            release_boot2: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl VmRuntimePort for PausedSecondBootVm {
+            async fn boot_vm(&self, _cfg: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+                let n = self.calls.fetch_add(1, Ordering::AcqRel);
+                if n == 1 {
+                    self.boot2_entered.notify_one();
+                    self.release_boot2.notified().await;
+                }
+                let rss_bytes = AtomicU64::new(if n == 0 { 300 * 1024 * 1024 } else { 0 });
+                let session = MockVmSession {
+                    pid: 8100 + n as u32,
+                    start_token: 9100 + n,
+                    artifacts: Vec::new(),
+                    state: Arc::new(MockSessionState {
+                        alive: AtomicBool::new(true),
+                        dropped_count: AtomicU64::new(0),
+                        rss_bytes,
+                        fail_enable_egress: AtomicBool::new(false),
+                        graceful_succeeds: true,
+                        graceful_calls: Mutex::new(0),
+                        force_kill_calls: Mutex::new(0),
+                        copied_in: Mutex::new(Vec::new()),
+                        copy_out_archive: Mutex::new(Vec::new()),
+                        egress_enabled_port: Mutex::new(None),
+                        egress_tx: Mutex::new(None),
+                    }),
+                };
+                Ok(VmBootOutcome {
+                    session: Box::new(session),
+                    pid: 8100 + n as u32,
+                    start_token: 9100 + n,
+                    artifact_paths: Vec::new(),
+                    hardware_accelerated: true,
+                    capabilities: CapabilityReport {
+                        cpu_quota: EnforcementLevel::HardLimit,
+                        host_rss: EnforcementLevel::BestEffort,
+                        host_storage: EnforcementLevel::BestEffort,
+                        egress_filter: EnforcementLevel::HardLimit,
+                    },
+                    egress_rx: None,
+                })
+            }
+
+            async fn kill_orphan_process(&self, _: u32, _: u64) -> Result<bool, SandboxError> {
+                Ok(false)
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-booting-rss-cap");
+        let vm = Arc::new(PausedSecondBootVm {
+            calls: AtomicU64::new(0),
+            boot2_entered: tokio::sync::Notify::new(),
+            release_boot2: tokio::sync::Notify::new(),
+        });
+        let mut cfg = base_config(tmp.path().join("state"));
+        cfg.admission = AdmissionLimits {
+            max_total_host_rss_mb: Some(512),
+            ..Default::default()
+        };
+        let mgr = Arc::new(
+            LocalRuntimeManager::new(cfg, Arc::new(MockOverlayStore::default()), vm.clone())
+                .unwrap(),
+        );
+
+        let mut spec = valid_spec(Duration::from_secs(60));
+        spec.budget.guest_ram_mb = 128;
+        spec.budget.host_rss_budget_mb = Some(128);
+
+        let lease1 = mgr.spawn(spec.clone()).await.unwrap();
+        let mgr_boot2 = Arc::clone(&mgr);
+        let spec_boot2 = spec.clone();
+        let boot2_task = tokio::spawn(async move { mgr_boot2.spawn(spec_boot2).await });
+        vm.boot2_entered.notified().await;
+
+        let usage = mgr.current_admission_usage();
+        assert_eq!(usage.reserved_host_rss_mb, 256);
+        assert_eq!(usage.effective_host_rss_mb, 428);
+
+        // 428 + 128 = 556 MiB > 512 MiB cap -> 3rd spawn must be rejected immediately.
+        assert!(matches!(
+            mgr.spawn(spec).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        vm.release_boot2.notify_one();
+        let lease2 = boot2_task.await.unwrap().unwrap();
+        mgr.destroy(&lease1.id).await.unwrap();
+        mgr.destroy(&lease2.id).await.unwrap();
     }
 }

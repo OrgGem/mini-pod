@@ -59,6 +59,7 @@ pub struct ExecStream {
     host_stdout_truncated: bool,
     host_stderr_truncated: bool,
     output_stopped: bool,
+    host_tripped_deadline: Option<Instant>,
 }
 
 /// Standalone sender handle for writing execution `stdin` chunks or closing `stdin` independently
@@ -120,6 +121,7 @@ impl ExecStream {
             host_stdout_truncated: false,
             host_stderr_truncated: false,
             output_stopped: false,
+            host_tripped_deadline: None,
         };
         let handle = ExecStreamHandle {
             stream_id,
@@ -252,21 +254,28 @@ impl ExecStream {
         if let Some(res) = &self.cached_exit {
             return res.clone();
         }
-        let Some(mut rx) = self.exit_rx.take() else {
+        let Some(rx) = self.exit_rx.as_mut() else {
             return Err(SandboxError::Internal(
                 "execution exit status receiver unavailable".to_owned(),
             ));
         };
 
         let res = match rx.try_recv() {
-            Ok(status) => self.merge_host_exit(status),
-            Err(oneshot::error::TryRecvError::Closed) if self.host_tripped() => {
-                Ok(self.synthesized_host_exit())
+            Ok(status) => {
+                self.exit_rx = None;
+                self.merge_host_exit(status)
             }
-            Err(oneshot::error::TryRecvError::Closed) => Err(SandboxError::Transport(
-                "execution stream terminated before reporting exit status".to_owned(),
-            )),
-            Err(oneshot::error::TryRecvError::Empty) => self.await_exit_receiver(&mut rx).await,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.exit_rx = None;
+                if self.host_tripped() {
+                    Ok(self.synthesized_host_exit())
+                } else {
+                    Err(SandboxError::Transport(
+                        "execution stream terminated before reporting exit status".to_owned(),
+                    ))
+                }
+            }
+            Err(oneshot::error::TryRecvError::Empty) => self.await_exit_receiver().await,
         };
         self.cached_exit = Some(res.clone());
         res
@@ -312,6 +321,9 @@ impl ExecStream {
         self.output_stopped = true;
         self.stdin_tx = None;
         self.output_rx.close();
+        if self.host_tripped_deadline.is_none() {
+            self.host_tripped_deadline = Instant::now().checked_add(self.exit_drain_grace());
+        }
         let _ = self.cancel();
     }
 
@@ -369,64 +381,80 @@ impl ExecStream {
         }
     }
 
-    async fn await_exit_receiver(
-        &mut self,
-        rx: &mut oneshot::Receiver<Result<ExecExitStatus, SandboxError>>,
-    ) -> Result<ExecExitStatus, SandboxError> {
+    async fn await_exit_receiver(&mut self) -> Result<ExecExitStatus, SandboxError> {
         if !self.host_tripped() {
             let maybe_deadline = self.limits.and_then(|l| l.deadline_at);
             let mut output_open = !self.output_stopped;
             loop {
-                tokio::select! {
+                enum Step {
+                    Exit(Result<Result<ExecExitStatus, SandboxError>, oneshot::error::RecvError>),
+                    HostDeadline,
+                    Chunk(Option<ExecOutputChunk>),
+                }
+
+                let rx = self
+                    .exit_rx
+                    .as_mut()
+                    .expect("exit_rx present while awaiting exit");
+                let step = tokio::select! {
                     biased;
-                    exit_res = &mut *rx => {
-                        return match exit_res {
-                            Ok(status) => self.merge_host_exit(status),
-                            Err(_) => Err(SandboxError::Transport(
-                                "execution stream terminated before reporting exit status".to_owned(),
-                            )),
-                        };
-                    }
+                    exit_res = rx => Step::Exit(exit_res),
                     _ = async {
                         match maybe_deadline {
                             Some(dl) => tokio::time::sleep_until(dl).await,
                             None => std::future::pending::<()>().await,
                         }
-                    }, if maybe_deadline.is_some() => {
+                    }, if maybe_deadline.is_some() => Step::HostDeadline,
+                    chunk = self.output_rx.recv(), if output_open => Step::Chunk(chunk),
+                };
+
+                match step {
+                    Step::Exit(exit_res) => {
+                        self.exit_rx = None;
+                        return match exit_res {
+                            Ok(status) => self.merge_host_exit(status),
+                            Err(_) => Err(SandboxError::Transport(
+                                "execution stream terminated before reporting exit status"
+                                    .to_owned(),
+                            )),
+                        };
+                    }
+                    Step::HostDeadline => {
                         self.trip_host_timeout();
                         break;
                     }
-                    chunk = self.output_rx.recv(), if output_open => {
-                        match chunk {
-                            Some(c) => {
-                                self.account_discarded_chunk(&c);
-                                if self.host_tripped() {
-                                    break;
-                                }
-                            }
-                            None => {
-                                output_open = false;
-                                if maybe_deadline.is_none() {
-                                    return match rx.await {
-                                        Ok(status) => self.merge_host_exit(status),
-                                        Err(_) => Err(SandboxError::Transport(
-                                            "execution stream terminated before reporting exit status".to_owned(),
-                                        )),
-                                    };
-                                }
-                            }
+                    Step::Chunk(Some(c)) => {
+                        self.account_discarded_chunk(&c);
+                        if self.host_tripped() {
+                            break;
                         }
+                    }
+                    Step::Chunk(None) => {
+                        output_open = false;
+                        self.output_stopped = true;
                     }
                 }
             }
         }
 
         let grace = self.exit_drain_grace();
-        match tokio::time::timeout(grace, rx).await {
-            Ok(Ok(status)) => self.merge_host_exit(status),
-            Ok(Err(_)) => Ok(self.synthesized_host_exit()),
-            Err(_) => Ok(self.synthesized_host_exit()),
-        }
+        let grace_dl = *self
+            .host_tripped_deadline
+            .get_or_insert_with(|| Instant::now() + grace);
+        let rx = self
+            .exit_rx
+            .as_mut()
+            .expect("exit_rx present during grace drain");
+        let res = tokio::select! {
+            biased;
+            exit_res = rx => match exit_res {
+                Ok(status) => self.merge_host_exit(status),
+                Err(_) => Ok(self.synthesized_host_exit()),
+            },
+            _ = tokio::time::sleep_until(grace_dl) => Ok(self.synthesized_host_exit()),
+        };
+        self.exit_rx = None;
+        res
     }
 }
 
@@ -678,5 +706,30 @@ mod tests {
         let closed_exit = stream_closed.wait_exit().await.unwrap();
         assert!(closed_exit.stdout_truncated);
         assert_eq!(closed_exit.code, None);
+    }
+
+    #[tokio::test]
+    async fn exec_stream_wait_exit_remains_usable_after_caller_cancellation() {
+        let (mut stream, handle) = ExecStream::channel(StreamId(35));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.wait_exit())
+                .await
+                .is_err(),
+            "first wait_exit should time out before exit is delivered"
+        );
+
+        handle.finish(Ok(ExecExitStatus {
+            code: Some(0),
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }));
+
+        let exit = stream
+            .wait_exit()
+            .await
+            .expect("second wait_exit after cancellation must receive exit status");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(stream.wait_exit().await.unwrap().code, Some(0));
     }
 }

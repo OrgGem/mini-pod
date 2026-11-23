@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sandbox_core::{EnforcementLevel, SandboxError};
 
@@ -313,6 +313,36 @@ pub fn kill_verified_orphan_process(
     expected_start_token: u64,
 ) -> Result<bool, SandboxError> {
     platform::kill_verified_orphan_process(pid, expected_start_token)
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn wait_for_verified_orphan_exit<F>(
+    pid: u32,
+    expected_start_token: u64,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut is_still_alive: F,
+) -> Result<(), SandboxError>
+where
+    F: FnMut() -> Result<bool, SandboxError>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !is_still_alive()? {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(deadline.saturating_duration_since(now).min(poll_interval));
+    }
+    if !is_still_alive()? {
+        return Ok(());
+    }
+    Err(SandboxError::Internal(format!(
+        "orphan process {pid} (start_token={expected_start_token}) is still alive after SIGKILL wait timeout"
+    )))
 }
 
 /// Encodes `program` and `args` into a NUL-terminated UTF-16 Windows command line following
@@ -747,5 +777,42 @@ mod tests {
             matches!(timed_out, Err(SandboxError::Transport(_))),
             "expected Transport timeout error, got {timed_out:?}"
         );
+    }
+
+    #[test]
+    fn wait_for_verified_orphan_exit_succeeds_on_exit_and_errors_when_still_alive() {
+        let mut checks = 0u32;
+        wait_for_verified_orphan_exit(
+            4242,
+            99,
+            Duration::from_millis(100),
+            Duration::from_millis(2),
+            || {
+                checks += 1;
+                Ok(checks < 3)
+            },
+        )
+        .expect("should return Ok once process stops matching");
+        assert_eq!(checks, 3);
+
+        let err = wait_for_verified_orphan_exit(
+            4242,
+            99,
+            Duration::from_millis(15),
+            Duration::from_millis(2),
+            || Ok(true),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::Internal(_)), "got {err:?}");
+
+        let probe_err = wait_for_verified_orphan_exit(
+            4242,
+            99,
+            Duration::from_millis(50),
+            Duration::from_millis(2),
+            || Err(SandboxError::Internal("proc read denied".to_owned())),
+        )
+        .unwrap_err();
+        assert!(matches!(probe_err, SandboxError::Internal(_)));
     }
 }

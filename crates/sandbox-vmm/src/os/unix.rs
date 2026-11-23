@@ -843,33 +843,9 @@ pub fn kill_verified_orphan_process(
         return Ok(false);
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(s) => s,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => {
-                return Err(SandboxError::Internal(format!(
-                    "failed to read /proc/{pid}/stat: {err}"
-                )));
-            }
-        };
-        let Some((state, actual_start_token)) = parse_proc_stat_state_and_starttime(&stat) else {
-            return Ok(false);
-        };
-        if state == 'Z' || actual_start_token != expected_start_token {
-            return Ok(false);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let Some((is_zombie, actual_start_token)) = query_macos_proc_bsd_start_token(pid)? else {
-            return Ok(false);
-        };
-        if is_zombie || actual_start_token != expected_start_token {
-            return Ok(false);
-        }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !is_verified_orphan_still_alive(pid, expected_start_token)? {
+        return Ok(false);
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -909,24 +885,13 @@ pub fn kill_verified_orphan_process(
         }
 
         if signaled {
-            let wait_deadline = Instant::now() + Duration::from_millis(500);
-            while Instant::now() < wait_deadline {
-                #[cfg(target_os = "linux")]
-                let still_alive = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-                    Ok(stat) => parse_proc_stat_state_and_starttime(&stat)
-                        .is_some_and(|(st, tok)| st != 'Z' && tok == expected_start_token),
-                    Err(_) => false,
-                };
-                #[cfg(target_os = "macos")]
-                let still_alive = query_macos_proc_bsd_start_token(pid)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(z, tok)| !z && tok == expected_start_token);
-                if !still_alive {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            crate::process::wait_for_verified_orphan_exit(
+                pid,
+                expected_start_token,
+                Duration::from_millis(500),
+                Duration::from_millis(5),
+                || is_verified_orphan_still_alive(pid, expected_start_token),
+            )?;
         }
 
         #[cfg(target_os = "linux")]
@@ -935,6 +900,41 @@ pub fn kill_verified_orphan_process(
         }
 
         Ok(signaled)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_verified_orphan_still_alive(pid: u32, expected_start_token: u64) -> Result<bool, SandboxError> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(false);
+            }
+            Err(err) => {
+                return Err(SandboxError::Internal(format!(
+                    "failed to read /proc/{pid}/stat: {err}"
+                )));
+            }
+        };
+        Ok(
+            parse_proc_stat_state_and_starttime(&stat).is_some_and(|(state, actual_start_token)| {
+                state != 'Z' && actual_start_token == expected_start_token
+            }),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(
+            query_macos_proc_bsd_start_token(pid)?.is_some_and(|(is_zombie, actual_start_token)| {
+                !is_zombie && actual_start_token == expected_start_token
+            }),
+        )
     }
 }
 

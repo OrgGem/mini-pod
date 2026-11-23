@@ -131,15 +131,20 @@ impl AdmissionState {
     }
 }
 
-type ObservedRssFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+type ObservedRssOverageFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 struct AdmissionInner {
     limits: AdmissionLimits,
-    observed_rss_mb: ObservedRssFn,
+    observed_rss_overage_mb: ObservedRssOverageFn,
     state: Mutex<AdmissionState>,
 }
 
 impl AdmissionInner {
+    fn effective_rss_mb(&self, state: &AdmissionState) -> u64 {
+        state
+            .reserved_host_rss_mb
+            .saturating_add((self.observed_rss_overage_mb)())
+    }
     fn check_individual_cap(&self, demand: ResourceDemand) -> Result<(), SandboxError> {
         if let Some(max_rss) = self.limits.max_total_host_rss_mb {
             if demand.rss_mb > max_rss {
@@ -177,8 +182,7 @@ impl AdmissionInner {
             }
         }
         if let Some(max_rss) = self.limits.max_total_host_rss_mb {
-            let observed_live = (self.observed_rss_mb)();
-            let live_total_mb = state.reserved_host_rss_mb.max(observed_live);
+            let live_total_mb = self.effective_rss_mb(state);
             if live_total_mb.saturating_add(demand.rss_mb) > max_rss {
                 return Err(format!(
                     "host RSS limit ({max_rss} MiB) exceeded: live_total={live_total_mb} MiB, requested={} MiB",
@@ -268,11 +272,11 @@ pub(crate) struct AdmissionController {
 }
 
 impl AdmissionController {
-    pub(crate) fn new(limits: AdmissionLimits, observed_rss_mb: ObservedRssFn) -> Self {
+    pub(crate) fn new(limits: AdmissionLimits, observed_rss_overage_mb: ObservedRssOverageFn) -> Self {
         Self {
             inner: Arc::new(AdmissionInner {
                 limits,
-                observed_rss_mb,
+                observed_rss_overage_mb,
                 state: Mutex::new(AdmissionState {
                     reserved_count: 0,
                     reserved_host_rss_mb: 0,
@@ -287,11 +291,10 @@ impl AdmissionController {
 
     pub(crate) fn usage(&self) -> AdmissionUsage {
         let state = lock_unpoisoned(&self.inner.state);
-        let observed_live_rss_mb = (self.inner.observed_rss_mb)();
         AdmissionUsage {
             active_sandboxes: state.reserved_count,
             reserved_host_rss_mb: state.reserved_host_rss_mb,
-            effective_host_rss_mb: state.reserved_host_rss_mb.max(observed_live_rss_mb),
+            effective_host_rss_mb: self.inner.effective_rss_mb(&state),
             reserved_host_storage_mb: state.reserved_host_storage_mb,
             reserved_host_cpu_millicores: state.reserved_host_cpu_millicores,
         }
@@ -579,8 +582,8 @@ mod tests {
 
     #[tokio::test]
     async fn live_rss_overage_blocks_new_admissions_until_released() {
-        let observed_rss = Arc::new(AtomicU64::new(0));
-        let observed_ref = Arc::clone(&observed_rss);
+        let observed_overage = Arc::new(AtomicU64::new(0));
+        let observed_ref = Arc::clone(&observed_overage);
         let ctrl = AdmissionController::new(
             AdmissionLimits {
                 max_total_host_rss_mb: Some(512),
@@ -593,22 +596,63 @@ mod tests {
             .acquire(&test_spec(1, Some(500), 128, Some(200), 256))
             .await
             .unwrap();
-        // Observed live RSS exceeds static 200 MiB reservation -> effective total is 400 MiB.
-        observed_rss.store(400, Ordering::Release);
+        // Observed live RSS (400 MiB) exceeds static 200 MiB reservation by 200 MiB -> effective 400 MiB.
+        observed_overage.store(200, Ordering::Release);
         assert!(matches!(
             ctrl.acquire(&test_spec(1, Some(500), 128, Some(200), 256))
                 .await,
             Err(SandboxError::AdmissionRejected(_))
         ));
 
-        // Once live pressure subsides or permit releases, admission succeeds.
-        observed_rss.store(200, Ordering::Release);
+        // Once live pressure subsides to reservation (0 overage) or permit releases, admission succeeds.
+        observed_overage.store(0, Ordering::Release);
         let p2 = ctrl
             .acquire(&test_spec(1, Some(500), 128, Some(200), 256))
             .await
             .unwrap();
         drop(p1);
         drop(p2);
+    }
+
+    #[tokio::test]
+    async fn booting_reservation_is_never_masked_by_running_vm_overage() {
+        let observed_overage = Arc::new(AtomicU64::new(0));
+        let observed_ref = Arc::clone(&observed_overage);
+        let ctrl = AdmissionController::new(
+            AdmissionLimits {
+                max_total_host_rss_mb: Some(512),
+                ..Default::default()
+            },
+            Arc::new(move || observed_ref.load(Ordering::Acquire)),
+        );
+
+        // VM #1 reserves 128 MiB and reports 300 MiB live RSS (+172 MiB overage).
+        let p1 = ctrl
+            .acquire(&test_spec(1, Some(500), 128, Some(128), 256))
+            .await
+            .unwrap();
+        observed_overage.store(172, Ordering::Release);
+
+        // VM #2 is booting (128 MiB reserved, 0 measured RSS yet -> 0 overage).
+        let p2 = ctrl
+            .acquire(&test_spec(1, Some(500), 128, Some(128), 256))
+            .await
+            .unwrap();
+
+        let usage = ctrl.usage();
+        assert_eq!(usage.reserved_host_rss_mb, 256);
+        assert_eq!(usage.effective_host_rss_mb, 428);
+
+        // VM #3 requesting 128 MiB would push effective RSS to 556 MiB > 512 MiB and must reject.
+        let req3 = test_spec(1, Some(500), 128, Some(128), 256);
+        assert!(ctrl.would_exceed_with(&req3));
+        assert!(matches!(
+            ctrl.acquire(&req3).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        drop(p2);
+        drop(p1);
     }
 
     #[tokio::test]
@@ -766,8 +810,8 @@ mod tests {
 
     #[tokio::test]
     async fn would_exceed_with_tracks_static_and_live_rss_without_enqueuing_waiters() {
-        let observed_rss = Arc::new(AtomicU64::new(0));
-        let observed_ref = Arc::clone(&observed_rss);
+        let observed_overage = Arc::new(AtomicU64::new(0));
+        let observed_ref = Arc::clone(&observed_overage);
         let ctrl = AdmissionController::new(
             AdmissionLimits {
                 max_concurrent_sandboxes: Some(2),
@@ -787,12 +831,12 @@ mod tests {
         let p1 = ctrl.acquire(&spec).await.unwrap();
         assert!(!ctrl.would_exceed_with(&spec));
 
-        // Live RSS spike above reserved (400 + 256 > 512) triggers would_exceed_with without queueing.
-        observed_rss.store(400, Ordering::Release);
+        // Live RSS spike above reserved (400 MiB live = 144 MiB overage -> 400 + 256 > 512) triggers would_exceed_with without queueing.
+        observed_overage.store(144, Ordering::Release);
         assert!(ctrl.would_exceed_with(&spec));
         assert!(!ctrl.has_waiters());
 
-        observed_rss.store(256, Ordering::Release);
+        observed_overage.store(0, Ordering::Release);
         let p2 = ctrl.acquire(&spec).await.unwrap();
         // Concurrent sandbox cap (2) reached.
         let tiny = test_spec(1, Some(100), 64, Some(64), 64);
