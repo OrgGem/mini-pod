@@ -1307,10 +1307,6 @@ fn push_stdin_slices(
     pending_stdin: &mut VecDeque<Option<Vec<u8>>>,
     pending_bytes: &mut usize,
 ) {
-    if data.is_empty() {
-        pending_stdin.push_back(Some(Vec::new()));
-        return;
-    }
     for chunk in data.chunks(EXEC_STDIN_SLICE_BYTES) {
         *pending_bytes = pending_bytes.saturating_add(chunk.len());
         pending_stdin.push_back(Some(chunk.to_vec()));
@@ -1413,7 +1409,7 @@ where
                     match frame_res {
                         Ok(Some(raw)) => match ExecWireClientMsg::from_json_bytes(&raw) {
                             Ok(ExecWireClientMsg::Stdin { data }) => {
-                                if !stdin_closed && !stdin_channel_closed {
+                                if !data.is_empty() && !stdin_closed && !stdin_channel_closed {
                                     if pending_bytes >= EXEC_MAX_PENDING_STDIN_BYTES {
                                         lookahead_stdin = Some(data);
                                     } else {
@@ -3041,5 +3037,78 @@ mod tests {
         assert!(!ops_dir.join(format!("{huge_op}.spec")).exists());
 
         client.destroy(&seed_lease.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_stdin_frame_flood_is_ignored_and_cancel_still_completes() {
+        use tokio::sync::Notify;
+
+        let tmp = TestTempDir::new("exec-empty-stdin-flood");
+        let (state, cancel_seen) = build_test_state(&tmp);
+        let client = test_client(Arc::clone(&state));
+        let lease = client
+            .spawn(sample_spec(NetworkPolicy::Isolated))
+            .await
+            .unwrap();
+
+        let start_bytes = ControlRequest::ExecStart {
+            id: lease.id.clone(),
+            req: ExecRequest {
+                target: ExecTarget::Guest,
+                argv: vec!["block-stdin".to_owned()],
+                env: BTreeMap::new(),
+                cwd: None,
+                user: None,
+                deadline: Duration::from_secs(30),
+                stdout_budget_bytes: 64 * 1024,
+                stderr_budget_bytes: 64 * 1024,
+            },
+        }
+        .to_json_bytes()
+        .unwrap();
+
+        let (mut cli_end, srv_end) = duplex(1024 * 1024);
+        let done = Arc::new(Notify::new());
+        let done_tx = Arc::clone(&done);
+        let st_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _ = serve_connection(srv_end, st_clone).await;
+            done_tx.notify_one();
+        });
+        write_control_frame(&mut cli_end, &start_bytes)
+            .await
+            .unwrap();
+        let started_raw = read_control_frame(&mut cli_end).await.unwrap().unwrap();
+        assert!(matches!(
+            ControlResponse::from_json_bytes(&started_raw).unwrap(),
+            ControlResponse::ExecStarted { .. }
+        ));
+
+        // Flood empty 0-byte Stdin frames on wire after non-empty fill, then Cancel.
+        let non_empty = (ExecWireClientMsg::Stdin {
+            data: vec![b'z'; 1024 * 1024],
+        })
+        .to_json_bytes()
+        .unwrap();
+        write_control_frame(&mut cli_end, &non_empty).await.unwrap();
+        let empty_frame = (ExecWireClientMsg::Stdin { data: Vec::new() })
+            .to_json_bytes()
+            .unwrap();
+        for _ in 0..5_000 {
+            write_control_frame(&mut cli_end, &empty_frame)
+                .await
+                .unwrap();
+        }
+        let cancel_frame = ExecWireClientMsg::Cancel.to_json_bytes().unwrap();
+        write_control_frame(&mut cli_end, &cancel_frame)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), done.notified())
+            .await
+            .expect("empty Stdin flood must not stall or block Cancel");
+        assert!(cancel_seen.load(Ordering::Acquire));
+
+        client.destroy(&lease.id).await.unwrap();
     }
 }

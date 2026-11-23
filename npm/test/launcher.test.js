@@ -7,7 +7,7 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 
-const { platformPackage } = require('../launcher');
+const { platformPackage, shouldForwardSignal, exitCodeForSignal } = require('../launcher');
 const { stage } = require('../scripts/stage');
 const main = require('../package.json');
 
@@ -259,4 +259,17 @@ test('Unix launcher forwards multiple escalating signals and propagates uncaught
     { encoding: 'utf8' },
   );
   assert.ok(killedRun.signal === 'SIGKILL' || killedRun.status === 128 + os.constants.signals.SIGKILL);
+});
+
+test('launcher preserves Win32 first Ctrl+C graceful cleanup while forwarding Unix/escalated signals', () => {
+  assert.equal(shouldForwardSignal('win32', 'SIGINT', 1), false);
+  assert.equal(shouldForwardSignal('win32', 'SIGINT', 2), true);
+  assert.equal(shouldForwardSignal('win32', 'SIGHUP', 1), false);
+  assert.equal(shouldForwardSignal('win32', 'SIGTERM', 1), true);
+
+  assert.equal(shouldForwardSignal('linux', 'SIGINT', 1), true);
+  assert.equal(shouldForwardSignal('darwin', 'SIGHUP', 1), true);
+
+  assert.equal(exitCodeForSignal('SIGINT'), 128 + os.constants.signals.SIGINT);
+  assert.equal(exitCodeForSignal('SIGNONE_SUCH'), 1);
 });

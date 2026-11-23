@@ -677,8 +677,9 @@ impl DockerCompatServer {
                     .await;
             }
             DockerRoute::ImageBuild => {
-                let params = decode_all_query_params(req.query.as_deref());
-                if let Err(rejection) = validate_image_build_query(&params) {
+                let res = decode_all_query_params_strict(req.query.as_deref())
+                    .and_then(|params| validate_image_build_query(&params));
+                if let Err(rejection) = res {
                     let (close, next) = close_mode_for_rejected_request(&req, false);
                     write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                         .await
@@ -688,8 +689,9 @@ impl DockerCompatServer {
                 RouteDispatch::Pass
             }
             DockerRoute::ImageCreate => {
-                let params = decode_all_query_params(req.query.as_deref());
-                if let Err(rejection) = validate_image_create_query(&params) {
+                let res = decode_all_query_params_strict(req.query.as_deref())
+                    .and_then(|params| validate_image_create_query(&params));
+                if let Err(rejection) = res {
                     let (close, next) = close_mode_for_rejected_request(&req, false);
                     write_json_error(client, 400, "Bad Request", rejection.reason(), close)
                         .await
@@ -1908,31 +1910,44 @@ where
     }
 }
 
-fn decode_all_query_params(query: Option<&str>) -> Vec<(String, String)> {
+fn decode_all_query_params_strict(
+    query: Option<&str>,
+) -> Result<Vec<(String, String)>, PolicyRejection> {
     let Some(q) = query else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    q.split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            (
-                percent_decode_query_component(k),
-                percent_decode_query_component(v),
-            )
-        })
-        .collect()
+    let mut out = Vec::new();
+    for pair in q.split('&').filter(|pair| !pair.is_empty()) {
+        if pair.contains(';') {
+            return Err(PolicyRejection::new(
+                "query parameter contains forbidden unencoded ';' delimiter",
+            ));
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let decoded_k = percent_decode_query_strict(k).map_err(PolicyRejection::new)?;
+        let decoded_v = percent_decode_query_strict(v).map_err(PolicyRejection::new)?;
+        out.push((decoded_k, decoded_v));
+    }
+    Ok(out)
 }
 
 fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     let q = query?;
-    for pair in q.split('&') {
+    for pair in q.split('&').filter(|pair| !pair.is_empty()) {
+        // Mirror Go `net/url.ParseQuery` + `gorilla/schema`: ignore `;` and invalid `%` pairs,
+        // match keys ASCII case-insensitively, and stop on the first matched key.
+        if pair.contains(';') {
+            continue;
+        }
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if percent_decode_query_component(k) == key {
-            let decoded = percent_decode_query_component(v);
-            if !decoded.is_empty() {
-                return Some(decoded);
-            }
+        let Ok(decoded_k) = percent_decode_query_strict(k) else {
+            continue;
+        };
+        let Ok(decoded_v) = percent_decode_query_strict(v) else {
+            continue;
+        };
+        if decoded_k.eq_ignore_ascii_case(key) {
+            return (!decoded_v.is_empty()).then_some(decoded_v);
         }
     }
     None
@@ -1945,16 +1960,11 @@ fn query_has_truthy_param(query: Option<&str>, key: &str) -> bool {
     val == "1" || val.eq_ignore_ascii_case("true")
 }
 
-fn percent_decode_bytes(input: &str, plus_as_space: bool) -> String {
+fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
-        if plus_as_space && bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-            continue;
-        }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
                 out.push((hi << 4) | lo);
@@ -1968,12 +1978,31 @@ fn percent_decode_bytes(input: &str, plus_as_space: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn percent_decode(input: &str) -> String {
-    percent_decode_bytes(input, false)
-}
-
-fn percent_decode_query_component(input: &str) -> String {
-    percent_decode_bytes(input, true)
+fn percent_decode_query_strict(input: &str) -> Result<String, &'static str> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("incomplete percent-encoding in query parameter");
+            }
+            let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) else {
+                return Err("invalid percent-encoding hex digit in query parameter");
+            };
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).map_err(|_| "query parameter is not valid UTF-8")
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -3400,13 +3429,26 @@ mod tests {
     #[tokio::test]
     async fn query_plus_decoding_early_abort_drains_and_417_avoids_upstream() {
         assert_eq!(
-            percent_decode_query_component("my+container%2Fname"),
+            percent_decode_query_strict("my+container%2Fname").unwrap(),
             "my container/name"
         );
         assert_eq!(percent_decode("keep+plus"), "keep+plus");
         assert_eq!(
             extract_query_param(Some("name=my+container&other=1"), "name").as_deref(),
             Some("my container")
+        );
+        // Query differential hardening: Go ignores `;`/invalid `%`, matches case-insensitively,
+        // and uses the first matched parameter rather than falling through an empty first match.
+        assert_eq!(extract_query_param(Some("Name=WebApp"), "name").as_deref(), Some("WebApp"));
+        assert_eq!(extract_query_param(Some("name=&name=real"), "name"), None);
+        assert!(!query_has_truthy_param(Some("force=&force=1"), "force"));
+        assert_eq!(
+            extract_query_param(Some("a=1;name=bypass&name=ok"), "name").as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            extract_query_param(Some("name=%ZZ&other=1"), "name"),
+            None
         );
 
         struct CountingNoUpstreamTunnel(Arc<AtomicU32>);
@@ -3519,6 +3561,18 @@ mod tests {
         .await;
         assert_eq!(r_plus.status, 400);
         assert_eq!(upstream_opens.load(Ordering::Acquire), 0);
+
+        // 5. Raw `;` and malformed `%ZZ` query strings on POST /images/create & POST /build return 400.
+        for bad_path in [
+            "/v1.45/images/create?fromImage=alpine;tlsVerify=false",
+            "/v1.45/images/create?fromImage=alpine%ZZ",
+            "/v1.45/build?t=app;networkmode=host",
+        ] {
+            let mut conn_bad = PrefixedReader::new(TcpStream::connect(addr).await.unwrap());
+            let (resp_bad, _) = send_http(&mut conn_bad, "POST", bad_path, None).await;
+            assert_eq!(resp_bad.status, 400, "expected 400 for {bad_path}");
+            assert_eq!(upstream_opens.load(Ordering::Acquire), 0);
+        }
 
         handle.shutdown().await;
     }

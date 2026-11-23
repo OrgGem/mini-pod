@@ -165,12 +165,14 @@ impl std::error::Error for PolicyRejection {}
 /// Validates query parameters on Docker `POST /images/create`.
 ///
 /// Rejects unallowlisted query keys, local archive transports, non-URL paths or non-public/SSRF
-/// destinations in `fromSrc`, invalid tags/platforms, whitespace, and control characters.
+/// destinations in `fromSrc`, invalid tags/platforms, unsafe control characters, and non-ASCII keys.
 pub fn validate_image_create_query(params: &[(String, String)]) -> Result<(), PolicyRejection> {
     for (raw_key, val) in params {
         if !raw_key.is_ascii()
             || raw_key.bytes().any(|b| b < 0x20 || b == 0x7f)
-            || val.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || val
+                .bytes()
+                .any(|b| b == 0x7f || (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')))
         {
             return Err(PolicyRejection::new(format!(
                 "invalid control or non-ASCII characters in POST /images/create parameter '{raw_key}'"
@@ -183,6 +185,18 @@ pub fn validate_image_create_query(params: &[(String, String)]) -> Result<(), Po
             "fromimage" => validate_image_create_from_image(val, "fromImage")?,
             "repo" => validate_image_create_from_image(val, "repo")?,
             "tag" => validate_image_create_tag(val)?,
+            "quiet" => {
+                if !val.is_empty()
+                    && !val.eq_ignore_ascii_case("true")
+                    && !val.eq_ignore_ascii_case("false")
+                    && val != "1"
+                    && val != "0"
+                {
+                    return Err(PolicyRejection::new(format!(
+                        "POST /images/create quiet '{val}' must be a boolean"
+                    )));
+                }
+            }
             "message" | "changes" => {}
             "platform" => validate_image_create_platform(val)?,
             _ => {
@@ -356,6 +370,8 @@ fn validate_image_create_from_image(val: &str, label: &str) -> Result<(), Policy
         "file:",
         "http:",
         "https:",
+        "tarball:",
+        "atomic:",
     ] {
         if head.starts_with(transport) {
             return Err(PolicyRejection::new(format!(
@@ -363,7 +379,40 @@ fn validate_image_create_from_image(val: &str, label: &str) -> Result<(), Policy
             )));
         }
     }
+    if check_target.contains('/') && head.contains(':') && !is_valid_registry_head(head) {
+        return Err(PolicyRejection::new(format!(
+            "POST /images/create {label} '{val}' contains an invalid registry host:port or unknown transport"
+        )));
+    }
     Ok(())
+}
+
+fn is_valid_registry_head(head: &str) -> bool {
+    if let Some(after_open) = head.strip_prefix('[') {
+        let Some((ip_str, rest)) = after_open.split_once(']') else {
+            return false;
+        };
+        if ip_str.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        let Some(port_str) = rest.strip_prefix(':') else {
+            return false;
+        };
+        return !port_str.is_empty()
+            && port_str.bytes().all(|b| b.is_ascii_digit())
+            && matches!(port_str.parse::<u16>(), Ok(p) if p > 0);
+    }
+    let Some((host, port_str)) = head.split_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.contains([':', '[', ']'])
+        && !port_str.is_empty()
+        && port_str.bytes().all(|b| b.is_ascii_digit())
+        && matches!(port_str.parse::<u16>(), Ok(p) if p > 0)
 }
 
 fn validate_image_create_tag(val: &str) -> Result<(), PolicyRejection> {
@@ -1392,14 +1441,32 @@ fn sanitize_bind_mount(
 }
 
 fn validate_tmpfs_option_token(opts: &str, ctx: &str) -> Result<(), PolicyRejection> {
+    const FORBIDDEN_TMPFS_OPTS: &[&str] = &[
+        "suid",
+        "dev",
+        "bind",
+        "rbind",
+        "shared",
+        "rshared",
+        "slave",
+        "rslave",
+        "unbindable",
+        "runbindable",
+    ];
+
     if opts.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(PolicyRejection::new(format!(
             "{ctx} option contains forbidden NUL or control character"
         )));
     }
     for raw in opts.split(',').map(str::trim).filter(|o| !o.is_empty()) {
-        let (key, val_opt) = raw.split_once('=').map_or((raw, None), |(k, v)| (k.trim(), Some(v.trim())));
-        if key.eq_ignore_ascii_case("suid") || key.eq_ignore_ascii_case("dev") {
+        let (key, val_opt) = raw
+            .split_once('=')
+            .map_or((raw, None), |(k, v)| (k.trim(), Some(v.trim())));
+        if FORBIDDEN_TMPFS_OPTS
+            .iter()
+            .any(|bad| key.eq_ignore_ascii_case(bad))
+        {
             return Err(PolicyRejection::new(format!(
                 "{ctx} mount option '{raw}' is forbidden"
             )));
@@ -1503,7 +1570,7 @@ fn sanitize_tmpfs_mount(obj: &mut Map<String, Value>) -> Result<(), PolicyReject
                                 ));
                             }
                             validate_tmpfs_option_token(
-                                &format!("{}={}", k.trim(), v.trim()),
+                                &format!("{k}={v}"),
                                 "TmpfsOptions.Options",
                             )?;
                         } else {
@@ -2392,6 +2459,13 @@ mod tests {
         .is_ok());
 
         assert!(validate_image_create_query(&[("fromImage".into(), "alpine:latest".into())]).is_ok());
+        assert!(validate_image_create_query(&[("fromImage".into(), "localhost:5000/org/app:v1".into())]).is_ok());
+        assert!(validate_image_create_query(&[("fromImage".into(), "[::1]:5000/org/app:v1".into())]).is_ok());
+        assert!(validate_image_create_query(&[
+            ("fromImage".into(), "alpine:latest".into()),
+            ("changes".into(), "ENV FOO=bar\nLABEL a=b".into()),
+            ("quiet".into(), "1".into()),
+        ]).is_ok());
         assert!(validate_image_create_query(&[("fromSrc".into(), "-".into())]).is_ok());
         assert!(validate_image_create_query(&[("fromSrc".into(), "https://example.com/img.tar".into())]).is_ok());
         assert!(validate_image_create_query(&[("repo".into(), "my-repo".into()), ("tag".into(), "v1.0".into())]).is_ok());
@@ -2404,6 +2478,10 @@ mod tests {
         // Hardened POST /images/create query & non-canonical fromSrc SSRF bypasses:
         for forbidden_query in [
             vec![("repo".into(), "dir:/etc".into())],
+            vec![("fromImage".into(), "tarball:/tmp/x.tar".into())],
+            vec![("fromImage".into(), "atomic:quay.io/a/b".into())],
+            vec![("fromImage".into(), "zstd:/tmp/x.zst".into())],
+            vec![("quiet".into(), "maybe".into())],
             vec![("fromImage".into(), "alpine latest".into())],
             vec![("fromImage".into(), "alpine".into()), ("tlsVerify".into(), "false".into())],
             vec![("tag".into(), "../bad".into())],
@@ -2432,6 +2510,10 @@ mod tests {
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"SizeBytes":-1}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["suid"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["dev"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["bind"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["rshared"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["mode\n","0755"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["size","10m\r"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["mode","4755"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["rw,suid"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"UnknownField":1}}]}}),
