@@ -710,11 +710,11 @@ impl LocalRuntimeManager {
         struct DrainReset<'a>(&'a WarmPoolStore);
         impl Drop for DrainReset<'_> {
             fn drop(&mut self) {
-                self.0.set_draining(false);
+                self.0.end_drain();
             }
         }
 
-        self.warm_pool.set_draining(true);
+        self.warm_pool.begin_drain();
         let _drain_reset = DrainReset(&self.warm_pool);
 
         if let Some(mut handle) = self.warm_pool.take_replenisher() {
@@ -1403,30 +1403,25 @@ impl Drop for BootCancellationGuard {
                         Ok(())
                     };
                     if kill_res.is_err() && session.is_alive() {
-                        if manager_alive.load(Ordering::Acquire) {
-                            if let Some(permit) = _permit {
-                                let overlay_path =
-                                    overlay_path.unwrap_or_else(|| work_dir.join("overlay.qcow2"));
-                                let reserved_rss_mb = permit.demand().rss_mb;
-                                let mut active_map = lock_unpoisoned(&active);
-                                active_map.insert(
-                                    sandbox_id,
-                                    ActiveSandbox {
-                                        session,
-                                        work_dir,
-                                        overlay_path,
-                                        artifact_paths,
-                                        network_policy: spec.network,
-                                        expires_at: Instant::now(),
-                                        reserved_rss_mb,
-                                        host_rss_budget_mb: spec.budget.host_rss_budget_mb,
-                                        host_storage_budget_mb: spec.budget.host_storage_budget_mb,
-                                        egress_proxy: None,
-                                        bundle_guard: _bundle_guard,
-                                        permit,
-                                    },
-                                );
-                            }
+                        if let Some(permit) = _permit {
+                            let overlay_path =
+                                overlay_path.unwrap_or_else(|| work_dir.join("overlay.qcow2"));
+                            let reserved_rss_mb = permit.demand().rss_mb;
+                            let restored = ActiveSandbox {
+                                session,
+                                work_dir,
+                                overlay_path,
+                                artifact_paths,
+                                network_policy: spec.network,
+                                expires_at: Instant::now(),
+                                reserved_rss_mb,
+                                host_rss_budget_mb: spec.budget.host_rss_budget_mb,
+                                host_storage_budget_mb: spec.budget.host_storage_budget_mb,
+                                egress_proxy: None,
+                                bundle_guard: _bundle_guard,
+                                permit,
+                            };
+                            restore_active_if_alive(&active, &manager_alive, sandbox_id, restored);
                         }
                         return;
                     }
@@ -1661,7 +1656,7 @@ impl LocalRuntimeManager {
             if st.cancelled {
                 let mut newly_recorded = false;
                 if let Some((p, t)) = identity {
-                    if st.pid.is_none() || st.start_token.is_none() {
+                    if st.pid != Some(p) || st.start_token != Some(t) {
                         st.pid = Some(p);
                         st.start_token = Some(t);
                         newly_recorded = true;
@@ -1688,13 +1683,14 @@ impl LocalRuntimeManager {
             };
             st.pid = pid;
             st.start_token = start_token;
+            let merged_all = st.artifacts.clone();
             drop(st);
             journal_for_hook.write_record(&JournalRecord {
                 sandbox_id: id_for_hook.clone(),
                 state: JournalLifecycleState::Spawning,
                 pid,
                 start_token,
-                artifact_paths: merged,
+                artifact_paths: merged_all,
                 expires_at_unix_ms: initial_expires_ms,
             })
         });
@@ -1710,8 +1706,8 @@ impl LocalRuntimeManager {
             Ok(outcome) => outcome,
             Err(err) => {
                 let (prog_pid, prog_token, prog_artifacts) = {
-                    let mut st = lock_unpoisoned(&progress);
-                    (st.pid, st.start_token, std::mem::take(&mut st.artifacts))
+                    let st = lock_unpoisoned(&progress);
+                    (st.pid, st.start_token, st.artifacts.clone())
                 };
                 let recorded = self.load_record_async(sandbox_id.clone()).await.ok().flatten();
                 let (mut target_pid, mut target_token) = (prog_pid, prog_token);
@@ -1730,6 +1726,7 @@ impl LocalRuntimeManager {
                         &work_dir,
                     );
                 }
+                cancel_guard.artifact_paths = rollback_artifacts.clone();
                 if let (Some(pid), Some(start_token)) = (target_pid, target_token) {
                     match self.vm_runtime.kill_orphan_process(pid, start_token).await {
                         Ok(_) | Err(SandboxError::NotFound(_)) => {}
@@ -1857,6 +1854,7 @@ impl LocalRuntimeManager {
             let _in_flight_guard = in_flight_guard;
             let _warm_guard = warm_guard;
             let _bundle_guard = bundle_guard;
+            let session = session;
 
             let graceful = session
                 .graceful_shutdown(config.graceful_shutdown_timeout)
@@ -1868,25 +1866,23 @@ impl LocalRuntimeManager {
                 Ok(())
             };
             if kill_res.is_err() && session.is_alive() {
-                if manager_alive.load(Ordering::Acquire) {
-                    if let Some(permit) = _permit {
-                        let reserved_rss_mb = permit.demand().rss_mb;
-                        let restored = ActiveSandbox {
-                            session,
-                            work_dir,
-                            overlay_path,
-                            artifact_paths: artifacts,
-                            network_policy: spec.network,
-                            expires_at: Instant::now(),
-                            reserved_rss_mb,
-                            host_rss_budget_mb: spec.budget.host_rss_budget_mb,
-                            host_storage_budget_mb: spec.budget.host_storage_budget_mb,
-                            egress_proxy: None,
-                            bundle_guard: _bundle_guard,
-                            permit,
-                        };
-                        lock_unpoisoned(&active).insert(sandbox_id, restored);
-                    }
+                if let Some(permit) = _permit {
+                    let reserved_rss_mb = permit.demand().rss_mb;
+                    let restored = ActiveSandbox {
+                        session,
+                        work_dir,
+                        overlay_path,
+                        artifact_paths: artifacts,
+                        network_policy: spec.network,
+                        expires_at: Instant::now(),
+                        reserved_rss_mb,
+                        host_rss_budget_mb: spec.budget.host_rss_budget_mb,
+                        host_storage_budget_mb: spec.budget.host_storage_budget_mb,
+                        egress_proxy: None,
+                        bundle_guard: _bundle_guard,
+                        permit,
+                    };
+                    restore_active_if_alive(&active, &manager_alive, sandbox_id, restored);
                 }
                 return;
             }
@@ -2523,7 +2519,7 @@ async fn destroy_locked_with_deps(
                     bundle_guard,
                     permit,
                 };
-                lock_unpoisoned(&active).insert(id.clone(), restored);
+                restore_active_if_alive(&active, &manager_alive, id.clone(), restored);
                 return Err(err);
             }
         }
@@ -2817,6 +2813,24 @@ fn is_overlay_artifact(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("qcow2")
 }
 
+fn restore_active_if_alive(
+    active: &Mutex<HashMap<SandboxId, ActiveSandbox>>,
+    manager_alive: &AtomicBool,
+    id: SandboxId,
+    restored: ActiveSandbox,
+) {
+    let rejected = {
+        let mut active_map = lock_unpoisoned(active);
+        if manager_alive.load(Ordering::Acquire) {
+            active_map.insert(id, restored);
+            None
+        } else {
+            Some(restored)
+        }
+    };
+    drop(rejected);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispose_warm_entry_with_deps(
     warm_pool: &WarmPoolStore,
@@ -2826,7 +2840,7 @@ async fn dispose_warm_entry_with_deps(
     overlay: &Arc<dyn DiskOverlayPort>,
     config: &RuntimeManagerConfig,
     entry: WarmEntry,
-    mut abort_guard: OwnedAbortTransitionGuard,
+    abort_guard: OwnedAbortTransitionGuard,
 ) -> Result<(), SandboxError> {
     let WarmEntry {
         sandbox_id,
@@ -2844,6 +2858,7 @@ async fn dispose_warm_entry_with_deps(
     // Bind in strict LIFO order so unwind/abort drops `session` -> `bundle_guard` ->
     // `abort_guard` -> `permit_slot` and never re-opens admission before QEMU is terminated.
     let mut permit_slot = Some(permit);
+    let mut abort_guard = abort_guard;
     let overlay_path = prepared.overlay_path;
     let bundle_guard = prepared.bundle_guard;
     let session = session;
@@ -2894,9 +2909,14 @@ async fn dispose_warm_entry_with_deps(
             bundle_guard,
             permit,
         };
-        {
+        let uninserted = {
             let mut active_map = lock_unpoisoned(active);
-            active_map.insert(sandbox_id.clone(), restored);
+            let uninserted = if manager_alive.load(Ordering::Acquire) {
+                active_map.insert(sandbox_id.clone(), restored);
+                None
+            } else {
+                Some(restored)
+            };
             // Commit transition under `active` lock (`active -> warm_pool`) to avoid RSS sampling gaps.
             if is_dirty_checkout {
                 warm_pool.abort_checkout(&sandbox_id);
@@ -2904,7 +2924,9 @@ async fn dispose_warm_entry_with_deps(
                 warm_pool.finish_eviction(&sandbox_id);
             }
             abort_guard.armed = false;
-        }
+            uninserted
+        };
+        drop(uninserted);
         return kill_res;
     }
     drop(session);
@@ -6350,5 +6372,133 @@ mod tests {
         assert_eq!(lock_unpoisoned(&vm_ok.kills).as_slice(), &[(7777, 5555)]);
         assert!(mgr_ok.journal.load_records().unwrap().is_empty());
         assert!(!overlay_ok.removed_paths().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispose_warm_entry_drops_session_before_overlay_cleanup() {
+        struct DropCheckOverlay {
+            inner: MockOverlayStore,
+            session_dropped: Arc<AtomicBool>,
+            session_was_dropped_before_remove: AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl DiskOverlayPort for DropCheckOverlay {
+            async fn prepare_overlay(
+                &self,
+                sandbox_id: &SandboxId,
+                spec: &SandboxSpec,
+                work_dir: &Path,
+            ) -> Result<PreparedOverlay, SandboxError> {
+                self.inner.prepare_overlay(sandbox_id, spec, work_dir).await
+            }
+
+            async fn remove_overlay(&self, overlay_path: &Path) -> Result<(), SandboxError> {
+                self.session_was_dropped_before_remove.store(
+                    self.session_dropped.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                self.inner.remove_overlay(overlay_path).await
+            }
+        }
+        struct DropOrderSession(Arc<AtomicBool>);
+        impl Drop for DropOrderSession {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        #[async_trait::async_trait]
+        impl VmSessionPort for DropOrderSession {
+            fn pid(&self) -> u32 { 5050 }
+            fn start_token(&self) -> u64 { 5050 }
+            fn artifact_paths(&self) -> &[PathBuf] { &[] }
+            fn is_alive(&self) -> bool { false }
+            fn current_rss_bytes(&self) -> Option<u64> { None }
+            async fn graceful_shutdown(&self, _: Duration) -> Result<bool, SandboxError> { Ok(false) }
+            async fn force_kill(&self) -> Result<(), SandboxError> { Ok(()) }
+            async fn exec_stream(&self, _: ExecRequest) -> Result<ExecStream, SandboxError> { unreachable!() }
+            async fn copy_in_tar(&self, _: &str, _: Vec<u8>, _: u64) -> Result<u64, SandboxError> { unreachable!() }
+            async fn copy_out_tar(&self, _: &str, _: u64) -> Result<Vec<u8>, SandboxError> { unreachable!() }
+            async fn open_tunnel(&self, _: StreamTargetWire) -> Result<TunnelStream, SandboxError> { unreachable!() }
+            async fn enable_egress_proxy(&self, _: u16) -> Result<tokio::sync::mpsc::Receiver<TunnelStream>, SandboxError> { unreachable!() }
+        }
+
+        let tmp = TestTempDir::new("mgr-warm-drop-before-rm");
+        let session_dropped = Arc::new(AtomicBool::new(false));
+        let overlay = Arc::new(DropCheckOverlay {
+            inner: MockOverlayStore::default(),
+            session_dropped: Arc::clone(&session_dropped),
+            session_was_dropped_before_remove: AtomicBool::new(false),
+        });
+        let vm = Arc::new(MockVmRuntime::new(true));
+        let mut cfg = base_config(tmp.path().join("state"));
+        cfg.warm_pool.target_size = 1;
+        cfg.warm_pool.template_spec = Some(valid_spec(Duration::from_secs(60)));
+        let mgr = LocalRuntimeManager::new(cfg, overlay.clone(), vm).unwrap();
+
+        assert_eq!(mgr.warm_up().await.unwrap(), 1);
+        let mut entry = mgr.warm_pool.pop_one_for_eviction().unwrap();
+        entry.session = Arc::new(DropOrderSession(Arc::clone(&session_dropped)));
+        mgr.dispose_warm_entry(entry).await;
+
+        assert!(
+            overlay.session_was_dropped_before_remove.load(Ordering::Acquire),
+            "TransitioningVm must hold Weak so VmSessionPort drops before remove_overlay"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_boot_progress_retains_external_artifacts_across_fallback_and_concurrent_drains() {
+        struct TwoAttemptVm {
+            ext_path: PathBuf,
+            saw_ext_after_reset: AtomicBool,
+            journal: JournalStore,
+        }
+        #[async_trait::async_trait]
+        impl VmRuntimePort for TwoAttemptVm {
+            async fn boot_vm(&self, cfg: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+                fs::write(&self.ext_path, b"ext").unwrap();
+                cfg.record_boot_progress(Some((1001, 11)), std::slice::from_ref(&self.ext_path))?;
+                // Second attempt resets pid to None with empty artifacts; journal must still keep ext_path.
+                cfg.record_boot_progress(None, &[])?;
+                if let Ok(Some(rec)) = self.journal.load_record(&cfg.sandbox_id) {
+                    self.saw_ext_after_reset
+                        .store(rec.artifact_paths.contains(&self.ext_path), Ordering::Release);
+                }
+                Err(SandboxError::Transport("simulated fallback fail".to_owned()))
+            }
+
+            async fn kill_orphan_process(&self, _: u32, _: u64) -> Result<bool, SandboxError> {
+                Ok(false)
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-fallback-artifacts");
+        let state_dir = tmp.path().join("state");
+        let ext_path = tmp.path().join("attempt1-ext.sock");
+        let overlay = Arc::new(MockOverlayStore::default());
+        let journal = JournalStore::new(&state_dir.join("journals")).unwrap();
+        let vm = Arc::new(TwoAttemptVm {
+            ext_path: ext_path.clone(),
+            saw_ext_after_reset: AtomicBool::new(false),
+            journal,
+        });
+        let mgr = LocalRuntimeManager::new(base_config(state_dir), overlay, vm.clone()).unwrap();
+
+        assert!(mgr.spawn(valid_spec(Duration::from_secs(60))).await.is_err());
+        assert!(
+            vm.saw_ext_after_reset.load(Ordering::Acquire),
+            "Attempt 2 progress reset must retain Attempt 1 external artifact paths"
+        );
+        assert!(!ext_path.exists(), "retained external artifact must be cleaned up");
+
+        // Concurrent drain guard counter test.
+        mgr.warm_pool.begin_drain();
+        assert_eq!(mgr.drain_warm_pool().await.unwrap(), 0);
+        assert!(
+            mgr.warm_pool.is_draining(),
+            "draining must stay active until outer drainer finishes"
+        );
+        mgr.warm_pool.end_drain();
+        assert!(!mgr.warm_pool.is_draining());
     }
 }

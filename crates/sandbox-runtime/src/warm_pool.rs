@@ -122,7 +122,7 @@ pub(crate) struct WarmEntry {
 }
 
 struct TransitioningVm {
-    session: Arc<dyn VmSessionPort>,
+    session: Weak<dyn VmSessionPort>,
     reserved_rss_mb: u64,
 }
 
@@ -142,7 +142,14 @@ struct WarmPoolState {
     total_cold_spawns: u64,
     total_evictions: u64,
     total_disposed_dirty: u64,
-    draining: bool,
+    active_drains: usize,
+    permanently_closed: bool,
+}
+
+impl WarmPoolState {
+    fn is_draining(&self) -> bool {
+        self.permanently_closed || self.active_drains > 0
+    }
 }
 
 pub(crate) enum CheckoutPop {
@@ -199,12 +206,11 @@ impl WeakWarmPoolStore {
                 .iter()
                 .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb)),
         );
-        dst.extend(
-            state
-                .transitioning
-                .values()
-                .map(|vm| (Arc::clone(&vm.session), vm.reserved_rss_mb)),
-        );
+        dst.extend(state.transitioning.values().filter_map(|vm| {
+            vm.session
+                .upgrade()
+                .map(|session| (session, vm.reserved_rss_mb))
+        }));
     }
 }
 
@@ -241,11 +247,17 @@ impl WarmPoolStore {
     }
 
     pub(crate) fn is_draining(&self) -> bool {
-        lock_unpoisoned(&self.inner).draining
+        lock_unpoisoned(&self.inner).is_draining()
     }
 
-    pub(crate) fn set_draining(&self, draining: bool) {
-        lock_unpoisoned(&self.inner).draining = draining;
+    pub(crate) fn begin_drain(&self) {
+        let mut state = lock_unpoisoned(&self.inner);
+        state.active_drains = state.active_drains.saturating_add(1);
+    }
+
+    pub(crate) fn end_drain(&self) {
+        let mut state = lock_unpoisoned(&self.inner);
+        state.active_drains = state.active_drains.saturating_sub(1);
     }
 
     pub(crate) fn contains_live_id(&self, id: &SandboxId) -> bool {
@@ -269,7 +281,8 @@ impl WarmPoolStore {
         sandbox_id: SandboxId,
     ) -> Option<WarmReplenishGuard> {
         let mut state = lock_unpoisoned(&self.inner);
-        if state.draining || state.ready.len().saturating_add(state.replenishing_vms) >= target_size
+        if state.is_draining()
+            || state.ready.len().saturating_add(state.replenishing_vms) >= target_size
         {
             return None;
         }
@@ -299,7 +312,7 @@ impl WarmPoolStore {
             if state.replenishing_vms == 0 {
                 notify_done = true;
             }
-            if state.draining || state.ready.len() >= target_size {
+            if state.is_draining() || state.ready.len() >= target_size {
                 Self::mark_transitioning_locked(&mut state, &entry);
                 Some(entry)
             } else {
@@ -315,7 +328,7 @@ impl WarmPoolStore {
 
     pub(crate) fn pop_for_checkout(&self, key: &WarmPoolKey, max_idle_age: Duration) -> CheckoutPop {
         let mut state = lock_unpoisoned(&self.inner);
-        if state.draining {
+        if state.is_draining() {
             return CheckoutPop::None;
         }
         let Some(pos) = state.ready.iter().position(|entry| entry.key == *key) else {
@@ -337,7 +350,7 @@ impl WarmPoolStore {
         state.transitioning.insert(
             entry.sandbox_id.clone(),
             TransitioningVm {
-                session: Arc::clone(&entry.session),
+                session: Arc::downgrade(&entry.session),
                 reserved_rss_mb: entry.reserved_rss_mb,
             },
         );
@@ -410,7 +423,7 @@ impl WarmPoolStore {
 
     pub(crate) fn clear_ready_for_drop(&self) -> Vec<WarmEntry> {
         let mut state = lock_unpoisoned(&self.inner);
-        state.draining = true;
+        state.permanently_closed = true;
         state.ready.drain(..).collect()
     }
 

@@ -1441,17 +1441,33 @@ fn sanitize_bind_mount(
 }
 
 fn validate_tmpfs_option_token(opts: &str, ctx: &str) -> Result<(), PolicyRejection> {
-    const FORBIDDEN_TMPFS_OPTS: &[&str] = &[
-        "suid",
-        "dev",
-        "bind",
-        "rbind",
-        "shared",
-        "rshared",
-        "slave",
-        "rslave",
-        "unbindable",
-        "runbindable",
+    const ALLOWED_TMPFS_FLAGS: &[&str] = &[
+        "rw",
+        "ro",
+        "nosuid",
+        "nodev",
+        "noexec",
+        "exec",
+        "atime",
+        "noatime",
+        "relatime",
+        "norelatime",
+        "strictatime",
+        "nostrictatime",
+        "diratime",
+        "nodiratime",
+        "lazytime",
+        "nolazytime",
+        "sync",
+        "async",
+        "dirsync",
+        "mand",
+        "nomand",
+        "tmpcopyup",
+        "notmpcopyup",
+        "private",
+        "rprivate",
+        "nosymfollow",
     ];
 
     if opts.bytes().any(|b| b < 0x20 || b == 0x7f) {
@@ -1460,31 +1476,98 @@ fn validate_tmpfs_option_token(opts: &str, ctx: &str) -> Result<(), PolicyReject
         )));
     }
     for raw in opts.split(',').map(str::trim).filter(|o| !o.is_empty()) {
-        let (key, val_opt) = raw
+        let (key_raw, val_opt) = raw
             .split_once('=')
             .map_or((raw, None), |(k, v)| (k.trim(), Some(v.trim())));
-        if FORBIDDEN_TMPFS_OPTS
-            .iter()
-            .any(|bad| key.eq_ignore_ascii_case(bad))
-        {
-            return Err(PolicyRejection::new(format!(
-                "{ctx} mount option '{raw}' is forbidden"
-            )));
-        }
-        if key.eq_ignore_ascii_case("mode") {
-            let Some(mode_str) = val_opt else {
+        let key = key_raw.to_ascii_lowercase();
+        match key.as_str() {
+            k if ALLOWED_TMPFS_FLAGS.contains(&k) => {
+                if val_opt.is_some() {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} flag option '{raw}' must not take a value"
+                    )));
+                }
+            }
+            "mode" => {
+                let Some(mode_str) = val_opt.filter(|v| !v.is_empty()) else {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' requires an octal mode value"
+                    )));
+                };
+                let perm = u32::from_str_radix(mode_str, 8).map_err(|_| {
+                    PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' has invalid octal mode"
+                    ))
+                })?;
+                if perm > 0o1777 {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount mode '{mode_str}' exceeds maximum permitted 01777"
+                    )));
+                }
+            }
+            "size" => {
+                let Some(size_str) = val_opt else {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' requires a size value"
+                    )));
+                };
+                let valid = size_str.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                    && size_str
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'%');
+                if !valid {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' has invalid size"
+                    )));
+                }
+            }
+            "nr_blocks" | "nr_inodes" => {
+                let Some(count_str) = val_opt else {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' requires a count value"
+                    )));
+                };
+                let valid = count_str.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                    && count_str.bytes().all(|b| b.is_ascii_alphanumeric());
+                if !valid {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' has invalid block/inode limit"
+                    )));
+                }
+            }
+            "uid" | "gid" => {
+                let Some(id_str) = val_opt else {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' requires a numeric ID"
+                    )));
+                };
+                if id_str.is_empty()
+                    || !id_str.bytes().all(|b| b.is_ascii_digit())
+                    || id_str.parse::<u32>().is_err()
+                {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' has invalid numeric ID"
+                    )));
+                }
+            }
+            "huge" => {
+                let Some(huge_val) = val_opt else {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' requires a policy value"
+                    )));
+                };
+                if !matches!(
+                    huge_val.to_ascii_lowercase().as_str(),
+                    "never" | "always" | "within_size" | "advise" | "deny" | "force"
+                ) {
+                    return Err(PolicyRejection::new(format!(
+                        "{ctx} mount option '{raw}' has invalid huge page setting"
+                    )));
+                }
+            }
+            _ => {
                 return Err(PolicyRejection::new(format!(
-                    "{ctx} mount option '{raw}' requires an octal mode value"
-                )));
-            };
-            let perm = u32::from_str_radix(mode_str, 8).map_err(|_| {
-                PolicyRejection::new(format!(
-                    "{ctx} mount option '{raw}' has invalid octal mode"
-                ))
-            })?;
-            if perm > 0o1777 {
-                return Err(PolicyRejection::new(format!(
-                    "{ctx} mount mode '{mode_str}' exceeds maximum permitted 01777"
+                    "{ctx} mount option '{raw}' is not in the permitted tmpfs allowlist"
                 )));
             }
         }
@@ -2503,13 +2586,19 @@ mod tests {
             );
         }
 
-        // Hardened Mounts[].TmpfsOptions & HostConfig.Tmpfs mode enforcement:
+        // Hardened Mounts[].TmpfsOptions & HostConfig.Tmpfs option allowlist enforcement:
         for forbidden_tmpfs in [
             json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"rw,mode=4755"}}}),
+            json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"rw,rsuid,rdev"}}}),
+            json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"rw,remount"}}}),
+            json!({"Image":"alpine","HostConfig":{"Tmpfs":{"/run":"idmap"}}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Mode":0o4755}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"SizeBytes":-1}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["suid"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["dev"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["rsuid"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["rdev"]]}}]}}),
+            json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["remount"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["bind"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["rshared"]]}}]}}),
             json!({"Image":"alpine","HostConfig":{"Mounts":[{"Type":"tmpfs","Target":"/run","TmpfsOptions":{"Options":[["mode\n","0755"]]}}]}}),
@@ -2528,13 +2617,16 @@ mod tests {
             &serde_json::to_vec(&json!({
                 "Image": "alpine",
                 "HostConfig": {
+                    "Tmpfs": {
+                        "/tmp": "rw,exec,nosuid,nodev,size=64m,uid=1000,gid=1000,nr_inodes=10k,mode=1777,tmpcopyup"
+                    },
                     "Mounts": [{
                         "Type": "tmpfs",
                         "Target": "/run",
                         "TmpfsOptions": {
                             "SizeBytes": 67_108_864,
                             "Mode": 0o1777,
-                            "Options": [["noexec"], ["mode", "0755"]]
+                            "Options": [["noexec"], ["mode", "0755"], ["size", "50%"]]
                         }
                     }]
                 }

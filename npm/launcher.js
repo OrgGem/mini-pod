@@ -23,15 +23,22 @@ function platformPackage(platform, arch, glibcVersion) {
   return `@orggem/mini-pod-${target}`;
 }
 
-function shouldForwardSignal(platform, signal, win32SigintCount) {
+function watchedSignals(platform) {
+  return platform === 'win32'
+    ? ['SIGINT', 'SIGBREAK', 'SIGTERM', 'SIGHUP']
+    : ['SIGINT', 'SIGTERM', 'SIGHUP'];
+}
+
+function shouldForwardSignal(platform, signal, win32InterruptCount) {
   if (platform !== 'win32') {
     return true;
   }
-  // On Windows inherited console `Ctrl+C` delivers `CTRL_C_EVENT` directly to the Rust child
-  // so it can clean up VMs and exit with code 130; `child.kill` calls `TerminateProcess` (hard kill).
-  // Let the first `SIGINT` pass gracefully and escalate on repeat `SIGINT` or `SIGTERM`.
-  if (signal === 'SIGINT') {
-    return win32SigintCount > 1;
+  // On Windows inherited console `Ctrl+C` / `Ctrl+Break` deliver `CTRL_C_EVENT` /
+  // `CTRL_BREAK_EVENT` directly to the Rust child so it can clean up VMs and exit cleanly;
+  // `child.kill` calls `TerminateProcess` (hard kill). Let the first interrupt pass gracefully and
+  // escalate on repeat interrupts or `SIGTERM`.
+  if (signal === 'SIGINT' || signal === 'SIGBREAK') {
+    return win32InterruptCount > 1;
   }
   if (signal === 'SIGHUP') {
     return false;
@@ -59,17 +66,17 @@ function run(command) {
     }
     const executable = path.join(path.dirname(packageJson), 'bin', command + (process.platform === 'win32' ? '.exe' : ''));
     const child = spawn(executable, process.argv.slice(2), { stdio: 'inherit' });
-    let win32SigintCount = 0;
+    let win32InterruptCount = 0;
     const signalHandlers = [];
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    for (const sig of watchedSignals(process.platform)) {
       const handler = () => {
-        if (process.platform === 'win32' && sig === 'SIGINT') {
-          win32SigintCount += 1;
+        if (process.platform === 'win32' && (sig === 'SIGINT' || sig === 'SIGBREAK')) {
+          win32InterruptCount += 1;
         }
         if (
           child.exitCode === null
           && child.signalCode === null
-          && shouldForwardSignal(process.platform, sig, win32SigintCount)
+          && shouldForwardSignal(process.platform, sig, win32InterruptCount)
         ) {
           try {
             child.kill(sig);
@@ -114,4 +121,4 @@ function run(command) {
   }
 }
 
-module.exports = { platformPackage, run, shouldForwardSignal, exitCodeForSignal };
+module.exports = { platformPackage, run, watchedSignals, shouldForwardSignal, exitCodeForSignal };

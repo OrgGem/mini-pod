@@ -7,7 +7,7 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 
-const { platformPackage, shouldForwardSignal, exitCodeForSignal } = require('../launcher');
+const { platformPackage, watchedSignals, shouldForwardSignal, exitCodeForSignal } = require('../launcher');
 const { stage } = require('../scripts/stage');
 const main = require('../package.json');
 
@@ -261,9 +261,15 @@ test('Unix launcher forwards multiple escalating signals and propagates uncaught
   assert.ok(killedRun.signal === 'SIGKILL' || killedRun.status === 128 + os.constants.signals.SIGKILL);
 });
 
-test('launcher preserves Win32 first Ctrl+C graceful cleanup while forwarding Unix/escalated signals', () => {
+test('launcher preserves Win32 first Ctrl+C/Ctrl+Break graceful cleanup while forwarding Unix/escalated signals', () => {
+  assert.ok(watchedSignals('win32').includes('SIGBREAK'));
+  assert.ok(!watchedSignals('linux').includes('SIGBREAK'));
+  assert.ok(!watchedSignals('darwin').includes('SIGBREAK'));
+
   assert.equal(shouldForwardSignal('win32', 'SIGINT', 1), false);
   assert.equal(shouldForwardSignal('win32', 'SIGINT', 2), true);
+  assert.equal(shouldForwardSignal('win32', 'SIGBREAK', 1), false);
+  assert.equal(shouldForwardSignal('win32', 'SIGBREAK', 2), true);
   assert.equal(shouldForwardSignal('win32', 'SIGHUP', 1), false);
   assert.equal(shouldForwardSignal('win32', 'SIGTERM', 1), true);
 
@@ -271,5 +277,8 @@ test('launcher preserves Win32 first Ctrl+C graceful cleanup while forwarding Un
   assert.equal(shouldForwardSignal('darwin', 'SIGHUP', 1), true);
 
   assert.equal(exitCodeForSignal('SIGINT'), 128 + os.constants.signals.SIGINT);
+  if (typeof os.constants.signals.SIGBREAK === 'number') {
+    assert.equal(exitCodeForSignal('SIGBREAK'), 128 + os.constants.signals.SIGBREAK);
+  }
   assert.equal(exitCodeForSignal('SIGNONE_SUCH'), 1);
 });
