@@ -15,6 +15,7 @@ sandbox-docker-compat = { workspace = true }
 sandbox-client = { workspace = true }
 serde_json = { workspace = true }
 getrandom = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["signal", "io-std"] }
 
 [dev-dependencies]

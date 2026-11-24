@@ -1105,10 +1105,13 @@ impl VmSessionPort for QemuVmSession {
         if !self.alive.load(Ordering::Acquire) {
             return None;
         }
-        let proc_guard = lock_unpoisoned(&self.process);
-        proc_guard
-            .as_ref()
-            .and_then(ConfinedProcess::current_rss_bytes)
+        if let Some(proc) = lock_unpoisoned(&self.process).as_ref() {
+            return proc.current_rss_bytes();
+        }
+        if self.has_process {
+            return crate::process::sample_verified_process_rss_bytes(self.pid, self.start_token);
+        }
+        None
     }
 
     async fn exec_stream(&self, req: ExecRequest) -> Result<ExecStream, SandboxError> {

@@ -195,21 +195,25 @@ pub(crate) struct WeakWarmPoolStore {
 }
 
 impl WeakWarmPoolStore {
-    pub(crate) fn collect_rss_samples(&self, dst: &mut Vec<(Arc<dyn VmSessionPort>, u64)>) {
+    pub(crate) fn collect_rss_samples(
+        &self,
+        dst: &mut Vec<(SandboxId, Arc<dyn VmSessionPort>, u64)>,
+    ) {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
         let state = lock_unpoisoned(&inner);
-        dst.extend(
-            state
-                .ready
-                .iter()
-                .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb)),
-        );
-        dst.extend(state.transitioning.values().filter_map(|vm| {
+        dst.extend(state.ready.iter().map(|entry| {
+            (
+                entry.sandbox_id.clone(),
+                Arc::clone(&entry.session),
+                entry.reserved_rss_mb,
+            )
+        }));
+        dst.extend(state.transitioning.iter().filter_map(|(id, vm)| {
             vm.session
                 .upgrade()
-                .map(|session| (session, vm.reserved_rss_mb))
+                .map(|session| (id.clone(), session, vm.reserved_rss_mb))
         }));
     }
 }

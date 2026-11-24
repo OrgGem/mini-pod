@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_core::{
@@ -286,6 +286,7 @@ pub struct LocalRuntimeManager {
     admission: AdmissionController,
     active: Arc<Mutex<HashMap<SandboxId, ActiveSandbox>>>,
     warm_pool: WarmPoolStore,
+    transient_sessions: Arc<TransientSessionMap>,
     in_flight_spawns: Arc<Mutex<HashSet<SandboxId>>>,
     in_flight_destroys: Arc<Mutex<HashMap<SandboxId, watch::Sender<bool>>>>,
     lifecycle_locks: Arc<Mutex<HashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>>,
@@ -353,26 +354,35 @@ impl LocalRuntimeManager {
 
         let active = Arc::new(Mutex::new(HashMap::<SandboxId, ActiveSandbox>::new()));
         let warm_pool = WarmPoolStore::new();
+        let transient_sessions = Arc::new(Mutex::new(HashMap::<SandboxId, TransientVmRss>::new()));
         let active_for_rss = Arc::downgrade(&active);
         let warm_pool_for_rss = warm_pool.downgrade();
+        let transient_for_rss = Arc::downgrade(&transient_sessions);
         let observed_rss_overage_fn = Arc::new(move || -> u64 {
-            let mut collected: Vec<(Arc<dyn VmSessionPort>, u64)> = Vec::new();
+            let mut collected: Vec<(SandboxId, Arc<dyn VmSessionPort>, u64)> = Vec::new();
             if let Some(active_arc) = active_for_rss.upgrade() {
                 let guard = lock_unpoisoned(&active_arc);
-                collected.extend(
-                    guard
-                        .values()
-                        .map(|entry| (Arc::clone(&entry.session), entry.reserved_rss_mb)),
-                );
-                // Sample WarmPool inside `active` lock (`active -> warm_pool`) so Warm -> Active
-                // commit transitions cannot momentarily disappear from both collections.
+                collected.extend(guard.iter().map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        Arc::clone(&entry.session),
+                        entry.reserved_rss_mb,
+                    )
+                }));
+                // Sample WarmPool and `transient_sessions` inside `active` lock
+                // (`active -> warm_pool -> transient_sessions`) so lifecycle handoffs
+                // (Warm -> Active, Booted -> Active, Active -> Destroying) never drop RSS samples.
                 warm_pool_for_rss.collect_rss_samples(&mut collected);
+                collect_transient_rss_samples(&transient_for_rss, &mut collected);
             } else {
                 warm_pool_for_rss.collect_rss_samples(&mut collected);
+                collect_transient_rss_samples(&transient_for_rss, &mut collected);
             }
+            let mut seen = HashSet::with_capacity(collected.len());
             collected
                 .into_iter()
-                .map(|(session, reserved_mb)| {
+                .filter(|(id, _, _)| seen.insert(id.clone()))
+                .map(|(_, session, reserved_mb)| {
                     let live_mb = session
                         .current_rss_bytes()
                         .map(bytes_to_mib_ceil)
@@ -395,6 +405,7 @@ impl LocalRuntimeManager {
             admission,
             active,
             warm_pool,
+            transient_sessions,
             in_flight_spawns: Arc::new(Mutex::new(HashSet::new())),
             in_flight_destroys: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -440,6 +451,7 @@ impl LocalRuntimeManager {
             let candidate = SandboxId::new(format!("mp-{rand_hex}-{seq}"));
             let in_use = lock_unpoisoned(&self.active).contains_key(&candidate)
                 || self.warm_pool.contains_live_id(&candidate)
+                || lock_unpoisoned(&self.transient_sessions).contains_key(&candidate)
                 || self.is_in_flight_spawn(&candidate)
                 || lock_unpoisoned(&self.in_flight_destroys).contains_key(&candidate);
             if !in_use {
@@ -620,6 +632,7 @@ impl LocalRuntimeManager {
                 .await?;
             let guard = warm_guard.expect("warm replenish guard preserved across boot");
             drop(booted.egress_rx);
+            let mut transient_rss = booted.transient_rss;
 
             let entry = WarmEntry {
                 sandbox_id,
@@ -640,10 +653,13 @@ impl LocalRuntimeManager {
                 } else {
                     target_size
                 };
-            if let Some(rejected) = self
+            let rejected = self
                 .warm_pool
-                .park_from_replenish(guard, entry, effective_target)
-            {
+                .park_from_replenish(guard, entry, effective_target);
+            if let Some(rss_guard) = transient_rss.as_mut() {
+                rss_guard.finish();
+            }
+            if let Some(rejected) = rejected {
                 self.dispose_warm_entry(rejected).await;
                 break;
             }
@@ -1217,6 +1233,69 @@ impl LocalRuntimeManager {
     }
 }
 
+struct TransientVmRss {
+    session: Weak<dyn VmSessionPort>,
+    reserved_rss_mb: u64,
+}
+
+type TransientSessionMap = Mutex<HashMap<SandboxId, TransientVmRss>>;
+
+fn collect_transient_rss_samples(
+    weak_map: &Weak<TransientSessionMap>,
+    dst: &mut Vec<(SandboxId, Arc<dyn VmSessionPort>, u64)>,
+) {
+    let Some(map_arc) = weak_map.upgrade() else {
+        return;
+    };
+    let map = lock_unpoisoned(&map_arc);
+    dst.extend(map.iter().filter_map(|(id, vm)| {
+        vm.session
+            .upgrade()
+            .map(|session| (id.clone(), session, vm.reserved_rss_mb))
+    }));
+}
+
+struct TransientSessionRssGuard {
+    map: Arc<TransientSessionMap>,
+    sandbox_id: SandboxId,
+    armed: bool,
+}
+
+impl TransientSessionRssGuard {
+    fn register(
+        map: &Arc<TransientSessionMap>,
+        sandbox_id: SandboxId,
+        session: &Arc<dyn VmSessionPort>,
+        reserved_rss_mb: u64,
+    ) -> Self {
+        lock_unpoisoned(map).insert(
+            sandbox_id.clone(),
+            TransientVmRss {
+                session: Arc::downgrade(session),
+                reserved_rss_mb,
+            },
+        );
+        Self {
+            map: Arc::clone(map),
+            sandbox_id,
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.armed {
+            self.armed = false;
+            lock_unpoisoned(&self.map).remove(&self.sandbox_id);
+        }
+    }
+}
+
+impl Drop for TransientSessionRssGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 struct BootedSandbox {
     session: Arc<dyn VmSessionPort>,
     work_dir: PathBuf,
@@ -1225,6 +1304,7 @@ struct BootedSandbox {
     capabilities: CapabilityReport,
     expires_at: Instant,
     egress_rx: Option<tokio::sync::mpsc::Receiver<TunnelStream>>,
+    transient_rss: Option<TransientSessionRssGuard>,
 }
 
 enum CheckoutAttempt {
@@ -1348,6 +1428,7 @@ struct BootCancellationGuard {
     artifact_paths: Vec<PathBuf>,
     bundle_guard: Option<BundleReadGuard>,
     session: Option<Arc<dyn VmSessionPort>>,
+    transient_rss: Option<TransientSessionRssGuard>,
     permit: Option<AdmissionPermit>,
     in_flight_guard: Option<InFlightSpawnGuard>,
     warm_guard: Option<WarmReplenishGuard>,
@@ -1363,12 +1444,14 @@ impl BootCancellationGuard {
         AdmissionPermit,
         Option<InFlightSpawnGuard>,
         Option<WarmReplenishGuard>,
+        Option<TransientSessionRssGuard>,
     ) {
         self.armed = false;
         (
             self.permit.take().expect("boot permit still held"),
             self.in_flight_guard.take(),
             self.warm_guard.take(),
+            self.transient_rss.take(),
         )
     }
 }
@@ -1404,6 +1487,7 @@ impl Drop for BootCancellationGuard {
         }
         let bundle_guard = self.bundle_guard.take();
         let session = self.session.take();
+        let mut transient_rss = self.transient_rss.take();
         let permit = self.permit.take();
         let in_flight_guard = self.in_flight_guard.take();
         let warm_guard = self.warm_guard.take();
@@ -1446,11 +1530,18 @@ impl Drop for BootCancellationGuard {
                                 bundle_guard: _bundle_guard,
                                 permit,
                             };
-                            restore_active_if_alive(&active, &manager_alive, sandbox_id, restored);
+                            restore_active_if_alive(
+                                &active,
+                                transient_rss.as_mut(),
+                                &manager_alive,
+                                sandbox_id,
+                                restored,
+                            );
                         }
                         return;
                     }
                     drop(session);
+                    drop(transient_rss);
                 } else {
                     let mut target_pid = recorded_pid;
                     let mut target_token = recorded_token;
@@ -1572,6 +1663,7 @@ impl LocalRuntimeManager {
             artifact_paths: vec![work_dir.clone()],
             bundle_guard: None,
             session: None,
+            transient_rss: None,
             permit: Some(permit),
             in_flight_guard,
             warm_guard,
@@ -1782,6 +1874,17 @@ impl LocalRuntimeManager {
             std::slice::from_ref(&prepared.overlay_path),
             &work_dir,
         );
+        let reserved_rss_mb = cancel_guard
+            .permit
+            .as_ref()
+            .map(|p| p.demand().rss_mb)
+            .unwrap_or(0);
+        cancel_guard.transient_rss = Some(TransientSessionRssGuard::register(
+            &self.transient_sessions,
+            sandbox_id.clone(),
+            &session,
+            reserved_rss_mb,
+        ));
         cancel_guard.session = Some(Arc::clone(&session));
         cancel_guard.artifact_paths = all_artifacts.clone();
         // Anchor lease expiry after VM boot succeeds so cold-boot latency does not consume `spec.lease_ttl`.
@@ -1829,7 +1932,7 @@ impl LocalRuntimeManager {
             return Err(err);
         }
 
-        let (permit, in_flight_guard, warm_guard) = cancel_guard.disarm();
+        let (permit, in_flight_guard, warm_guard, transient_rss) = cancel_guard.disarm();
         Ok((
             BootedSandbox {
                 session,
@@ -1839,6 +1942,7 @@ impl LocalRuntimeManager {
                 capabilities: boot.capabilities,
                 expires_at,
                 egress_rx: boot.egress_rx,
+                transient_rss,
             },
             permit,
             in_flight_guard,
@@ -1859,6 +1963,7 @@ impl LocalRuntimeManager {
         // teardown never runs a second concurrent `graceful_shutdown` from `Drop`.
         cancel_guard.armed = false;
         cancel_guard.session = None;
+        let mut transient_rss = cancel_guard.transient_rss.take();
         let permit_slot = cancel_guard.permit.take();
         let in_flight_guard = cancel_guard.in_flight_guard.take();
         let warm_guard = cancel_guard.warm_guard.take();
@@ -1907,11 +2012,18 @@ impl LocalRuntimeManager {
                         bundle_guard: _bundle_guard,
                         permit,
                     };
-                    restore_active_if_alive(&active, &manager_alive, sandbox_id, restored);
+                    restore_active_if_alive(
+                        &active,
+                        transient_rss.as_mut(),
+                        &manager_alive,
+                        sandbox_id,
+                        restored,
+                    );
                 }
                 return;
             }
             drop(session);
+            drop(transient_rss);
             if manager_alive.load(Ordering::Acquire) {
                 rollback_spawn_with_deps(
                     &journal,
@@ -2000,6 +2112,7 @@ impl LocalRuntimeManager {
             capabilities: warm.boot_capabilities,
             expires_at,
             egress_rx,
+            transient_rss: None,
         };
         let lease = self.register_active_sandbox(
             warm.sandbox_id,
@@ -2031,6 +2144,7 @@ impl LocalRuntimeManager {
         });
         let capabilities = build_lease_capabilities(spec, &booted.prepared, booted.capabilities);
         let reserved_rss_mb = permit.demand().rss_mb;
+        let mut transient_rss = booted.transient_rss;
         let replaced = {
             let mut active = lock_unpoisoned(&self.active);
             let prev = active.insert(
@@ -2054,6 +2168,9 @@ impl LocalRuntimeManager {
                 // Commit inside `active` lock (preserving `active -> warm_pool`) so RSS sampling
                 // never double-counts or under-counts across the Warm -> Active handoff.
                 self.warm_pool.commit_checkout(&sandbox_id);
+            }
+            if let Some(rss_guard) = transient_rss.as_mut() {
+                rss_guard.finish();
             }
             prev
         };
@@ -2163,6 +2280,21 @@ impl LocalRuntimeManager {
         tokio::task::spawn_blocking(move || journal.remove_record(&id))
             .await
             .map_err(|err| SandboxError::Internal(format!("journal remove task failed: {err}")))?
+    }
+
+    fn take_active_for_destroy(
+        &self,
+        id: &SandboxId,
+    ) -> Option<(ActiveSandbox, TransientSessionRssGuard)> {
+        let mut active = lock_unpoisoned(&self.active);
+        let entry = active.remove(id)?;
+        let rss_guard = TransientSessionRssGuard::register(
+            &self.transient_sessions,
+            id.clone(),
+            &entry.session,
+            entry.reserved_rss_mb,
+        );
+        Some((entry, rss_guard))
     }
 }
 
@@ -2386,14 +2518,11 @@ impl RuntimeManager for LocalRuntimeManager {
         let lifecycle = self.acquire_lifecycle_lock(id).await;
 
         let pre_in_flight = self.warm_pool.contains_live_id(id) || self.is_in_flight_spawn(id);
-        let mut removed_active = {
-            let mut active = lock_unpoisoned(&self.active);
-            active.remove(id)
-        };
+        let mut removed_active = self.take_active_for_destroy(id);
         if removed_active.is_none() {
             let post_in_flight =
                 self.warm_pool.contains_live_id(id) || self.is_in_flight_spawn(id);
-            removed_active = lock_unpoisoned(&self.active).remove(id);
+            removed_active = self.take_active_for_destroy(id);
             if removed_active.is_none() && (pre_in_flight || post_in_flight) {
                 return Ok(DestroyStatus::AllResourcesCleaned);
             }
@@ -2435,7 +2564,7 @@ impl RuntimeManager for LocalRuntimeManager {
 #[allow(clippy::too_many_arguments)]
 async fn destroy_locked_with_deps(
     id: SandboxId,
-    removed_active: Option<ActiveSandbox>,
+    removed_active: Option<(ActiveSandbox, TransientSessionRssGuard)>,
     manager_alive: Arc<AtomicBool>,
     active: Arc<Mutex<HashMap<SandboxId, ActiveSandbox>>>,
     warm_pool: WarmPoolStore,
@@ -2478,92 +2607,100 @@ async fn destroy_locked_with_deps(
         .map(|rec| rec.expires_at_unix_ms)
         .unwrap_or_else(unix_now_ms);
 
-    let (overlay_path_opt, artifacts, _permit_and_notify) = if let Some(entry) = removed_active {
-        let ActiveSandbox {
-            session,
-            work_dir,
-            overlay_path,
-            artifact_paths: entry_artifacts,
-            network_policy,
-            expires_at: _,
-            reserved_rss_mb,
-            host_rss_budget_mb,
-            host_storage_budget_mb,
-            egress_proxy,
-            bundle_guard,
-            permit,
-        } = entry;
+    let (overlay_path_opt, artifacts, _permit_and_notify) =
+        if let Some((entry, mut dying_rss)) = removed_active {
+            let ActiveSandbox {
+                session,
+                work_dir,
+                overlay_path,
+                artifact_paths: entry_artifacts,
+                network_policy,
+                expires_at: _,
+                reserved_rss_mb,
+                host_rss_budget_mb,
+                host_storage_budget_mb,
+                egress_proxy,
+                bundle_guard,
+                permit,
+            } = entry;
 
-        let journal_paths = journal_rec
-            .as_ref()
-            .map(|rec| rec.artifact_paths.as_slice())
-            .unwrap_or(&[]);
-        let mut merged = merge_artifact_paths(
-            &entry_artifacts,
-            journal_paths,
-            &sandboxes_dir.join(id.as_str()),
-        );
-        push_unique_path(&mut merged, &overlay_path);
+            let journal_paths = journal_rec
+                .as_ref()
+                .map(|rec| rec.artifact_paths.as_slice())
+                .unwrap_or(&[]);
+            let mut merged = merge_artifact_paths(
+                &entry_artifacts,
+                journal_paths,
+                &sandboxes_dir.join(id.as_str()),
+            );
+            push_unique_path(&mut merged, &overlay_path);
 
-        if manager_alive.load(Ordering::Acquire) {
-            let rec = JournalRecord {
-                sandbox_id: id.clone(),
-                state: JournalLifecycleState::Destroying,
-                pid: Some(session.pid()),
-                start_token: Some(session.start_token()),
-                artifact_paths: merged.clone(),
-                expires_at_unix_ms,
-            };
-            let j = journal.clone();
-            let _ = tokio::task::spawn_blocking(move || j.write_record(&rec)).await;
-        }
-
-        let graceful_ok = session
-            .graceful_shutdown(config.graceful_shutdown_timeout)
-            .await
-            .unwrap_or(false);
-        let kill_res = if !graceful_ok && session.is_alive() {
-            session.force_kill().await
-        } else {
-            Ok(())
-        };
-        if let Err(err) = kill_res {
-            if session.is_alive() {
-                let restored = ActiveSandbox {
-                    session,
-                    work_dir,
-                    overlay_path,
-                    artifact_paths: entry_artifacts,
-                    network_policy,
-                    expires_at: Instant::now(),
-                    reserved_rss_mb,
-                    host_rss_budget_mb,
-                    host_storage_budget_mb,
-                    egress_proxy,
-                    bundle_guard,
-                    permit,
+            if manager_alive.load(Ordering::Acquire) {
+                let rec = JournalRecord {
+                    sandbox_id: id.clone(),
+                    state: JournalLifecycleState::Destroying,
+                    pid: Some(session.pid()),
+                    start_token: Some(session.start_token()),
+                    artifact_paths: merged.clone(),
+                    expires_at_unix_ms,
                 };
-                restore_active_if_alive(&active, &manager_alive, id.clone(), restored);
-                return Err(err);
+                let j = journal.clone();
+                let _ = tokio::task::spawn_blocking(move || j.write_record(&rec)).await;
             }
-        }
 
-        // Strict one-way disposal: dirty sandboxes are never recycled back into `warm_pool`.
-        warm_pool.record_disposed_dirty();
-        let permit_guard = OwnedDestroyPermit {
-            bundle_guard,
-            permit: Some(permit),
-            warm_pool: warm_pool.clone(),
-        };
+            let graceful_ok = session
+                .graceful_shutdown(config.graceful_shutdown_timeout)
+                .await
+                .unwrap_or(false);
+            let kill_res = if !graceful_ok && session.is_alive() {
+                session.force_kill().await
+            } else {
+                Ok(())
+            };
+            if let Err(err) = kill_res {
+                if session.is_alive() {
+                    let restored = ActiveSandbox {
+                        session,
+                        work_dir,
+                        overlay_path,
+                        artifact_paths: entry_artifacts,
+                        network_policy,
+                        expires_at: Instant::now(),
+                        reserved_rss_mb,
+                        host_rss_budget_mb,
+                        host_storage_budget_mb,
+                        egress_proxy,
+                        bundle_guard,
+                        permit,
+                    };
+                    restore_active_if_alive(
+                        &active,
+                        Some(&mut dying_rss),
+                        &manager_alive,
+                        id.clone(),
+                        restored,
+                    );
+                    return Err(err);
+                }
+            }
 
-        // Drop session ownership before removing overlays/sockets so Windows releases all handles,
-        // and shut down all proxy tasks before cleanup completes.
-        drop(session);
-        if let Some(proxy) = egress_proxy {
-            proxy.shutdown().await;
-        }
-        (Some(overlay_path), merged, Some(permit_guard))
-    } else if let Some(rec) = journal_rec {
+            // Strict one-way disposal: dirty sandboxes are never recycled back into `warm_pool`.
+            warm_pool.record_disposed_dirty();
+            let permit_guard = OwnedDestroyPermit {
+                bundle_guard,
+                permit: Some(permit),
+                warm_pool: warm_pool.clone(),
+            };
+
+            // Drop session ownership before removing overlays/sockets so Windows releases all handles,
+            // and shut down all proxy tasks before cleanup completes.
+            drop(session);
+            dying_rss.finish();
+            if let Some(proxy) = egress_proxy {
+                proxy.shutdown().await;
+            }
+            (Some(overlay_path), merged, Some(permit_guard))
+        } else if let Some(rec) = journal_rec {
         if let (Some(pid), Some(start_token)) = (rec.pid, rec.start_token) {
             match vm_runtime.kill_orphan_process(pid, start_token).await {
                 Ok(_) | Err(SandboxError::NotFound(_)) => {}
@@ -2839,18 +2976,23 @@ fn is_overlay_artifact(path: &Path) -> bool {
 
 fn restore_active_if_alive(
     active: &Mutex<HashMap<SandboxId, ActiveSandbox>>,
+    transient_rss: Option<&mut TransientSessionRssGuard>,
     manager_alive: &AtomicBool,
     id: SandboxId,
     restored: ActiveSandbox,
 ) {
     let rejected = {
         let mut active_map = lock_unpoisoned(active);
-        if manager_alive.load(Ordering::Acquire) {
+        let rejected = if manager_alive.load(Ordering::Acquire) {
             active_map.insert(id, restored);
             None
         } else {
             Some(restored)
+        };
+        if let Some(rss_guard) = transient_rss {
+            rss_guard.finish();
         }
+        rejected
     };
     drop(rejected);
 }
@@ -6671,6 +6813,160 @@ mod tests {
         vm.release_boot2.notify_one();
         let lease2 = boot2_task.await.unwrap().unwrap();
         mgr.destroy(&lease1.id).await.unwrap();
+        mgr.destroy(&lease2.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn destroy_tracks_dying_vm_rss_overage_until_process_exits() {
+        struct PausedShutdownSession {
+            pid: u32,
+            alive: AtomicBool,
+            rss_bytes: u64,
+            artifacts: Vec<PathBuf>,
+            shutdown_entered: Arc<tokio::sync::Notify>,
+            release_shutdown: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl VmSessionPort for PausedShutdownSession {
+            fn pid(&self) -> u32 {
+                self.pid
+            }
+            fn start_token(&self) -> u64 {
+                9500 + u64::from(self.pid)
+            }
+            fn artifact_paths(&self) -> &[PathBuf] {
+                &self.artifacts
+            }
+            fn is_alive(&self) -> bool {
+                self.alive.load(Ordering::Acquire)
+            }
+            fn current_rss_bytes(&self) -> Option<u64> {
+                self.is_alive().then_some(self.rss_bytes)
+            }
+            async fn exec_stream(&self, _: ExecRequest) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn open_tunnel(&self, _: StreamTargetWire) -> Result<TunnelStream, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn enable_egress_proxy(
+                &self,
+                _: u16,
+            ) -> Result<tokio::sync::mpsc::Receiver<TunnelStream>, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn copy_in_tar(
+                &self,
+                _: &str,
+                _: Vec<u8>,
+                _: u64,
+            ) -> Result<u64, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn copy_out_tar(&self, _: &str, _: u64) -> Result<Vec<u8>, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn graceful_shutdown(&self, _: Duration) -> Result<bool, SandboxError> {
+                self.shutdown_entered.notify_one();
+                self.release_shutdown.notified().await;
+                self.alive.store(false, Ordering::Release);
+                Ok(true)
+            }
+            async fn force_kill(&self) -> Result<(), SandboxError> {
+                self.alive.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        struct DyingRssVm {
+            calls: AtomicU64,
+            shutdown_entered: Arc<tokio::sync::Notify>,
+            release_shutdown: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl VmRuntimePort for DyingRssVm {
+            async fn boot_vm(&self, _: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let rss_bytes = if n == 0 {
+                    400 * 1024 * 1024
+                } else {
+                    128 * 1024 * 1024
+                };
+                Ok(VmBootOutcome {
+                    session: Box::new(PausedShutdownSession {
+                        pid: 8500 + n as u32,
+                        alive: AtomicBool::new(true),
+                        rss_bytes,
+                        artifacts: Vec::new(),
+                        shutdown_entered: Arc::clone(&self.shutdown_entered),
+                        release_shutdown: Arc::clone(&self.release_shutdown),
+                    }),
+                    pid: 8500 + n as u32,
+                    start_token: 9500 + 8500 + n,
+                    artifact_paths: Vec::new(),
+                    hardware_accelerated: true,
+                    capabilities: CapabilityReport {
+                        cpu_quota: EnforcementLevel::HardLimit,
+                        host_rss: EnforcementLevel::BestEffort,
+                        host_storage: EnforcementLevel::BestEffort,
+                        egress_filter: EnforcementLevel::HardLimit,
+                    },
+                    egress_rx: None,
+                })
+            }
+
+            async fn kill_orphan_process(&self, _: u32, _: u64) -> Result<bool, SandboxError> {
+                Ok(false)
+            }
+        }
+
+        let tmp = TestTempDir::new("mgr-dying-rss-cap");
+        let shutdown_entered = Arc::new(tokio::sync::Notify::new());
+        let release_shutdown = Arc::new(tokio::sync::Notify::new());
+        let vm = Arc::new(DyingRssVm {
+            calls: AtomicU64::new(0),
+            shutdown_entered: Arc::clone(&shutdown_entered),
+            release_shutdown: Arc::clone(&release_shutdown),
+        });
+        let mut cfg = base_config(tmp.path().join("state"));
+        cfg.admission = AdmissionLimits {
+            max_total_host_rss_mb: Some(512),
+            ..Default::default()
+        };
+        let mgr = Arc::new(
+            LocalRuntimeManager::new(cfg, Arc::new(MockOverlayStore::default()), vm).unwrap(),
+        );
+
+        let mut spec = valid_spec(Duration::from_secs(60));
+        spec.budget.guest_ram_mb = 128;
+        spec.budget.host_rss_budget_mb = Some(128);
+
+        let lease1 = mgr.spawn(spec.clone()).await.unwrap();
+        assert_eq!(mgr.current_admission_usage().effective_host_rss_mb, 400);
+
+        let mgr_destroy = Arc::clone(&mgr);
+        let id1 = lease1.id.clone();
+        let destroy_task = tokio::spawn(async move { mgr_destroy.destroy(&id1).await });
+        shutdown_entered.notified().await;
+
+        // While VM 1 is still alive inside `graceful_shutdown`, effective RSS must stay 400 MiB
+        // (not drop to the 128 MiB reservation), rejecting a 128 MiB request (400 + 128 > 512).
+        let mid_usage = mgr.current_admission_usage();
+        assert_eq!(mid_usage.reserved_host_rss_mb, 128);
+        assert_eq!(mid_usage.effective_host_rss_mb, 400);
+        assert!(matches!(
+            mgr.spawn(spec.clone()).await,
+            Err(SandboxError::AdmissionRejected(_))
+        ));
+
+        release_shutdown.notify_one();
+        destroy_task.await.unwrap().unwrap();
+        assert_eq!(mgr.current_admission_usage().effective_host_rss_mb, 0);
+
+        let lease2 = mgr.spawn(spec).await.unwrap();
+        release_shutdown.notify_one();
         mgr.destroy(&lease2.id).await.unwrap();
     }
 }

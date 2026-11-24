@@ -315,6 +315,15 @@ pub fn kill_verified_orphan_process(
     platform::kill_verified_orphan_process(pid, expected_start_token)
 }
 
+/// Samples the live RSS / working-set size in bytes for `pid` while `expected_start_token` is
+/// non-zero and matches the live OS process, returning `None` once exited or if reused.
+pub(crate) fn sample_verified_process_rss_bytes(
+    pid: u32,
+    expected_start_token: u64,
+) -> Option<u64> {
+    platform::sample_verified_process_rss_bytes(pid, expected_start_token)
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn wait_for_verified_orphan_exit<F>(
     pid: u32,
@@ -814,5 +823,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(probe_err, SandboxError::Internal(_)));
+    }
+
+    #[test]
+    fn sample_verified_process_rss_bytes_checks_start_token_and_exit() {
+        #[cfg(windows)]
+        let spec = ProcessLaunchSpec::new(
+            "cmd.exe",
+            vec![
+                OsString::from("/C"),
+                OsString::from("ping -n 6 127.0.0.1 >NUL"),
+            ],
+        );
+        #[cfg(unix)]
+        let spec = ProcessLaunchSpec::new(
+            "/bin/sh",
+            vec![OsString::from("-c"), OsString::from("sleep 5")],
+        );
+
+        let mut proc = ConfinedProcess::spawn(spec).expect("spawn confined sleep");
+        let id = proc.start_identity();
+        assert_eq!(sample_verified_process_rss_bytes(id.pid, 0), None);
+        assert_eq!(
+            sample_verified_process_rss_bytes(id.pid, id.start_token.wrapping_add(1)),
+            None
+        );
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let rss = sample_verified_process_rss_bytes(id.pid, id.start_token)
+                .expect("live verified child must report RSS");
+            assert!(rss > 0);
+        }
+        proc.kill_and_wait().expect("kill child");
+        assert_eq!(
+            sample_verified_process_rss_bytes(id.pid, id.start_token),
+            None
+        );
     }
 }

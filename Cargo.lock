@@ -1678,6 +1678,7 @@ dependencies = [
  "sandbox-runtime",
  "sandbox-vmm",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

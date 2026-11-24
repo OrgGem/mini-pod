@@ -374,26 +374,7 @@ impl WindowsConfinedProcess {
         if self.exited.is_some() {
             return None;
         }
-        // SAFETY: `self.process.as_raw()` is an open Win32 process handle with `SYNCHRONIZE`.
-        if unsafe { WaitForSingleObject(self.process.as_raw(), 0) } != WAIT_TIMEOUT {
-            return None;
-        }
-        // SAFETY: `PROCESS_MEMORY_COUNTERS` is POD; `cb` is initialized to exact struct size.
-        let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
-        pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        // SAFETY: `self.process.as_raw()` is an open process handle from `CreateProcessW` and `pmc`
-        // is valid writable stack storage.
-        let ok = unsafe {
-            GetProcessMemoryInfo(
-                self.process.as_raw(),
-                &mut pmc,
-                size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-            )
-        };
-        if ok == 0 {
-            return None;
-        }
-        Some(pmc.WorkingSetSize as u64)
+        sample_handle_working_set_bytes(self.process.as_raw())
     }
 
     /// Non-blocking check for process exit.
@@ -818,6 +799,53 @@ pub fn kill_verified_orphan_process(
     }
 
     Ok(true)
+}
+
+fn sample_handle_working_set_bytes(handle: HANDLE) -> Option<u64> {
+    // SAFETY: `handle` is an open Win32 process handle with `SYNCHRONIZE`.
+    if unsafe { WaitForSingleObject(handle, 0) } != WAIT_TIMEOUT {
+        return None;
+    }
+    // SAFETY: `PROCESS_MEMORY_COUNTERS` is POD; `cb` is initialized to exact struct size.
+    let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
+    pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: `handle` has process query rights and `pmc` is valid writable stack storage.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            handle,
+            &mut pmc,
+            size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(pmc.WorkingSetSize as u64)
+}
+
+pub(crate) fn sample_verified_process_rss_bytes(
+    pid: u32,
+    expected_start_token: u64,
+) -> Option<u64> {
+    if pid == 0 || expected_start_token == 0 {
+        return None;
+    }
+    // SAFETY: Read-only/wait probe for `pid`; returns null on failure.
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let handle = OwnedHandle::from_raw(raw).ok()?;
+    if query_process_creation_time(handle.as_raw()).ok()? != expected_start_token {
+        return None;
+    }
+    sample_handle_working_set_bytes(handle.as_raw())
 }
 
 fn confirm_process_exited(handle: &OwnedHandle, can_wait: bool) -> bool {

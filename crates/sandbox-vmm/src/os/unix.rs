@@ -903,6 +903,35 @@ pub fn kill_verified_orphan_process(
     }
 }
 
+pub(crate) fn sample_verified_process_rss_bytes(
+    pid: u32,
+    expected_start_token: u64,
+) -> Option<u64> {
+    if pid == 0 || expected_start_token == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (state, actual_start_token) = parse_proc_stat_state_and_starttime(&stat)?;
+        if state == 'Z' || actual_start_token != expected_start_token {
+            return None;
+        }
+        let statm = fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is a read-only POSIX query returning OS page size.
+        let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if raw_page_size <= 0 {
+            return None;
+        }
+        let bytes = parse_proc_statm_rss_bytes(&statm, raw_page_size as u64)?;
+        (bytes > 0).then_some(bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_verified_orphan_still_alive(pid: u32, expected_start_token: u64) -> Result<bool, SandboxError> {
     #[cfg(target_os = "linux")]

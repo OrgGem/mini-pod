@@ -342,13 +342,44 @@ impl DaemonState {
     }
 }
 
+fn docker_endpoint_sandbox_token(id: &SandboxId) -> String {
+    let raw = id.as_str();
+    if !raw.is_empty()
+        && raw.len() <= 36
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return raw.to_owned();
+    }
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut out = String::with_capacity(34);
+    out.push_str("h-");
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn docker_unix_socket_filename(id: &SandboxId, seq: u64) -> String {
+    format!("d-{}-{seq}.sock", docker_endpoint_sandbox_token(id))
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn docker_named_pipe_name(id: &SandboxId, seq: u64) -> String {
+    format!("minipod-docker-{}-{seq}", docker_endpoint_sandbox_token(id))
+}
+
 #[cfg(windows)]
 async fn bind_owner_only_docker_listener(
     compat: &Arc<DockerCompatServer>,
     _state_dir: &Path,
 ) -> Result<(String, DockerListenerHandle), SandboxError> {
     let seq = NEXT_DOCKER_COMPAT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let pipe_name = format!("minipod-docker-{}-{seq}", std::process::id());
+    let pipe_name = docker_named_pipe_name(compat.sandbox_id(), seq);
     let handle = compat.bind_named_pipe_with_factory(
         &pipe_name,
         sandbox_vmm::create_owner_only_async_named_pipe,
@@ -366,7 +397,8 @@ async fn bind_owner_only_docker_listener(
     use sandbox_vmm::validate_socket_path;
 
     let seq = NEXT_DOCKER_COMPAT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let state_candidate = state_dir.join("dck").join(format!("d-{seq}.sock"));
+    let sock_file = docker_unix_socket_filename(compat.sandbox_id(), seq);
+    let state_candidate = state_dir.join("dck").join(&sock_file);
     let sock_path = if validate_socket_path(&state_candidate).is_ok() {
         state_candidate
     } else {
@@ -376,7 +408,7 @@ async fn bind_owner_only_docker_listener(
             .unwrap_or(0);
         PathBuf::from("/tmp")
             .join(format!("mpd-{uid}-{}", std::process::id()))
-            .join(format!("d-{seq}.sock"))
+            .join(&sock_file)
     };
     validate_socket_path(&sock_path)?;
     let handle = compat.bind_unix_owner_only(&sock_path).await?;
@@ -3131,5 +3163,65 @@ mod tests {
         assert!(cancel_seen.load(Ordering::Acquire));
 
         client.destroy(&lease.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn docker_compat_endpoint_never_reuses_socket_or_pipe_name_across_daemon_restarts() {
+        let tmp = TestTempDir::new("docker-compat-restart-unique");
+
+        let (lease1_id, uri1) = {
+            let (state1, _) = build_test_state(&tmp);
+            let client1 = test_client(Arc::clone(&state1));
+            let lease1 = client1.spawn(sample_spec(NetworkPolicy::Isolated)).await.unwrap();
+            let uri1 = state1.enable_docker_compat(&lease1.id, false).await.unwrap();
+            assert!(
+                uri1.contains(lease1.id.as_str()),
+                "docker endpoint URI '{uri1}' must embed sandbox ID '{}'",
+                lease1.id
+            );
+            state1.shutdown_all().await;
+            (lease1.id, uri1)
+        };
+
+        let (lease2_id, uri2) = {
+            let (state2, _) = build_test_state(&tmp);
+            let client2 = test_client(Arc::clone(&state2));
+            let lease2 = client2.spawn(sample_spec(NetworkPolicy::Isolated)).await.unwrap();
+            let uri2 = state2.enable_docker_compat(&lease2.id, false).await.unwrap();
+            assert!(
+                uri2.contains(lease2.id.as_str()),
+                "docker endpoint URI '{uri2}' must embed sandbox ID '{}'",
+                lease2.id
+            );
+            state2.shutdown_all().await;
+            (lease2.id, uri2)
+        };
+
+        assert_ne!(lease1_id, lease2_id);
+        assert_ne!(uri1, uri2);
+
+        // Even when a restarted daemon resets `seq` to `1` under the same OS PID and `state_dir`,
+        // both Unix `dck/*.sock` and Windows Named Pipe names stay distinct per `SandboxId`.
+        assert_ne!(
+            docker_unix_socket_filename(&lease1_id, 1),
+            docker_unix_socket_filename(&lease2_id, 1)
+        );
+        assert_ne!(
+            docker_named_pipe_name(&lease1_id, 1),
+            docker_named_pipe_name(&lease2_id, 1)
+        );
+
+        let long_id_a = SandboxId::new("custom/unsafe,id:".to_owned() + &"a".repeat(80));
+        let long_id_b = SandboxId::new("custom/unsafe,id:".to_owned() + &"b".repeat(80));
+        let sock_a = docker_unix_socket_filename(&long_id_a, u64::MAX);
+        let sock_b = docker_unix_socket_filename(&long_id_b, u64::MAX);
+        assert_ne!(sock_a, sock_b);
+        let fallback_unix_path = format!("/tmp/mpd-{}-{}/{sock_a}", u32::MAX, u32::MAX);
+        assert!(
+            fallback_unix_path.len() <= sandbox_vmm::MAX_UNIX_SOCKET_PATH_BYTES,
+            "fallback path '{fallback_unix_path}' ({} bytes) exceeded {}",
+            fallback_unix_path.len(),
+            sandbox_vmm::MAX_UNIX_SOCKET_PATH_BYTES
+        );
     }
 }

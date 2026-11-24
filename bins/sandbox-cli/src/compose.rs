@@ -520,31 +520,40 @@ pub async fn compose_down_in_sandbox(
     let docker_uri = client.enable_docker_compat(sandbox_id, false).await?;
     let docker_ep = ControlEndpoint::parse(&docker_uri)?;
 
-    let containers = list_project_containers(&docker_ep, project_name).await?;
     let mut removed_containers = 0u64;
     let mut errors: Vec<SandboxError> = Vec::new();
-    // Tear down in reverse order, continuing across individual failures so remaining resources
-    // still get cleaned up before reporting any non-404 errors.
-    for row in containers.iter().rev() {
-        if let Some(id) = row["id"].as_str().filter(|id| !id.is_empty()) {
-            let enc_id = percent_encode_component(id);
-            let stop_path = format!("/containers/{enc_id}/stop?t=3");
-            let _ = docker_json_request(&docker_ep, "POST", &stop_path, None).await;
-            let del_path = format!("/containers/{enc_id}?force=true");
-            match docker_json_request(&docker_ep, "DELETE", &del_path, None).await {
-                Ok((st, _)) if (200..300).contains(&st) || st == 404 => {
-                    removed_containers += 1;
+    // Tear down in reverse order, continuing across list or delete failures so independent
+    // networks and volumes still get cleaned up before reporting any non-404 errors.
+    match list_project_containers(&docker_ep, project_name).await {
+        Ok(containers) => {
+            for row in containers.iter().rev() {
+                match row["id"].as_str().filter(|id| !id.is_empty()) {
+                    Some(id) => {
+                        let enc_id = percent_encode_component(id);
+                        let stop_path = format!("/containers/{enc_id}/stop?t=3");
+                        let _ = docker_json_request(&docker_ep, "POST", &stop_path, None).await;
+                        let del_path = format!("/containers/{enc_id}?force=true");
+                        match docker_json_request(&docker_ep, "DELETE", &del_path, None).await {
+                            Ok((st, _)) if (200..300).contains(&st) || st == 404 => {
+                                removed_containers += 1;
+                            }
+                            Ok((st, body)) => {
+                                errors.push(docker_http_error(
+                                    &format!("remove container '{id}'"),
+                                    st,
+                                    &body,
+                                ));
+                            }
+                            Err(err) => errors.push(err),
+                        }
+                    }
+                    None => errors.push(SandboxError::Transport(
+                        "listed project container missing 'Id'".to_owned(),
+                    )),
                 }
-                Ok((st, body)) => {
-                    errors.push(docker_http_error(
-                        &format!("remove container '{id}'"),
-                        st,
-                        &body,
-                    ));
-                }
-                Err(err) => errors.push(err),
             }
         }
+        Err(err) => errors.push(err),
     }
 
     let mut removed_networks = 0u64;
@@ -555,20 +564,27 @@ pub async fn compose_down_in_sandbox(
                     let matches_label =
                         net["Labels"][LABEL_PROJECT].as_str() == Some(project_name);
                     if matches_label {
-                        if let Some(name) = net["Name"].as_str().filter(|n| !n.is_empty()) {
-                            let path = format!("/networks/{}", percent_encode_component(name));
-                            match docker_json_request(&docker_ep, "DELETE", &path, None).await {
-                                Ok((st, _)) if (200..300).contains(&st) => {
-                                    removed_networks += 1;
+                        let net_name = net["Name"].as_str().unwrap_or("<unnamed>");
+                        match net["Id"].as_str().filter(|id| !id.is_empty()) {
+                            Some(net_id) => {
+                                let path =
+                                    format!("/networks/{}", percent_encode_component(net_id));
+                                match docker_json_request(&docker_ep, "DELETE", &path, None).await {
+                                    Ok((st, _)) if (200..300).contains(&st) => {
+                                        removed_networks += 1;
+                                    }
+                                    Ok((404, _)) => {}
+                                    Ok((st, body)) => errors.push(docker_http_error(
+                                        &format!("remove network '{net_name}' ({net_id})"),
+                                        st,
+                                        &body,
+                                    )),
+                                    Err(err) => errors.push(err),
                                 }
-                                Ok((404, _)) => {}
-                                Ok((st, body)) => errors.push(docker_http_error(
-                                    &format!("remove network '{name}'"),
-                                    st,
-                                    &body,
-                                )),
-                                Err(err) => errors.push(err),
                             }
+                            None => errors.push(SandboxError::Transport(format!(
+                                "listed project network '{net_name}' missing 'Id'"
+                            ))),
                         }
                     }
                 }
@@ -3563,11 +3579,11 @@ services:
             ("GET", "/networks") => (
                 200,
                 json!([
-                    { "Name": "demo_default", "Labels": { LABEL_PROJECT: "demo" } }
+                    { "Id": "net-demo-1", "Name": "demo_default", "Labels": { LABEL_PROJECT: "demo" } }
                 ])
                 .to_string(),
             ),
-            ("DELETE", "/networks/demo_default") => (204, String::new()),
+            ("DELETE", "/networks/net-demo-1") => (204, String::new()),
             ("GET", "/volumes") => (
                 200,
                 json!({
@@ -3600,7 +3616,8 @@ services:
         let reqs = server.recorded_requests();
         assert!(reqs.contains(&"DELETE /containers/ctr-2?force=true".to_owned()));
         assert!(reqs.contains(&"DELETE /containers/ctr-1?force=true".to_owned()));
-        assert!(reqs.contains(&"DELETE /networks/demo_default".to_owned()));
+        assert!(reqs.contains(&"DELETE /networks/net-demo-1".to_owned()));
+        assert!(!reqs.contains(&"DELETE /networks/demo_default".to_owned()));
         assert!(reqs.contains(&"DELETE /volumes/demo_data".to_owned()));
         server.stop().await;
 
@@ -3626,9 +3643,9 @@ services:
             ("DELETE", "/containers/ctr-gone?force=true") => (404, String::new()),
             ("GET", "/networks") => (
                 200,
-                json!([{ "Name": "demo_default", "Labels": { LABEL_PROJECT: "demo" } }]).to_string(),
+                json!([{ "Id": "net-gone-1", "Name": "sharednet", "Labels": { LABEL_PROJECT: "demo" } }]).to_string(),
             ),
-            ("DELETE", "/networks/demo_default") => (404, String::new()),
+            ("DELETE", "/networks/net-gone-1") => (404, String::new()),
             ("GET", "/volumes") => (200, json!({ "Volumes": null }).to_string()),
             _ => (500, format!("unexpected {method} {target}")),
         })
@@ -3640,6 +3657,73 @@ services:
         assert_eq!(summary["removed_containers"], 1);
         assert_eq!(summary["removed_networks"], 0);
         assert_eq!(summary["removed_volumes"], 0);
+        let ok_reqs = ok_server.recorded_requests();
+        assert!(ok_reqs.contains(&"DELETE /networks/net-gone-1".to_owned()));
+        assert!(!ok_reqs.contains(&"DELETE /networks/sharednet".to_owned()));
         ok_server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn compose_down_cleans_networks_by_id_and_volumes_even_when_container_listing_fails() {
+        let server =
+            MockDockerServer::start("down500list", |method, target| match (method, target) {
+                ("GET", "/containers/json?all=true") => {
+                    (500, r#"{"message":"daemon container store error"}"#.to_owned())
+                }
+                ("GET", "/networks") => (
+                    200,
+                    json!([
+                        {
+                            "Id": "old-demo-net-id",
+                            "Name": "sharednet",
+                            "Labels": { LABEL_PROJECT: "demo" }
+                        },
+                        {
+                            "Id": "new-foreign-net-id",
+                            "Name": "sharednet",
+                            "Labels": { LABEL_PROJECT: "other" }
+                        }
+                    ])
+                    .to_string(),
+                ),
+                ("DELETE", "/networks/old-demo-net-id") => (204, String::new()),
+                ("GET", "/volumes") => (
+                    200,
+                    json!({
+                        "Volumes": [
+                            { "Name": "demo_data", "Labels": { LABEL_PROJECT: "demo" } },
+                            { "Name": "other_data", "Labels": { LABEL_PROJECT: "other" } }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("DELETE", "/volumes/demo_data") => (204, String::new()),
+                _ => (500, format!("unexpected {method} {target}")),
+            })
+            .await;
+
+        let client = mock_compose_sandbox_client(server.endpoint_uri.clone());
+        let err = execute_compose(
+            &client,
+            &SandboxId::new("sb-1"),
+            true,
+            ComposeAction::Down {
+                file: None,
+                project: Some("demo".to_owned()),
+                volumes: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::Transport(_)), "got {err:?}");
+
+        let reqs = server.recorded_requests();
+        assert!(reqs.contains(&"GET /containers/json?all=true".to_owned()));
+        assert!(reqs.contains(&"DELETE /networks/old-demo-net-id".to_owned()));
+        assert!(!reqs.contains(&"DELETE /networks/sharednet".to_owned()));
+        assert!(!reqs.contains(&"DELETE /networks/new-foreign-net-id".to_owned()));
+        assert!(reqs.contains(&"DELETE /volumes/demo_data".to_owned()));
+        assert!(!reqs.contains(&"DELETE /volumes/other_data".to_owned()));
+        server.stop().await;
     }
 }
