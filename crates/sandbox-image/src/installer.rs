@@ -78,6 +78,23 @@ pub fn install_bundle_atomic(
     install_parent_dir: &Path,
     verifier: &BundleVerifier,
 ) -> Result<InstalledBundle, SandboxError> {
+    install_bundle_atomic_inner(
+        source_bundle_dir,
+        install_parent_dir,
+        verifier,
+        BUNDLE_EXCLUSIVE_LOCK_TIMEOUT,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn install_bundle_atomic_inner(
+    source_bundle_dir: &Path,
+    install_parent_dir: &Path,
+    verifier: &BundleVerifier,
+    lock_timeout: Duration,
+    #[cfg(test)] after_backup_hook: Option<&mut dyn FnMut()>,
+) -> Result<InstalledBundle, SandboxError> {
     check_dir_path(source_bundle_dir)?;
 
     let manifest_bytes = read_bounded_regular_file(&source_bundle_dir.join(MANIFEST_FILENAME), MAX_MANIFEST_BYTES)?;
@@ -111,6 +128,9 @@ pub fn install_bundle_atomic(
         &manifest.bundle_id,
         verifier,
         &mut staging_guard,
+        lock_timeout,
+        #[cfg(test)]
+        after_backup_hook,
     )?;
 
     Ok(InstalledBundle {
@@ -143,7 +163,30 @@ pub(crate) fn with_verified_installed_bundle_read_locked<T, F>(
 where
     F: FnOnce(InstalledBundle, Option<File>) -> Result<T, SandboxError>,
 {
-    let read_guard = acquire_bundle_read_guard(bundle_dir, verifier)?;
+    with_verified_installed_bundle_read_locked_inner(
+        bundle_dir,
+        verifier,
+        #[cfg(test)]
+        None,
+        op,
+    )
+}
+
+fn with_verified_installed_bundle_read_locked_inner<T, F>(
+    bundle_dir: &Path,
+    verifier: &BundleVerifier,
+    #[cfg(test)] before_shared_lock_hook: Option<&mut dyn FnMut()>,
+    op: F,
+) -> Result<T, SandboxError>
+where
+    F: FnOnce(InstalledBundle, Option<File>) -> Result<T, SandboxError>,
+{
+    let read_guard = acquire_bundle_read_guard(
+        bundle_dir,
+        verifier,
+        #[cfg(test)]
+        before_shared_lock_hook,
+    )?;
     let installed = verify_installed_bundle_once(bundle_dir, verifier)?;
     op(installed, read_guard)
 }
@@ -610,12 +653,14 @@ fn atomic_swap_dir(
     bundle_id: &str,
     verifier: &BundleVerifier,
     staging_guard: &mut TempDirGuard,
+    lock_timeout: Duration,
+    #[cfg(test)] mut after_backup_hook: Option<&mut dyn FnMut()>,
 ) -> Result<(), SandboxError> {
     let parent = target_dir.parent().ok_or_else(|| {
         SandboxError::Internal("target bundle directory has no parent".to_owned())
     })?;
     let lock_path = parent.join(format!(".lock-{bundle_id}"));
-    let _swap_lock = open_bundle_lock_exclusive(&lock_path)?;
+    let _swap_lock = open_bundle_lock_exclusive_timeout(&lock_path, lock_timeout)?;
 
     let intent_path = parent.join(format!(".promote-{bundle_id}.v1"));
     if path_exists_no_follow(&intent_path)? {
@@ -651,6 +696,11 @@ fn atomic_swap_dir(
                     "move existing bundle directory to backup",
                     err,
                 ));
+            }
+
+            #[cfg(test)]
+            if let Some(hook) = after_backup_hook.as_mut() {
+                hook();
             }
 
             if let Err(promote_err) = rename_with_brief_retry(staging_dir, target_dir) {
@@ -813,6 +863,7 @@ fn open_bundle_lock_exclusive_timeout(
 fn acquire_bundle_read_guard(
     target_dir: &Path,
     verifier: &BundleVerifier,
+    #[cfg(test)] mut before_shared_lock_hook: Option<&mut dyn FnMut()>,
 ) -> Result<Option<File>, SandboxError> {
     let Some((lock_path, intent_path)) = bundle_lock_and_intent_paths(target_dir) else {
         return Ok(None);
@@ -845,6 +896,10 @@ fn acquire_bundle_read_guard(
     let Some(shared_file) = open_bundle_lock_file(&lock_path, true)? else {
         return Ok(None);
     };
+    #[cfg(test)]
+    if let Some(hook) = before_shared_lock_hook.as_mut() {
+        hook();
+    }
     shared_file
         .lock_shared()
         .map_err(|err| map_fs_error(&lock_path, "acquire shared bundle read lock", err))?;
@@ -1502,16 +1557,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_promotion_crash_recovers_and_concurrent_readers_never_observe_missing_bundle() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-
-        let tmp = TestTempDir::new("promo-recovery-and-concurrency");
+    fn interrupted_promotion_crash_recovers_and_cleans_up_artifacts() {
+        let tmp = TestTempDir::new("promo-crash-recovery");
         let src_v1 = tmp.path().join("src-v1");
-        let src_v2 = tmp.path().join("src-v2");
         let install_root = tmp.path().join("installed");
         fs::create_dir_all(&src_v1).unwrap();
-        fs::create_dir_all(&src_v2).unwrap();
 
         let secret = [0x66u8; 32];
         let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
@@ -1526,25 +1576,15 @@ mod tests {
                 ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v1"),
             ],
         );
-        write_signed_bundle(
-            &src_v2,
-            "minipod-rc-test",
-            &secret,
-            &[
-                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v2-upgraded"),
-                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v2-upgraded"),
-                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v2-upgraded"),
-            ],
-        );
 
         let installed = install_bundle_atomic(&src_v1, &install_root, &verifier).unwrap();
         let target_dir = installed.root_dir().to_path_buf();
 
-        // 1. Simulate process crash right after renaming `target_dir` -> `.backup-*` before promoting `.staging-*`.
+        // Simulate process crash right after renaming `target_dir` -> `.backup-*` before promoting `.staging-*`.
         let backup_dir = install_root.join(".backup-minipod-rc-test-crashed");
         let staging_dir = install_root.join(".staging-minipod-rc-test-crashed");
+        let intent_path = install_root.join(".promote-minipod-rc-test.v1");
         fs::rename(&target_dir, &backup_dir).unwrap();
-        // Copy valid v2 into staging_dir.
         write_signed_bundle(
             &staging_dir,
             "minipod-rc-test",
@@ -1556,7 +1596,7 @@ mod tests {
             ],
         );
         fs::write(
-            install_root.join(".promote-minipod-rc-test.v1"),
+            &intent_path,
             "staging=.staging-minipod-rc-test-crashed\nbackup=.backup-minipod-rc-test-crashed\n",
         )
         .unwrap();
@@ -1565,39 +1605,133 @@ mod tests {
         let recovered = verify_installed_bundle(&target_dir, &verifier)
             .expect("verify_installed_bundle must recover crashed promotion automatically");
         assert_eq!(fs::read(recovered.kernel_path()).unwrap(), b"kernel-v2-upgraded");
+        assert_eq!(fs::read(recovered.initrd_path()).unwrap(), b"initrd-v2-upgraded");
+        assert_eq!(
+            fs::read(recovered.base_rootfs_qcow2_path()).unwrap(),
+            b"qcow2-v2-upgraded"
+        );
         assert!(!backup_dir.exists());
         assert!(!staging_dir.exists());
-        assert!(!install_root.join(".promote-minipod-rc-test.v1").exists());
+        assert!(!intent_path.exists());
+    }
 
-        // 2. Concurrent readers loop during repeated live upgrades without ever observing NotFound.
-        let done = Arc::new(AtomicBool::new(false));
-        let mut readers = Vec::new();
-        for _ in 0..3 {
-            let done_r = Arc::clone(&done);
-            let dir_r = target_dir.clone();
-            let ver_r = verifier.clone();
-            readers.push(thread::spawn(move || {
-                while !done_r.load(Ordering::Acquire) {
-                    verify_installed_bundle(&dir_r, &ver_r)
-                        .expect("concurrent reader must never observe missing or partial bundle");
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }));
-        }
+    #[test]
+    fn reader_during_mid_swap_waits_for_promotion_and_observes_verified_v2() {
+        let tmp = TestTempDir::new("promo-mid-swap-reader");
+        let src_v1 = tmp.path().join("src-v1");
+        let src_v2 = tmp.path().join("src-v2");
+        let install_root = tmp.path().join("installed");
+        fs::create_dir_all(&src_v1).unwrap();
+        fs::create_dir_all(&src_v2).unwrap();
 
-        for idx in 0..8 {
-            let src = if idx % 2 == 0 { &src_v1 } else { &src_v2 };
-            install_bundle_atomic(src, &install_root, &verifier)
-                .expect("live bundle upgrade must succeed");
-        }
-        done.store(true, Ordering::Release);
-        for handle in readers {
-            handle.join().expect("reader thread panicked");
-        }
+        let secret = [0x67u8; 32];
+        let verifier = BundleVerifier::with_public_key(public_key_from_secret(&secret)).unwrap();
+
+        write_signed_bundle(
+            &src_v1,
+            "minipod-midswap",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v1"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v1"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v1"),
+            ],
+        );
+        write_signed_bundle(
+            &src_v2,
+            "minipod-midswap",
+            &secret,
+            &[
+                ("boot/vmlinuz", ArtifactRole::Kernel, b"kernel-v2-upgraded"),
+                ("boot/initrd.img", ArtifactRole::Initrd, b"initrd-v2-upgraded"),
+                ("images/base.qcow2", ArtifactRole::BaseRootfsQcow2, b"qcow2-v2-upgraded"),
+            ],
+        );
+
+        let installed_v1 = install_bundle_atomic(&src_v1, &install_root, &verifier).unwrap();
+        let target_dir = installed_v1.root_dir().to_path_buf();
+
+        let (writer_paused_tx, writer_paused_rx) = std::sync::mpsc::channel();
+        let (resume_writer_tx, resume_writer_rx) = std::sync::mpsc::channel();
+        let writer_src = src_v2.clone();
+        let writer_root = install_root.clone();
+        let writer_verifier = verifier.clone();
+        let writer_target_check = target_dir.clone();
+        let writer_handle = thread::spawn(move || {
+            let mut pause_after_backup = || {
+                let target_missing = !writer_target_check.exists();
+                let _ = writer_paused_tx.send(target_missing);
+                let _ = resume_writer_rx.recv_timeout(Duration::from_secs(5));
+            };
+            install_bundle_atomic_inner(
+                &writer_src,
+                &writer_root,
+                &writer_verifier,
+                BUNDLE_EXCLUSIVE_LOCK_TIMEOUT,
+                Some(&mut pause_after_backup),
+            )
+        });
+
+        let target_was_missing = writer_paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer must reach post-backup-rename hook");
+
+        let (reader_at_lock_tx, reader_at_lock_rx) = std::sync::mpsc::channel();
+        let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
+        let reader_dir = target_dir.clone();
+        let reader_verifier = verifier.clone();
+        let reader_handle = thread::spawn(move || {
+            let mut on_before_lock = || {
+                let _ = reader_at_lock_tx.send(());
+            };
+            let res = with_verified_installed_bundle_read_locked_inner(
+                &reader_dir,
+                &reader_verifier,
+                Some(&mut on_before_lock),
+                |bundle, _guard| Ok(bundle),
+            );
+            let _ = reader_done_tx.send(res);
+        });
+
+        let reached_lock = reader_at_lock_rx.recv_timeout(Duration::from_secs(5));
+        let reader_blocked = matches!(
+            reader_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let _ = resume_writer_tx.send(());
+
+        // Always join both threads before unwrapping assertions or dropping `TestTempDir`.
+        let writer_join = writer_handle.join();
+        let reader_join = reader_handle.join();
+        let reader_res = reader_done_rx.recv_timeout(Duration::from_secs(5));
+
+        assert!(target_was_missing, "target_dir must be absent right after backup rename");
+        reached_lock.expect("reader must reach shared lock point while swap is paused");
+        assert!(
+            reader_blocked,
+            "reader must wait on writer's exclusive lock rather than failing early"
+        );
+        let promoted = writer_join
+            .expect("writer thread panicked")
+            .expect("writer promotion must succeed");
+        assert_eq!(fs::read(promoted.kernel_path()).unwrap(), b"kernel-v2-upgraded");
+
+        reader_join.expect("reader thread panicked");
+        let observed = reader_res
+            .expect("reader result missing")
+            .expect("reader starting mid-swap must observe verified bundle without NotFound");
+        assert_eq!(fs::read(observed.kernel_path()).unwrap(), b"kernel-v2-upgraded");
+        assert_eq!(fs::read(observed.initrd_path()).unwrap(), b"initrd-v2-upgraded");
+        assert_eq!(
+            fs::read(observed.base_rootfs_qcow2_path()).unwrap(),
+            b"qcow2-v2-upgraded"
+        );
     }
 
     #[test]
     fn read_guard_locks_preexisting_unpromoted_bundle_and_blocks_concurrent_swap() {
+        assert_eq!(BUNDLE_EXCLUSIVE_LOCK_TIMEOUT, Duration::from_secs(5));
+
         let temp = TestTempDir::new("preexisting-lock");
         let install_root = temp.path().join("bundles");
         fs::create_dir_all(&install_root).expect("create install root");
@@ -1667,6 +1801,33 @@ mod tests {
         .expect("verified preexisting bundle")
         .expect("read guard must be created even before any install promotion");
 
+        // 1. Reader holds lock past writer timeout -> writer receives AdmissionRejected,
+        // staging directory is cleaned up, and v1 remains readable and verified.
+        let timed_out_err = install_bundle_atomic_inner(
+            &src_v2,
+            &install_root,
+            &verifier,
+            Duration::from_millis(80),
+            None,
+        )
+        .expect_err("writer must return AdmissionRejected when read guard outlives lock timeout");
+        assert!(
+            matches!(timed_out_err, SandboxError::AdmissionRejected(_)),
+            "got {timed_out_err:?}"
+        );
+        let still_v1 = verify_installed_bundle(&target_dir, &verifier)
+            .expect("v1 bundle must remain readable after timed-out upgrade attempt");
+        assert_eq!(fs::read(still_v1.kernel_path()).unwrap(), b"kernel-v1");
+        let leftover_staging = fs::read_dir(&install_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with(".staging-"));
+        assert!(
+            !leftover_staging,
+            "timed-out install_bundle_atomic must clean up its staging directory"
+        );
+
+        // 2. Reader holds lock briefly -> writer waits and completes promotion once guard drops.
         let (tx, rx) = std::sync::mpsc::channel();
         let swap_src = src_v2.clone();
         let swap_root = install_root.clone();
@@ -1676,29 +1837,28 @@ mod tests {
             let _ = tx.send(res);
         });
 
-        assert!(
-            matches!(
-                rx.recv_timeout(std::time::Duration::from_millis(200)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "concurrent bundle swap must block while shared read guard is held"
+        let blocked_while_held = matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         );
-        assert_eq!(
-            fs::read(target_dir.join("guest/vmlinuz")).expect("read v1 kernel"),
-            b"kernel-v1"
-        );
+        let v1_bytes_while_held = fs::read(target_dir.join("guest/vmlinuz")).expect("read v1 kernel");
 
         drop(guard);
 
-        let swap_res = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("swap finishes after read guard drops");
-        swap_res.expect("bundle upgrade succeeds after guard release");
-        swap_thread.join().expect("swap thread joins");
-        assert_eq!(
-            fs::read(target_dir.join("guest/vmlinuz")).expect("read v2 kernel"),
-            b"kernel-v2"
+        let swap_res = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let join_res = swap_thread.join();
+
+        assert!(
+            blocked_while_held,
+            "concurrent bundle swap must block while shared read guard is held"
         );
+        assert_eq!(v1_bytes_while_held, b"kernel-v1");
+        join_res.expect("swap thread joins");
+        swap_res
+            .expect("swap finishes after read guard drops")
+            .expect("bundle upgrade succeeds after guard release");
+        let upgraded_v2 = verify_installed_bundle(&target_dir, &verifier).expect("verify v2");
+        assert_eq!(fs::read(upgraded_v2.kernel_path()).unwrap(), b"kernel-v2");
     }
 
     #[test]

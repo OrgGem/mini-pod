@@ -292,8 +292,21 @@ pub struct LocalRuntimeManager {
     lifecycle_locks: Arc<Mutex<HashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>>,
     sweeper_abort: Mutex<Option<tokio::task::AbortHandle>>,
     destroy_listeners: Mutex<Vec<DestroyListener>>,
+    #[cfg(test)]
+    rss_handoff_hook: Arc<Mutex<Option<Arc<RssHandoffSyncHook>>>>,
     next_seq: AtomicU64,
     alive: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+struct RssHandoffSyncHook {
+    warm_ready_for_handoff: tokio::sync::Notify,
+    release_warm_handoff: tokio::sync::Notify,
+    handoff_completed_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    mid_sample_wait_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    sample_count: std::sync::atomic::AtomicUsize,
+    trigger_on_sample: usize,
+    armed: AtomicBool,
 }
 
 type DestroyListener = Arc<dyn Fn(&SandboxId) + Send + Sync>;
@@ -355,6 +368,11 @@ impl LocalRuntimeManager {
         let active = Arc::new(Mutex::new(HashMap::<SandboxId, ActiveSandbox>::new()));
         let warm_pool = WarmPoolStore::new();
         let transient_sessions = Arc::new(Mutex::new(HashMap::<SandboxId, TransientVmRss>::new()));
+        #[cfg(test)]
+        let rss_handoff_hook: Arc<Mutex<Option<Arc<RssHandoffSyncHook>>>> =
+            Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let hook_for_rss = Arc::downgrade(&rss_handoff_hook);
         let active_for_rss = Arc::downgrade(&active);
         let warm_pool_for_rss = warm_pool.downgrade();
         let transient_for_rss = Arc::downgrade(&transient_sessions);
@@ -371,8 +389,24 @@ impl LocalRuntimeManager {
                 }));
                 // Sample WarmPool and `transient_sessions` inside `active` lock
                 // (`active -> warm_pool -> transient_sessions`) so lifecycle handoffs
-                // (Warm -> Active, Booted -> Active, Active -> Destroying) never drop RSS samples.
+                // (Warm -> Active, Booted -> Warm, Booted -> Active, Active -> Destroying)
+                // never drop RSS samples.
                 warm_pool_for_rss.collect_rss_samples(&mut collected);
+                #[cfg(test)]
+                if let Some(hook_slot) = hook_for_rss.upgrade() {
+                    let hook_opt = lock_unpoisoned(&hook_slot).clone();
+                    if let Some(hook) = hook_opt {
+                        if hook.armed.load(Ordering::Acquire) {
+                            let idx = hook.sample_count.fetch_add(1, Ordering::AcqRel);
+                            if idx == hook.trigger_on_sample {
+                                if let Some(rx) = lock_unpoisoned(&hook.mid_sample_wait_rx).take() {
+                                    hook.release_warm_handoff.notify_one();
+                                    let _ = rx.recv_timeout(Duration::from_millis(30));
+                                }
+                            }
+                        }
+                    }
+                }
                 collect_transient_rss_samples(&transient_for_rss, &mut collected);
             } else {
                 warm_pool_for_rss.collect_rss_samples(&mut collected);
@@ -411,6 +445,8 @@ impl LocalRuntimeManager {
             lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             sweeper_abort: Mutex::new(None),
             destroy_listeners: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            rss_handoff_hook,
             next_seq: AtomicU64::new(1),
             alive: Arc::new(AtomicBool::new(true)),
         })
@@ -653,11 +689,31 @@ impl LocalRuntimeManager {
                 } else {
                     target_size
                 };
-            let rejected = self
-                .warm_pool
-                .park_from_replenish(guard, entry, effective_target);
-            if let Some(rss_guard) = transient_rss.as_mut() {
-                rss_guard.finish();
+            #[cfg(test)]
+            let handoff_hook = lock_unpoisoned(&self.rss_handoff_hook).clone();
+            #[cfg(test)]
+            if let Some(hook) = handoff_hook.as_ref() {
+                hook.warm_ready_for_handoff.notify_one();
+                hook.release_warm_handoff.notified().await;
+            }
+            let rejected = {
+                // Hold `self.active` across `park_from_replenish` + `rss_guard.finish()`
+                // (`active -> warm_pool -> transient_sessions`) so `observed_rss_overage_fn`
+                // cannot observe an intermediate state where the VM is in neither map.
+                let _active_handoff = lock_unpoisoned(&self.active);
+                let rejected = self
+                    .warm_pool
+                    .park_from_replenish(guard, entry, effective_target);
+                if let Some(rss_guard) = transient_rss.as_mut() {
+                    rss_guard.finish();
+                }
+                rejected
+            };
+            #[cfg(test)]
+            if let Some(hook) = handoff_hook.as_ref() {
+                if let Some(tx) = lock_unpoisoned(&hook.handoff_completed_tx).take() {
+                    let _ = tx.send(());
+                }
             }
             if let Some(rejected) = rejected {
                 self.dispose_warm_entry(rejected).await;
@@ -6968,5 +7024,251 @@ mod tests {
         let lease2 = mgr.spawn(spec).await.unwrap();
         release_shutdown.notify_one();
         mgr.destroy(&lease2.id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_up_handoff_preserves_live_rss_across_concurrent_spawn_and_releases_on_exit() {
+        struct HandoffSession {
+            pid: u32,
+            alive: AtomicBool,
+            rss_bytes: u64,
+            artifacts: Vec<PathBuf>,
+            shutdown_entered: Arc<tokio::sync::Notify>,
+            release_shutdown: Arc<tokio::sync::Notify>,
+            pause_on_shutdown: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl VmSessionPort for HandoffSession {
+            fn pid(&self) -> u32 {
+                self.pid
+            }
+            fn start_token(&self) -> u64 {
+                9800 + u64::from(self.pid)
+            }
+            fn artifact_paths(&self) -> &[PathBuf] {
+                &self.artifacts
+            }
+            fn is_alive(&self) -> bool {
+                self.alive.load(Ordering::Acquire)
+            }
+            fn current_rss_bytes(&self) -> Option<u64> {
+                self.is_alive().then_some(self.rss_bytes)
+            }
+            async fn exec_stream(&self, _: ExecRequest) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn open_tunnel(&self, _: StreamTargetWire) -> Result<TunnelStream, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn enable_egress_proxy(
+                &self,
+                _: u16,
+            ) -> Result<tokio::sync::mpsc::Receiver<TunnelStream>, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn copy_in_tar(
+                &self,
+                _: &str,
+                _: Vec<u8>,
+                _: u64,
+            ) -> Result<u64, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn copy_out_tar(&self, _: &str, _: u64) -> Result<Vec<u8>, SandboxError> {
+                Err(SandboxError::Internal("unused".to_owned()))
+            }
+            async fn graceful_shutdown(&self, _: Duration) -> Result<bool, SandboxError> {
+                if self.pause_on_shutdown {
+                    self.shutdown_entered.notify_one();
+                    self.release_shutdown.notified().await;
+                }
+                self.alive.store(false, Ordering::Release);
+                Ok(true)
+            }
+            async fn force_kill(&self) -> Result<(), SandboxError> {
+                self.alive.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        struct HandoffVm {
+            calls: AtomicU64,
+            shutdown_entered: Arc<tokio::sync::Notify>,
+            release_shutdown: Arc<tokio::sync::Notify>,
+            on_warm_boot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl VmRuntimePort for HandoffVm {
+            async fn boot_vm(&self, cfg: VmBootConfig) -> Result<VmBootOutcome, SandboxError> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let is_warm = cfg.spec.acceleration == AccelerationPolicy::Preferred;
+                if is_warm {
+                    if let Some(cb) = lock_unpoisoned(&self.on_warm_boot).take() {
+                        cb();
+                    }
+                }
+                let rss_bytes = if is_warm {
+                    400 * 1024 * 1024
+                } else {
+                    128 * 1024 * 1024
+                };
+                Ok(VmBootOutcome {
+                    session: Box::new(HandoffSession {
+                        pid: 8800 + n as u32,
+                        alive: AtomicBool::new(true),
+                        rss_bytes,
+                        artifacts: Vec::new(),
+                        shutdown_entered: Arc::clone(&self.shutdown_entered),
+                        release_shutdown: Arc::clone(&self.release_shutdown),
+                        pause_on_shutdown: is_warm,
+                    }),
+                    pid: 8800 + n as u32,
+                    start_token: 9800 + 8800 + n,
+                    artifact_paths: Vec::new(),
+                    hardware_accelerated: is_warm,
+                    capabilities: CapabilityReport {
+                        cpu_quota: EnforcementLevel::HardLimit,
+                        host_rss: EnforcementLevel::BestEffort,
+                        host_storage: EnforcementLevel::BestEffort,
+                        egress_filter: EnforcementLevel::HardLimit,
+                    },
+                    egress_rx: None,
+                })
+            }
+
+            async fn kill_orphan_process(&self, _: u32, _: u64) -> Result<bool, SandboxError> {
+                Ok(false)
+            }
+        }
+
+        for reject_on_handoff in [false, true] {
+            let tmp = TestTempDir::new(if reject_on_handoff {
+                "mgr-warm-handoff-rejected"
+            } else {
+                "mgr-warm-handoff-ready"
+            });
+            let shutdown_entered = Arc::new(tokio::sync::Notify::new());
+            let release_shutdown = Arc::new(tokio::sync::Notify::new());
+            let vm = Arc::new(HandoffVm {
+                calls: AtomicU64::new(0),
+                shutdown_entered: Arc::clone(&shutdown_entered),
+                release_shutdown: Arc::clone(&release_shutdown),
+                on_warm_boot: Mutex::new(None),
+            });
+
+            let mut template_spec = valid_spec(Duration::from_secs(60));
+            template_spec.acceleration = AccelerationPolicy::Preferred;
+            template_spec.budget.guest_ram_mb = 128;
+            template_spec.budget.host_rss_budget_mb = Some(128);
+
+            let mut cfg = base_config(tmp.path().join("state"));
+            cfg.admission = AdmissionLimits {
+                max_total_host_rss_mb: Some(512),
+                admission_queue_timeout: Duration::from_secs(5),
+                ..Default::default()
+            };
+            cfg.warm_pool = WarmPoolConfig {
+                target_size: 1,
+                template_spec: Some(template_spec),
+                ..Default::default()
+            };
+
+            let mgr = Arc::new(
+                LocalRuntimeManager::new(
+                    cfg,
+                    Arc::new(MockOverlayStore::default()),
+                    Arc::clone(&vm) as Arc<dyn VmRuntimePort>,
+                )
+                .unwrap(),
+            );
+            if reject_on_handoff {
+                let warm_pool = mgr.warm_pool.clone();
+                *lock_unpoisoned(&vm.on_warm_boot) = Some(Box::new(move || {
+                    warm_pool.begin_drain();
+                }));
+            }
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let hook = Arc::new(RssHandoffSyncHook {
+                warm_ready_for_handoff: tokio::sync::Notify::new(),
+                release_warm_handoff: tokio::sync::Notify::new(),
+                handoff_completed_tx: Mutex::new(Some(done_tx)),
+                mid_sample_wait_rx: Mutex::new(Some(done_rx)),
+                sample_count: std::sync::atomic::AtomicUsize::new(0),
+                // Skip `would_exceed_with` (sample 0) so sample 1 inside `admission.acquire`
+                // collides directly with `warm_up`'s handoff.
+                trigger_on_sample: 1,
+                armed: AtomicBool::new(false),
+            });
+            let ready_notified = hook.warm_ready_for_handoff.notified();
+            tokio::pin!(ready_notified);
+            ready_notified.as_mut().enable();
+            *lock_unpoisoned(&mgr.rss_handoff_hook) = Some(Arc::clone(&hook));
+
+            let mgr_warm = Arc::clone(&mgr);
+            let warm_task = tokio::spawn(async move { mgr_warm.warm_up().await });
+            ready_notified.await;
+
+            hook.armed.store(true, Ordering::Release);
+
+            let mut spawn_spec = valid_spec(Duration::from_secs(60));
+            spawn_spec.acceleration = AccelerationPolicy::SoftwareOnly;
+            spawn_spec.budget.guest_ram_mb = 128;
+            spawn_spec.budget.host_rss_budget_mb = Some(128);
+
+            let mgr_spawn = Arc::clone(&mgr);
+            let mut spawn_task = tokio::spawn(async move { mgr_spawn.spawn(spawn_spec).await });
+
+            if reject_on_handoff {
+                shutdown_entered.notified().await;
+                *lock_unpoisoned(&mgr.rss_handoff_hook) = None;
+
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut spawn_task)
+                        .await
+                        .is_err(),
+                    "spawn must remain blocked while rejected warm VM is still alive in disposal"
+                );
+
+                release_shutdown.notify_one();
+                assert_eq!(warm_task.await.unwrap().unwrap(), 0);
+                mgr.warm_pool.end_drain();
+            } else {
+                let warm_ready_count = warm_task.await.unwrap().unwrap();
+                assert_eq!(warm_ready_count, 1);
+                *lock_unpoisoned(&mgr.rss_handoff_hook) = None;
+
+                // Warm VM uses 400 MiB (`400 + 128 = 528 > 512`), so `spawn` must remain pending
+                // while the warm VM is alive (both in `ready` and during `graceful_shutdown`).
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut spawn_task)
+                        .await
+                        .is_err(),
+                    "spawn must not bypass 512 MiB cap during warm_up handoff"
+                );
+
+                let mgr_drain = Arc::clone(&mgr);
+                let drain_task = tokio::spawn(async move { mgr_drain.drain_warm_pool().await });
+                shutdown_entered.notified().await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(25), &mut spawn_task)
+                        .await
+                        .is_err(),
+                    "spawn must remain blocked while warm VM is still alive in graceful_shutdown"
+                );
+
+                release_shutdown.notify_one();
+                assert_eq!(drain_task.await.unwrap().unwrap(), 1);
+            }
+
+            let lease = tokio::time::timeout(Duration::from_secs(2), spawn_task)
+                .await
+                .expect("spawn must unblock promptly once old VM exits")
+                .unwrap()
+                .unwrap();
+            mgr.destroy(&lease.id).await.unwrap();
+        }
     }
 }
