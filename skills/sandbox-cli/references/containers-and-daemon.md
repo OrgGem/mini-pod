@@ -26,21 +26,23 @@ sandbox-cli --json spawn \
 - **Deploy, inspect, and tear down a `compose.yaml` / `docker-compose.yml` stack:**
   *(Supports `build:`, `image:`, `depends_on:`, `ports:` forwarded onto Host `127.0.0.1`, named `volumes:`, `tmpfs:`, `networks:` with automatic service DNS aliases, `environment:` / `env_file:`; rejects unsafe host bind mounts and `privileged: true`)*:
   ```bash
-  sandbox-cli --json compose <ID> up -f ./compose.yaml --build
-  sandbox-cli --json compose <ID> ps -f ./compose.yaml
-  sandbox-cli --json compose <ID> logs -f ./compose.yaml --tail 50
-  sandbox-cli --json compose <ID> down -f ./compose.yaml -v
+  sandbox-cli --json compose <ID> up -f ./compose.yaml -p my-app --build
+  sandbox-cli --json compose <ID> ps -f ./compose.yaml -p my-app
+  sandbox-cli --json compose <ID> logs -f ./compose.yaml -p my-app --tail 50
+  sandbox-cli --json compose <ID> down -f ./compose.yaml -p my-app -v
   ```
+
+  When a sandbox hosts several projects, pass the same explicit `-p` used by `up` and the same Compose file when inspecting or tearing down that project. `up` refuses to replace an existing container unless its project and service labels match. `down` selects project-labeled resources, continues independent cleanup after an error, and reports listing and deletion failures. After a partial failure, inspect what remains and rerun that project's `down` command. Include `-v` when its project-labeled named volumes should also be removed.
 
 ### Option B: Direct Guest Podman (`exec`)
 - **Air-gapped (`--network isolated`):** Load an OCI archive without internet:
-  - Small `.tar` (`<= 16 MiB`):
+  - A `.tar` small enough for the CLI's `16 MiB` copy budget, including tar wrapping overhead:
     ```bash
     sandbox-cli --json copy-in <ID> ./image.tar /tmp
     sandbox-cli --json exec <ID> -- /usr/bin/podman load -i /tmp/image.tar
     sandbox-cli --json exec <ID> -- /bin/rm -f /tmp/image.tar
     ```
-  - Large `.tar` (`> 16 MiB`): Bind `docker-endpoint` (Option B below) and run `docker -H <URI> load -i ./image.tar`.
+  - For a larger `.tar`, bind `docker-endpoint` (Option C below) and run `docker -H <URI> load -i ./image.tar`.
 - **Start & execute inside a container:**
   ```bash
   sandbox-cli --json exec <ID> --deadline-secs 120 -- /usr/bin/podman run -d --name app -p 8080:8080 my-image:latest
@@ -58,6 +60,8 @@ sandbox-cli --json docker-endpoint <ID>
 # Testcontainers mode (maps /var/run/docker.sock inside guest for Ryuk reaper)
 sandbox-cli --json docker-endpoint <ID> --allow-reaper-socket
 ```
+
+Capture the returned URI instead of constructing its name. It is associated with the sandbox identity. Request a fresh endpoint after replacing the sandbox. Enable the reaper socket only when the workload needs it.
 
 - **PowerShell (Windows):**
   ```powershell
@@ -94,14 +98,17 @@ sandbox-cli --json docker-endpoint <ID> --allow-reaper-socket
     --admission-timeout-ms 5000
   ```
 
-*(If `.cache/bundles-src/<arch>` does not exist yet in a fresh repo clone, ask the user or run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable-bundles.ps1` once).*
+If `.cache/bundles-src/<arch>` does not exist, follow the repository README's signed-bundle build instructions and use the matching public key. QEMU must also be available to the daemon.
 
 ## 3. Common Errors & Remedies
 
 | Error Kind / Symptom | Cause & Fix |
 | --- | --- |
-| `InvalidSpec` (`virtual_disk_mb exceeds host_storage_budget_mb`) | Pass `--storage-mb` at least `2x` `--disk-mb` (e.g. `--disk-mb 1024 --storage-mb 2048`). |
-| `AdmissionRejected` | Host concurrency, RSS, or storage cap is full. `destroy` unused sandboxes (`sandbox-cli --json list`) or wait/retry. |
-| `BudgetExceeded` on `copy-in` or `exec` | `copy-in` archive exceeded `16 MiB` / `4096` files, or command output exceeded `--stdout-budget-bytes` / `--stderr-budget-bytes`. Filter files or raise budget flags. |
+| `InvalidSpec` (`virtual_disk_mb exceeds host_storage_budget_mb`) | Set `--storage-mb` to at least `--disk-mb`, allowing space for host-side artifacts (e.g. `--disk-mb 1024 --storage-mb 2048`). |
+| `AdmissionRejected` | Host concurrency, RSS, CPU, or storage capacity is unavailable, or the request exceeds a configured limit. Inspect `status` and `list`, then wait or adjust the request. Clean up sandboxes created for the task when appropriate. |
+| Copy `BudgetExceeded` | The transfer exceeded a configured archive, entry, or transport limit. Select fewer inputs or smaller outputs. The CLI's default copy archive budget is `16 MiB`, including tar overhead. |
+| Truncated output or timeout | Check `stdout_truncated`, `stderr_truncated`, `timed_out`, and the process exit code. Adjust the workload or `exec`/`run` budget and deadline flags as appropriate. |
 | `PolicyViolation` on `copy-in` | Source directory contains symlinks, junctions, or hardlinks. Copy plain files only. |
-| `LeaseExpired` / `NotFound` | Sandbox TTL elapsed and the sweeper destroyed it. Spawn a fresh sandbox and use `renew` on long runs. |
+| `LeaseExpired` / `NotFound` | The sandbox or keyed operation may have expired, or the sandbox ID may no longer exist. Inspect the daemon state, then spawn a fresh sandbox if appropriate. Renew leases during long runs. |
+| Compose `PolicyViolation` on `up` | An existing container name is owned by a different Compose project or service. Inspect the project and choose names deliberately. |
+| `ProcessExited` on destroy | The VM exited but some artifacts remain. Inspect the reported paths and retry cleanup as appropriate. |

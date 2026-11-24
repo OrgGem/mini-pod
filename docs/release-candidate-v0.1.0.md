@@ -1,8 +1,10 @@
-# mini-pod v0.1.0-rc2 — Release Candidate Verification & Security Guide
+# mini-pod v0.1.0 — Verification & Security Guide
 
-- **Version:** `0.1.0` (`v0.1.0-rc2`)
+- **Source snapshot:** tag `v0.1.0`, commit `95b1cb3`
 - **Architecture Contract:** [BRD.md](../BRD.md) (`v2.1`, QEMU-First MVP)
 - **Primary Reference Benchmark:** [docs/benchmarks/phase6-windows-x86_64.md](benchmarks/phase6-windows-x86_64.md)
+
+The platform and gate results below record the earlier `v0.1.0-rc2` verification, last updated on November 17, 2026. They are historical observations, with platform and fixture scope as listed, and do not establish live-QEMU verification of subsequent changes. As of November 25, 2026, the `v0.1.0` tag [CI run](https://github.com/OrgGem/mini-pod/actions/runs/45361553067) passed its Ubuntu, macOS, Windows, and guest Alpine jobs. The [release workflow](https://github.com/OrgGem/mini-pod/actions/runs/45394844943) built host artifacts and npm packages, while both guest static-musl jobs failed. GitHub Release and npm publish jobs were skipped.
 
 ---
 
@@ -10,8 +12,8 @@
 
 | Platform / Target | Accelerator / Mode | Verification Status | Verified Scope & Notes |
 | --- | --- | --- | --- |
-| **Windows `x86_64`** | QEMU + `WHPX` (fallback `TCG`) | **Verified (Live QEMU E2E)** | Full Phase 1–8 live QEMU suite executed on Windows host with `WHPX`: signed bundle verification, exclusive `state.lock`, Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, CPU/RAM limits, handle whitelist, confined `qemu -accel help` & `qemu-img` helpers), owner-SID Named Pipe DACLs on both `sandboxd` and `DockerCompatServer` (`ERROR_ACCESS_DENIED` to restricted non-owner token), `sandbox-docker-compat` (`bollard` + `testcontainers` + Ryuk), `HostEgressProxy`, Warm Pool + 4-metric benchmark, `sandboxd` + `sandbox-cli` + `mcp` + crash-recovery drill. |
-| **Linux `x86_64`** | QEMU + `KVM` (fallback `TCG`) / `SharedKernelAllowed` (explicit opt-in) | **Partially Verified (Container musl + Unit/IPC)** | Cross-compiled & tested in pinned `rust:alpine` musl container: guest `tiny-init` / `sandbox-agent`, per-exec cgroup v2 `cgroup.kill` + `setsid` containment, `0700`/`0600` Unix socket ownership on control & Docker IPC, root `fork` + `setuid(65534)` kernel `EACCES` check (`CrossUserIpcCheck::KernelRejectedAccess`), cgroup v2 & `/proc/<pid>/stat` parser tests. Live Linux `KVM` boot was **not** executed on this Windows host. |
+| **Windows `x86_64`** | QEMU + `WHPX` (fallback `TCG`) | **Historically verified (Live QEMU E2E)** | RC live QEMU suite executed on Windows host with `WHPX`: signed bundle verification, exclusive `state.lock`, Win32 Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, CPU/RAM limits, handle whitelist, confined `qemu -accel help` & `qemu-img` helpers), owner-SID Named Pipe DACLs on both `sandboxd` and `DockerCompatServer` (`ERROR_ACCESS_DENIED` to restricted non-owner token), `sandbox-docker-compat` (`bollard` + `testcontainers` + Ryuk), `HostEgressProxy`, Warm Pool + 4-metric benchmark, `sandboxd` + `sandbox-cli` + `mcp` + crash-recovery drill. |
+| **Linux `x86_64`** | QEMU + `KVM` (fallback `TCG`) | **Partially verified (Container musl + Unit/IPC)** | Cross-compiled & tested in pinned `rust:alpine` musl container: guest `tiny-init` / `sandbox-agent`, per-exec cgroup v2 `cgroup.kill` + `setsid` containment, `0700`/`0600` Unix socket ownership on control & Docker IPC, root `fork` + `setuid(65534)` kernel `EACCES` check (`CrossUserIpcCheck::KernelRejectedAccess`), cgroup v2 & `/proc/<pid>/stat` parser tests. Live Linux `KVM` boot was **not** executed on this Windows host. |
 | **Linux `aarch64`** | QEMU + `KVM` / `TCG` | **Verified (Bundle + Cross-Arch QEMU TCG Boot)** | Reproducible signed `aarch64` Portable Runtime Bundle built via `scripts/build-portable-bundles.ps1` and booted end-to-end under `qemu-system-aarch64` (`-accel tcg`) in Phase 2 (`signed_bundle_atomic_install_cow_overlay_and_boot_x86_64_and_aarch64`). Live ARM64 KVM host tests not run on this Windows host. |
 | **macOS (`x86_64` / `aarch64`)** | QEMU + `HVF` (fallback `TCG`) | **Unexecuted on Host (Code Paths Implemented)** | Unix `0700`/`0600` IPC, `proc_pidinfo(PROC_PIDTBSDINFO)` microsecond `start_token` verification (`expected_start_token == 0` rejected), `setpgid(0, 0)` process-group confinement, and `-accel hvf` -> `-accel tcg` selection are implemented; live execution on macOS hardware was **not** performed. |
 | **Windows `ARM64`** | — | **Deferred Post-MVP** | Explicitly out of scope for MVP (`BRD.md` Section 4.2 & Section 6). |
@@ -22,7 +24,7 @@
 
 ### 2.1 Isolation Boundary (`IsolationMode`)
 - **`VmRequired` never degrades to `SharedKernelAllowed`:** If hardware acceleration (`KVM`/`HVF`/`WHPX`) is unavailable and `AccelerationPolicy::Preferred` is set, `QemuVmDriver` falls back strictly to QEMU `TCG` (same guest-kernel VM isolation). It **never** falls back to Rootless Podman (`userns`).
-- **`SharedKernelAllowed` requires explicit opt-in on Linux only:** `SandboxSpec::validate_for_host_os` rejects `SharedKernelAllowed` on Windows and macOS (`SandboxError::UnsupportedIsolationMode`), and `QemuVmDriver` rejects `SharedKernelAllowed` unconditionally (`SandboxError::UnsupportedIsolationMode`).
+- **`SharedKernelAllowed` is unsupported by the QEMU driver:** `SandboxSpec::validate_for_host_os` rejects it on Windows and macOS, and `QemuVmDriver` rejects it on all hosts with `SandboxError::UnsupportedIsolationMode`.
 - **Windows Enterprise Lockdown (AppLocker / WDAC / EDR):** If host security policy blocks launching `qemu-system-*` or `qemu-img`, `classify_launch_error` surfaces `SandboxError::BinaryExecutionBlocked` with a diagnostic message rather than attempting workarounds.
 
 ### 2.2 Local Control & Docker Compatibility IPC Authentication
@@ -55,7 +57,7 @@
 | `egress_filter` | `HardLimit` (`Isolated`, `InternetOnly`, `DomainAllowList`); `Unsupported` (`Unrestricted`) | Same | Same | Guest runs with `-nic none`; non-isolated traffic traverses `HostEgressProxy`. |
 
 ### 2.6 Post-MVP Deferrals (`BRD.md` Section 4.1, 4.2, 6)
-The following capabilities are **intentionally deferred post-MVP** and are not shipped in `v0.1.0-rc2`:
+The following capabilities are **intentionally deferred post-MVP** in the `v0.1.0` source:
 1. External VM State/Memory Snapshot restore (`snapshot_restore` = `DeferredPostMvp`; QEMU `savevm`/`loadvm` across CoW overlays is explicitly rejected).
 2. Native macOS `Virtualization.framework` / `vmnet` backend.
 3. Windows `ARM64` host builds.
@@ -65,7 +67,9 @@ The following capabilities are **intentionally deferred post-MVP** and are not s
 
 ---
 
-## 3. BRD 7 Release Gates Verification Matrix
+## 3. Historical BRD 7 Release Gates Verification Matrix
+
+The PASS entries preserve the RC observations described above. Re-run the applicable gates against the intended build and host before relying on them for a new release.
 
 | Gate | Requirement (`BRD.md` Section 6) | Verification Evidence (Files & Test Cases) | Observed Result |
 | --- | --- | --- | --- |
@@ -76,6 +80,17 @@ The following capabilities are **intentionally deferred post-MVP** and are not s
 | **Gate 5** | Automated security tests block DNS rebinding, private/mapped IPv6, and tar traversal/symlinks/reparse points | [phase5_egress_and_resources_e2e.rs](../crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs) (`e2e_egress_proxy_blocks_private_ips_ipv6_mapped_dns_rebinding_and_redirects`); [phase3_runtime_e2e.rs](../crates/sandbox-vmm/tests/phase3_runtime_e2e.rs) (`e2e_safe_copy_in_exec_copy_out_and_reject_guest_symlink`); `safe_tar.rs` tests | **PASS** — Blocks RFC1918, loopback, metadata IP, `::ffff:127.0.0.1`, DNS rebinding flips, `3xx` redirects to internal targets, `..`, symlinks, and Windows junctions. |
 | **Gate 6** | Testcontainers full lifecycle (pull/import, port forward to Host, logs, exec hijack, Ryuk cleanup) | [phase4_docker_compat_e2e.rs](../crates/sandbox-vmm/tests/phase4_docker_compat_e2e.rs) (`e2e_testcontainers_full_lifecycle_and_ryuk_reaper`, `e2e_bollard_sdk_lifecycle_port_forward_hijack_archive_and_policy`) | **PASS** — Offline OCI `echo-http` + `ryuk` containers boot via `sandbox-docker-compat`, map HTTP ports to loopback, serve `200 OK`, reject raw host bind mounts (`400`), and clean up via Ryuk. |
 | **Gate 7** | Disk fill and runaway `stdout`/`stderr` floods terminate within budget and release temporary storage | [phase3_runtime_e2e.rs](../crates/sandbox-vmm/tests/phase3_runtime_e2e.rs) (`e2e_stdout_budget_deadline_priority_cancel_and_disk_cap`, `e2e_ttl_lease_renewal_and_automatic_expiry`) | **PASS** — Guest supervisor kills runaway process group/cgroup at `stdout_budget_bytes` / `deadline` and on priority `ExecCancel`; guest disk write stops at `ENOSPC` within `host_storage_budget_mb`; `destroy` reclaims overlay. |
+
+### Changes after the recorded RC checks
+
+The current source includes the following fixes, with regression tests alongside the affected implementation. The historical live-QEMU results above predate these changes.
+
+- **Compose safety:** `up` verifies a container's Compose project and service labels before deleting the inspected container ID. `down` filters by project labels, removes networks by ID, continues independent cleanup after failures, and returns an error for failed cleanup. See [Compose implementation and tests](../bins/sandbox-cli/src/compose.rs).
+- **Lifecycle and RSS:** sandbox IDs use random values. Docker endpoint names include the sandbox identity. Admission accounts for transient and stopping VM RSS across warm-pool and active transitions. Failed cleanup is surfaced through `DestroyStatus`. See [runtime manager](../crates/sandbox-runtime/src/manager.rs), [admission controller](../crates/sandbox-runtime/src/admission.rs), and [daemon server](../bins/sandboxd/src/server.rs).
+- **Unix orphan recovery:** the reconciler verifies the recorded PID and process start token. After signaling a matching orphan it waits for exit. If the process check errors or the exit wait times out, the journal is retained for later recovery and artifact cleanup is deferred. See [Unix process handling](../crates/sandbox-vmm/src/os/unix.rs) and [startup reconciliation](../crates/sandbox-runtime/src/manager.rs).
+- **Exec and transport:** the client can await exit again after a pending `wait_exit()` is cancelled. While waiting, unread output is discarded to keep the bounded queue moving. Cancellation, stream credits, shutdown, and CopyOut timeout handling were hardened. See [client stream](../crates/sandbox-client/src/client.rs), [runtime stream](../crates/sandbox-runtime/src/exec_stream.rs), and [VMM driver](../crates/sandbox-vmm/src/driver.rs).
+- **Bundle promotion and files:** warm-up admission handoff and bundle swap reader tests were made deterministic. Bundle installation uses reader locks and promotion journals. Image export creates a new temporary archive and retries name collisions without deleting pre-existing files. See [bundle installer](../crates/sandbox-image/src/installer.rs) and [image build](../bins/sandbox-cli/src/image_build.rs).
+- **Docker API and launchers:** the adapter restricts Docker query parameters and tmpfs options. The npm launcher handles Windows signals. See [Docker adapter](../crates/sandbox-docker-compat/src/server.rs) and [npm launcher](../npm/launcher.js).
 
 ---
 
@@ -110,8 +125,14 @@ cargo run -p sandboxd -- serve \
 ### 4.2 Interact via `sandbox-cli`
 
 ```powershell
-# Query daemon counters
+# Query daemon counters and check configured binaries, bundle, and accelerators
 sandbox-cli --json status
+sandbox-cli --json doctor
+# Optional live guest execution and cleanup check
+sandbox-cli --json doctor --smoke
+
+# One-shot execution with automatic cleanup attempt
+sandbox-cli --json run -- /bin/uname -a
 
 # Spawn an isolated VM (matching warm pool defaults: 1 vCPU, 256 MiB RAM, 512 MiB RSS cap, 512 MiB disk)
 sandbox-cli --json spawn --rss-mb 512 --ttl-secs 300
@@ -127,6 +148,8 @@ sandbox-cli docker-endpoint <SANDBOX_ID>
 # Idempotent cleanup
 sandbox-cli destroy <SANDBOX_ID>
 ```
+
+`doctor --smoke` can use a warm VM. Inspect its reported accelerator, workload, and cleanup fields. A `run` report separates workload, copy-out, and cleanup, and can report an unknown cleanup outcome when the ID was never received. Use an explicit `spawn` workflow when several commands must share a sandbox.
 
 ### 4.3 Run MCP Server (`sandboxd mcp`)
 
@@ -170,7 +193,8 @@ use sandbox_core::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = ControlEndpoint::parse(r"\\.\pipe\minipod-sandboxd")?; // or "unix:///tmp/minipod-1000/ctl.sock"
+    // Set MINIPOD_ENDPOINT to the running daemon's local pipe or socket URI.
+    let endpoint = ControlEndpoint::parse(&std::env::var("MINIPOD_ENDPOINT")?)?;
     let client = SandboxClient::new(endpoint);
 
     let lease = client.spawn(SandboxSpec {

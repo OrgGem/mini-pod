@@ -4,10 +4,21 @@ Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with Ed25519-signed Po
 
 - **Specification & Architecture Contract:** [BRD.md](BRD.md) (`v2.1`)
 - **Engineering & Security Invariants:** [AGENTS.md](AGENTS.md)
-- **Release Candidate Notes & Support Matrix:** [docs/release-candidate-v0.1.0.md](docs/release-candidate-v0.1.0.md)
+- **Verification, Security & Support Guide:** [docs/release-candidate-v0.1.0.md](docs/release-candidate-v0.1.0.md)
 - **Measured Benchmark Report:** [docs/benchmarks/phase6-windows-x86_64.md](docs/benchmarks/phase6-windows-x86_64.md)
 
 ---
+
+## Current status and recent fixes
+
+As of November 25, 2026, the `v0.1.0` tag points to commit `95b1cb3`. The tag's [CI run](https://github.com/OrgGem/mini-pod/actions/runs/45361553067) passed on Ubuntu, macOS, Windows, and the guest Alpine job. The [release workflow](https://github.com/OrgGem/mini-pod/actions/runs/45394844943) built host artifacts and npm packages, but both static guest musl jobs failed, so GitHub Release and npm publication were skipped. The live-QEMU results and benchmark linked below were recorded earlier and do not establish a new live-QEMU run at this tag.
+
+Recent fixes included in this snapshot address:
+
+- **Compose ownership and cleanup:** `up` checks project and service labels before replacing a container. `down` continues independent cleanup after errors and reports failures. Network removal targets the discovered network ID. [Commits `e147871`](https://github.com/OrgGem/mini-pod/commit/e1478710bcb4c2c5615b5fa03e4443e24337ad4a) and [`03d7769`](https://github.com/OrgGem/mini-pod/commit/03d7769705af57f93c9e89426c16f6b5d4f77e01).
+- **Lifecycle and admission:** randomized sandbox IDs, Docker endpoint names tied to sandbox identity, and RSS accounting for VMs being stopped and during Warm Pool handoff. These changes protect admission decisions across concurrent lifecycle transitions. [Commits `e147871`](https://github.com/OrgGem/mini-pod/commit/e1478710bcb4c2c5615b5fa03e4443e24337ad4a), [`03d7769`](https://github.com/OrgGem/mini-pod/commit/03d7769705af57f93c9e89426c16f6b5d4f77e01), and [`cc751cf`](https://github.com/OrgGem/mini-pod/commit/cc751cfe0cfb99f418ee45b2d69d7e2f8b7a613f).
+- **Streams and cleanup:** cancellation-safe exit waiting, bounded stream handling, safer orphan recovery and temporary-file creation. Guest and host cancellation paths were hardened for busy streams. [Commits `e147871`](https://github.com/OrgGem/mini-pod/commit/e1478710bcb4c2c5615b5fa03e4443e24337ad4a), [`99a2ad9`](https://github.com/OrgGem/mini-pod/commit/99a2ad9), and [`2803ad5`](https://github.com/OrgGem/mini-pod/commit/2803ad5).
+- **Docker API and packaging:** stricter Docker query and tmpfs policy checks, plus Windows launcher signal handling. [Commits `4f9f4f6`](https://github.com/OrgGem/mini-pod/commit/4f9f4f6) and [`abdeda2`](https://github.com/OrgGem/mini-pod/commit/abdeda2).
 
 ## Table of Contents
 
@@ -15,7 +26,7 @@ Unprivileged, QEMU-first micro-VM sandbox runtime in Rust with Ed25519-signed Po
    - [1.1 Target Use Cases & When Not to Use](#11-target-use-cases--when-not-to-use)
 2. [System Requirements & Installation](#2-system-requirements--installation)
    - [2.1 Prerequisites](#21-prerequisites)
-   - [2.2 Download Prebuilt Release Binaries](#22-download-prebuilt-release-binaries)
+   - [2.2 Prebuilt Release Binaries](#22-prebuilt-release-binaries)
    - [2.3 Build & Install Binaries from Source](#23-build--install-binaries-from-source)
    - [2.4 Quickstart Checklist (After Cloning)](#24-quickstart-checklist-after-cloning)
 3. [Building Signed Portable Runtime Bundles](#3-building-signed-portable-runtime-bundles)
@@ -60,7 +71,7 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 | [`crates/sandbox-docker-compat`](crates/sandbox-docker-compat) | 3 | Owner-only IPC (`npipe://` Named Pipe on Windows, `unix://` `0600` socket on Unix) HTTP/1.1 Docker Engine compatibility adapter (`bollard` / `testcontainers` + Ryuk), host port forwarding over virtio, HTTP hijack & half-close, URL/JSON canonicalization, `/libpod/*` block, and raw host bind-mount rejection. |
 | [`crates/sandbox-client`](crates/sandbox-client) | Adapter | Lightweight async `SandboxClient` SDK + `ControlEndpoint` parser + client-side safe tar packing/extraction (no daemon/QEMU/MCP deps). |
 | [`bins/sandboxd`](bins/sandboxd) | 4 | Local daemon (`serve`) over owner-only Named Pipe / Unix socket and JSON-RPC 2.0 `stdio` MCP server (`mcp`). |
-| [`bins/sandbox-cli`](bins/sandbox-cli) | 4 | CLI client (`status`, `spawn`, `exec`, `renew`, `copy-in`, `copy-out`, `docker-endpoint`, `destroy`). |
+| [`bins/sandbox-cli`](bins/sandbox-cli) | 4 | CLI client for diagnostics, one-shot and managed VM lifecycles, image builds, Compose, Docker endpoints, and an interactive TUI. |
 | [`guest/tiny-init`](guest/tiny-init) & [`guest/sandbox-agent`](guest/sandbox-agent) | Guest | PID 1 read-only rootfs + overlay setup, zombie reaping, execution supervisor (per-exec cgroup v2 `cgroup.kill` + container exec process-tree termination on deadline or output budget), and Podman Unix socket relay. |
 
 ### 1.1 Target Use Cases & When Not to Use
@@ -73,7 +84,7 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 | **4. Standard-User Enterprise Workstations (Windows / macOS / Linux)** | Runs without Administrator/root privileges or custom kernel drivers; confines host QEMU processes via Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + handle whitelist) or Unix process groups/cgroup v2, and restricts control/Docker IPC to the owner SID/UID. |
 
 **When NOT to Use `mini-pod` (Current MVP Scope & Post-MVP Deferrals):**
-- **High-volume, real-time bidirectional host/guest Live Mounts:** MVP uses explicit bounded `copy-in` / `copy-out` tar transfers (`16 MiB` default, configurable via `--max-copy-bytes`) instead of `virtiofs`/`9p` shared mounts to eliminate host symlink/TOCTOU attack surfaces.
+- **High-volume, real-time bidirectional host/guest Live Mounts:** MVP uses explicit bounded `copy-in` / `copy-out` tar transfers instead of `virtiofs`/`9p` shared mounts. The CLI client uses a `16 MiB` tar budget by default. SDK clients can configure their own limits, subject to daemon and transport limits.
 - **GPU passthrough or native Windows containers:** Guest micro-VMs run a minimal Linux kernel (`linux-virt`) with static musl userland and Podman/crun.
 - **External VM state/memory snapshots, Windows ARM64 hosts, and native macOS `Virtualization.framework`:** Explicitly deferred post-MVP per [BRD.md](BRD.md).
 
@@ -108,9 +119,9 @@ Guest Binaries (Linux static musl):            guest/tiny-init (PID 1) | guest/s
 3. **Docker (Optional — only required when building guest bundles from source):**
    - Needed to run `scripts/build-portable-bundles.ps1` and `scripts/build-test-oci-images.ps1`.
 
-### 2.2 Download Prebuilt Release Binaries
+### 2.2 Prebuilt Release Binaries
 
-Prebuilt archives containing `sandboxd`, `sandbox-cli`, and `bundle-pack` (along with `SHA256SUMS.txt` and static `linux-musl` guest binaries) are built automatically by [`.github/workflows/release.yml`](.github/workflows/release.yml) and published on [GitHub Releases](https://github.com/OrgGem/mini-pod/releases) for:
+The [release workflow](.github/workflows/release.yml) is configured to publish archives containing `sandboxd`, `sandbox-cli`, `bundle-pack`, checksums, and static `linux-musl` guest binaries to [GitHub Releases](https://github.com/OrgGem/mini-pod/releases). The `v0.1.0` workflow did not publish a release. Build from source until a release is available. The configured host targets are:
 - **Windows (`x86_64`):** `mini-pod-<version>-x86_64-pc-windows-msvc.zip`
 - **Linux (`x86_64` / `aarch64`):** `mini-pod-<version>-x86_64-unknown-linux-gnu.tar.gz`, `mini-pod-<version>-aarch64-unknown-linux-gnu.tar.gz`
 - **macOS (`x86_64` / `aarch64`):** `mini-pod-<version>-x86_64-apple-darwin.tar.gz`, `mini-pod-<version>-aarch64-apple-darwin.tar.gz`
@@ -275,9 +286,9 @@ cargo run --release -p sandbox-image --bin bundle-pack -- \
 sandbox-cli run --input ./job /tmp/work --cwd /tmp/work --output /tmp/work/out ./result --deadline-secs 60 -- sh ./process.sh
 ```
 
-`run` creates a VM with isolated networking, copies the explicitly selected input into it, executes the command, copies the selected output after a successful execution, and destroys the sandbox. The command and its tools must be available in the guest bundle, and the copy-in destination must be writable in the guest. Omit either transfer flag when it is not needed. The output destination must not exist and its parent directory must already exist. Output is extracted into a private staging directory on the same filesystem and published with an atomic no-overwrite rename.
+`run` creates a VM with isolated networking by default, copies the explicitly selected input into it, executes the command, copies the selected output after a successful execution, and attempts to destroy the sandbox. The command and its tools must be available in the guest bundle, and the copy-in destination must be writable in the guest. Omit either transfer flag when it is not needed. The output destination must not exist and its parent directory must already exist. Output is extracted into a private staging directory on the same filesystem and published with an atomic no-overwrite rename.
 
-`run` accepts the resource, accelerator, network, and TTL options of `spawn`, as well as the working directory, user, environment, deadline, and output budget options of `exec`. It renews the lease during the operation. An interrupt requests cancellation and cleanup. With `--json`, the result contains separate `workload`, `copy_out`, and `cleanup` objects and the sandbox ID when known. Cleanup that reports `ProcessExited` or an unknown outcome makes the command fail and includes the sandbox ID when available for investigation.
+`run` accepts the resource, isolation, accelerator, network, and TTL options of `spawn`, as well as the working directory, user, environment, deadline, and output budget options of `exec`. `--operation-id` is available on `spawn` and is not accepted by `run`. `run` renews the lease during the operation. An interrupt requests cancellation and cleanup. With `--json`, the result contains separate `workload`, `copy_out`, and `cleanup` objects and the sandbox ID when known. Cleanup that reports `ProcessExited` or an unknown outcome makes the command fail and includes the sandbox ID when available for investigation.
 
 The Linux guest agent gives each guest exec its own cgroup v2 leaf with a limit of 128 tasks, including threads. The kernel rejects new tasks at capacity. The agent stays outside the leaf and can accept the next exec on the same VM. A failure to install the limit rejects the guest exec before launch. Commands targeting an existing Podman container use that container's resource policy.
 
@@ -336,6 +347,7 @@ sandbox-cli tui --refresh-ms 500
   ```bash
   sandbox-cli --json spawn --rss-mb 512 --ttl-secs 300
   ```
+- **Retryable spawn request:** `sandbox-cli --json spawn --operation-id <lowercase-UUID> --rss-mb 512`. Retry the same logical request with the same UUID and identical spec. If the operation has expired or belongs to a previous daemon incarnation, use a new UUID for a fresh spawn after checking the daemon state.
 - **Custom Network Policy (`isolated`, `internet`, or repeatable `allow:<domain>:<port>`):**
   ```bash
   # Allow outbound HTTPS/HTTP only to github.com:443 and *.npmjs.org:443 via HostEgressProxy
@@ -400,13 +412,15 @@ sandbox-cli build <SANDBOX_ID> ./my-app -t my-app:v1 -f Dockerfile --build-arg E
 
 # 2. Bring up a multi-service Compose stack (builds `build:` services, orders `depends_on:`,
 #    creates Podman DNS networks & named `volumes:`, and forwards `ports:` to Host 127.0.0.1)
-sandbox-cli compose <SANDBOX_ID> up -f ./compose.yaml --build
+sandbox-cli compose <SANDBOX_ID> up -f ./compose.yaml -p my-app --build
 
 # 3. Check stack status, view service logs, and tear down (including named volumes with `-v`)
-sandbox-cli compose <SANDBOX_ID> ps -f ./compose.yaml
-sandbox-cli compose <SANDBOX_ID> logs -f ./compose.yaml --tail 100
-sandbox-cli compose <SANDBOX_ID> down -f ./compose.yaml -v
+sandbox-cli compose <SANDBOX_ID> ps -f ./compose.yaml -p my-app
+sandbox-cli compose <SANDBOX_ID> logs -f ./compose.yaml -p my-app --tail 100
+sandbox-cli compose <SANDBOX_ID> down -f ./compose.yaml -p my-app -v
 ```
+
+Use the same project name and file when inspecting or retrying teardown, especially when sharing a sandbox across projects. `up` checks the existing container's Compose project and service labels before replacement. A name collision with another project or service fails with `PolicyViolation`. `down` acts on resources labeled for the selected project, attempts independent cleanup even after errors, and reports listing and deletion failures. A failed `up` or `down` can leave resources behind. Inspect with `compose ps` and retry cleanup as needed. `-v` also removes project-labeled named volumes.
 
 ---
 
@@ -422,9 +436,7 @@ sandbox-cli docker-endpoint <SANDBOX_ID>
 sandbox-cli docker-endpoint <SANDBOX_ID> --allow-reaper-socket
 ```
 
-Output URI:
-- **Windows:** `npipe:////./pipe/minipod-docker-<PID>-<SEQ>` (protected by owner-only Win32 DACL)
-- **Linux / macOS:** `unix:///.../d.sock` (`0600` socket inside a `0700` directory)
+The returned URI identifies the sandbox's endpoint and uses an owner-only Windows Named Pipe or a `0600` Unix socket inside a `0700` directory. Capture the returned value instead of constructing the endpoint name. After destroying or replacing a sandbox, obtain a fresh endpoint for the new sandbox.
 
 ### Using with `DOCKER_HOST`, `bollard`, or `testcontainers`
 
@@ -528,8 +540,8 @@ use sandbox_core::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Windows Named Pipe or Unix socket ("unix:///tmp/minipod-1000/ctl.sock")
-    let endpoint = ControlEndpoint::parse(r"\\.\pipe\minipod-sandboxd-Gem")?;
+    // Set MINIPOD_ENDPOINT to the running daemon's local pipe or socket URI.
+    let endpoint = ControlEndpoint::parse(&std::env::var("MINIPOD_ENDPOINT")?)?;
     let client = SandboxClient::new(endpoint);
 
     // 1. Spawn a micro-VM (matches Warm Pool template when warm-pool-size > 0)
@@ -591,6 +603,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+For streaming execution, consume output with `next_output()` or use `collect()` / `exec_collect()` when output is needed. `ClientExecStream::wait_exit()` discards unread output while waiting to avoid blocking on a full output queue. Its result can be awaited again after a caller cancels a pending wait.
 
 ---
 
