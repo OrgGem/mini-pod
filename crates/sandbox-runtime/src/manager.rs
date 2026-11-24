@@ -300,8 +300,9 @@ pub struct LocalRuntimeManager {
 
 #[cfg(test)]
 struct RssHandoffSyncHook {
-    warm_ready_for_handoff: tokio::sync::Notify,
-    release_warm_handoff: tokio::sync::Notify,
+    warm_ready_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release_warm_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release_warm_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     handoff_completed_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     mid_sample_wait_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     sample_count: std::sync::atomic::AtomicUsize,
@@ -399,9 +400,14 @@ impl LocalRuntimeManager {
                         if hook.armed.load(Ordering::Acquire) {
                             let idx = hook.sample_count.fetch_add(1, Ordering::AcqRel);
                             if idx == hook.trigger_on_sample {
-                                if let Some(rx) = lock_unpoisoned(&hook.mid_sample_wait_rx).take() {
-                                    hook.release_warm_handoff.notify_one();
-                                    let _ = rx.recv_timeout(Duration::from_millis(30));
+                                if let (Some(release_tx), Some(rx)) = (
+                                    lock_unpoisoned(&hook.release_warm_tx).take(),
+                                    lock_unpoisoned(&hook.mid_sample_wait_rx).take(),
+                                ) {
+                                    tokio::task::block_in_place(|| {
+                                        let _ = release_tx.send(());
+                                        let _ = rx.recv_timeout(Duration::from_millis(50));
+                                    });
                                 }
                             }
                         }
@@ -693,8 +699,15 @@ impl LocalRuntimeManager {
             let handoff_hook = lock_unpoisoned(&self.rss_handoff_hook).clone();
             #[cfg(test)]
             if let Some(hook) = handoff_hook.as_ref() {
-                hook.warm_ready_for_handoff.notify_one();
-                hook.release_warm_handoff.notified().await;
+                if let (Some(ready_tx), Some(release_rx)) = (
+                    lock_unpoisoned(&hook.warm_ready_tx).take(),
+                    lock_unpoisoned(&hook.release_warm_rx).take(),
+                ) {
+                    tokio::task::block_in_place(|| {
+                        let _ = ready_tx.send(());
+                        let _ = release_rx.recv();
+                    });
+                }
             }
             let rejected = {
                 // Hold `self.active` across `park_from_replenish` + `rss_guard.finish()`
@@ -7026,7 +7039,7 @@ mod tests {
         mgr.destroy(&lease2.id).await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn warm_up_handoff_preserves_live_rss_across_concurrent_spawn_and_releases_on_exit() {
         struct HandoffSession {
             pid: u32,
@@ -7190,10 +7203,13 @@ mod tests {
                 }));
             }
 
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let hook = Arc::new(RssHandoffSyncHook {
-                warm_ready_for_handoff: tokio::sync::Notify::new(),
-                release_warm_handoff: tokio::sync::Notify::new(),
+                warm_ready_tx: Mutex::new(Some(ready_tx)),
+                release_warm_tx: Mutex::new(Some(release_tx)),
+                release_warm_rx: Mutex::new(Some(release_rx)),
                 handoff_completed_tx: Mutex::new(Some(done_tx)),
                 mid_sample_wait_rx: Mutex::new(Some(done_rx)),
                 sample_count: std::sync::atomic::AtomicUsize::new(0),
@@ -7202,14 +7218,17 @@ mod tests {
                 trigger_on_sample: 1,
                 armed: AtomicBool::new(false),
             });
-            let ready_notified = hook.warm_ready_for_handoff.notified();
-            tokio::pin!(ready_notified);
-            ready_notified.as_mut().enable();
             *lock_unpoisoned(&mgr.rss_handoff_hook) = Some(Arc::clone(&hook));
 
             let mgr_warm = Arc::clone(&mgr);
             let warm_task = tokio::spawn(async move { mgr_warm.warm_up().await });
-            ready_notified.await;
+            tokio::task::spawn_blocking(move || {
+                ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("warm_up must reach handoff point")
+            })
+            .await
+            .unwrap();
 
             hook.armed.store(true, Ordering::Release);
 

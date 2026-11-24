@@ -1651,36 +1651,19 @@ mod tests {
         let installed_v1 = install_bundle_atomic(&src_v1, &install_root, &verifier).unwrap();
         let target_dir = installed_v1.root_dir().to_path_buf();
 
-        let (writer_paused_tx, writer_paused_rx) = std::sync::mpsc::channel();
-        let (resume_writer_tx, resume_writer_rx) = std::sync::mpsc::channel();
-        let writer_src = src_v2.clone();
-        let writer_root = install_root.clone();
-        let writer_verifier = verifier.clone();
-        let writer_target_check = target_dir.clone();
-        let writer_handle = thread::spawn(move || {
-            let mut pause_after_backup = || {
-                let target_missing = !writer_target_check.exists();
-                let _ = writer_paused_tx.send(target_missing);
-                let _ = resume_writer_rx.recv_timeout(Duration::from_secs(5));
-            };
-            install_bundle_atomic_inner(
-                &writer_src,
-                &writer_root,
-                &writer_verifier,
-                BUNDLE_EXCLUSIVE_LOCK_TIMEOUT,
-                Some(&mut pause_after_backup),
-            )
-        });
-
-        let target_was_missing = writer_paused_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("writer must reach post-backup-rename hook");
-
+        // Pre-spawn the reader thread before starting the writer so OS thread creation latency on
+        // loaded CI runners cannot delay the reader past any writer wait window.
+        let (reader_spawned_tx, reader_spawned_rx) = std::sync::mpsc::channel();
+        let (start_reader_tx, start_reader_rx) = std::sync::mpsc::channel();
         let (reader_at_lock_tx, reader_at_lock_rx) = std::sync::mpsc::channel();
         let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
         let reader_dir = target_dir.clone();
         let reader_verifier = verifier.clone();
         let reader_handle = thread::spawn(move || {
+            let _ = reader_spawned_tx.send(());
+            if start_reader_rx.recv().is_err() {
+                return;
+            }
             let mut on_before_lock = || {
                 let _ = reader_at_lock_tx.send(());
             };
@@ -1692,21 +1675,65 @@ mod tests {
             );
             let _ = reader_done_tx.send(res);
         });
+        reader_spawned_rx
+            .recv()
+            .expect("pre-spawned reader thread must signal readiness");
 
-        let reached_lock = reader_at_lock_rx.recv_timeout(Duration::from_secs(5));
-        let reader_blocked = matches!(
-            reader_done_rx.recv_timeout(Duration::from_millis(50)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        );
+        let (writer_paused_tx, writer_paused_rx) = std::sync::mpsc::channel();
+        let (resume_writer_tx, resume_writer_rx) = std::sync::mpsc::channel();
+        let writer_src = src_v2.clone();
+        let writer_root = install_root.clone();
+        let writer_verifier = verifier.clone();
+        let writer_target_check = target_dir.clone();
+        let writer_handle = thread::spawn(move || {
+            let mut pause_after_backup = || {
+                let target_missing = !writer_target_check.exists();
+                let _ = writer_paused_tx.send(target_missing);
+                // Block until the coordinator explicitly releases (or drops `resume_writer_tx`),
+                // never auto-resuming early when the reader thread is slow to schedule.
+                let _ = resume_writer_rx.recv();
+            };
+            install_bundle_atomic_inner(
+                &writer_src,
+                &writer_root,
+                &writer_verifier,
+                BUNDLE_EXCLUSIVE_LOCK_TIMEOUT,
+                Some(&mut pause_after_backup),
+            )
+        });
+
+        let target_was_missing = writer_paused_rx.recv();
+        if target_was_missing.is_ok() {
+            let _ = start_reader_tx.send(());
+        }
+        drop(start_reader_tx);
+
+        let reached_lock = if target_was_missing.is_ok() {
+            reader_at_lock_rx.recv_timeout(Duration::from_secs(30)).ok()
+        } else {
+            None
+        };
+        let reader_blocked = reached_lock.is_some()
+            && matches!(
+                reader_done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
         let _ = resume_writer_tx.send(());
+        drop(resume_writer_tx);
 
         // Always join both threads before unwrapping assertions or dropping `TestTempDir`.
         let writer_join = writer_handle.join();
         let reader_join = reader_handle.join();
-        let reader_res = reader_done_rx.recv_timeout(Duration::from_secs(5));
+        let reader_res = reader_done_rx.recv_timeout(Duration::from_secs(30));
 
-        assert!(target_was_missing, "target_dir must be absent right after backup rename");
-        reached_lock.expect("reader must reach shared lock point while swap is paused");
+        assert!(
+            target_was_missing.expect("writer must reach post-backup-rename hook"),
+            "target_dir must be absent right after backup rename"
+        );
+        assert!(
+            reached_lock.is_some(),
+            "reader must reach shared lock point while swap is paused"
+        );
         assert!(
             reader_blocked,
             "reader must wait on writer's exclusive lock rather than failing early"
