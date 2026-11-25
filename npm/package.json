@@ -1,6 +1,6 @@
 {
   "name": "@orggem/mini-pod",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Command-line client and daemon for the mini-pod sandbox runtime",
   "license": "MIT",
   "repository": {
@@ -21,11 +21,11 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@orggem/mini-pod-win32-x64": "0.1.0",
-    "@orggem/mini-pod-linux-x64": "0.1.0",
-    "@orggem/mini-pod-linux-arm64": "0.1.0",
-    "@orggem/mini-pod-darwin-x64": "0.1.0",
-    "@orggem/mini-pod-darwin-arm64": "0.1.0"
+    "@orggem/mini-pod-win32-x64": "0.1.1",
+    "@orggem/mini-pod-linux-x64": "0.1.1",
+    "@orggem/mini-pod-linux-arm64": "0.1.1",
+    "@orggem/mini-pod-darwin-x64": "0.1.1",
+    "@orggem/mini-pod-darwin-arm64": "0.1.1"
   },
   "publishConfig": {
     "access": "public"
