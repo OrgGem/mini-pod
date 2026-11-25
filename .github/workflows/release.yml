@@ -343,11 +343,11 @@ jobs:
           mkdir -p "${STAGE_DIR}" dist
           chmod 0777 "${STAGE_DIR}"
 
-          docker run --rm --platform "${PLATFORM}" \
+          docker run --rm -i --platform "${PLATFORM}" \
             -v "${GITHUB_WORKSPACE}:/src:ro" \
             -v "${GITHUB_WORKSPACE}/${STAGE_DIR}:/out" \
             rust:alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 \
-            sh -euxc '
+            sh -euxs <<'GUEST_BUILD_SCRIPT'
               apk add --no-cache musl-dev file binutils >/dev/null
               RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-Wl,--build-id=none" \
                 cargo build --manifest-path /src/Cargo.toml --locked \
@@ -360,16 +360,22 @@ jobs:
               chmod 0755 /out/tiny-init /out/sandbox-agent
               file /out/tiny-init /out/sandbox-agent
               for bin in /out/tiny-init /out/sandbox-agent; do
-                if readelf -d "$bin" 2>/dev/null | grep -Eq '\(NEEDED\)'; then
-                  echo "ERROR: $bin has dynamic NEEDED dependencies" >&2
-                  exit 1
-                fi
-                if readelf -l "$bin" | grep -Eq 'INTERP|Requesting program interpreter'; then
-                  echo "ERROR: $bin has a dynamic program interpreter" >&2
-                  exit 1
-                fi
+                dynamic_section="$(readelf -d "$bin")"
+                program_headers="$(readelf -l "$bin")"
+                case "$dynamic_section" in
+                  *"(NEEDED)"*)
+                    echo "ERROR: $bin has dynamic NEEDED dependencies" >&2
+                    exit 1
+                    ;;
+                esac
+                case "$program_headers" in
+                  *INTERP*|*"Requesting program interpreter"*)
+                    echo "ERROR: $bin has a dynamic program interpreter" >&2
+                    exit 1
+                    ;;
+                esac
               done
-            '
+          GUEST_BUILD_SCRIPT
 
           chmod 0755 "${STAGE_DIR}"
           ARCHIVE_NAME="${STAGE_DIR}.tar.gz"
