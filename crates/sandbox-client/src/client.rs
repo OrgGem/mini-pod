@@ -37,9 +37,9 @@ const SECURITY_IDENTIFICATION_QOS: u32 = 0x0001_0000;
 #[cfg(windows)]
 const ERROR_PIPE_BUSY: i32 = 231;
 #[cfg(windows)]
-const PIPE_BUSY_MAX_RETRIES: usize = 20;
+const PIPE_BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(windows)]
-const PIPE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+const PIPE_BUSY_MAX_DELAY: Duration = Duration::from_millis(25);
 
 /// Marker trait for bidirectional async streams accepted by [`SandboxClient`].
 pub trait ControlStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -936,19 +936,20 @@ async fn connect_unix_socket(path: &Path) -> Result<BoxedControlStream, SandboxE
 #[cfg(windows)]
 async fn connect_named_pipe(raw_pipe: &str) -> Result<BoxedControlStream, SandboxError> {
     use tokio::net::windows::named_pipe::ClientOptions;
+    use tokio::time::{sleep_until, Instant};
 
     let pipe_path = normalize_named_pipe_path(raw_pipe)?;
-    for attempt in 0..=PIPE_BUSY_MAX_RETRIES {
+    let deadline = Instant::now() + PIPE_BUSY_TIMEOUT;
+    let mut delay = Duration::from_millis(1);
+    loop {
         match ClientOptions::new()
             .security_qos_flags(SECURITY_IDENTIFICATION_QOS)
             .open(&pipe_path)
         {
             Ok(client) => return Ok(Box::new(client)),
-            Err(err)
-                if err.raw_os_error() == Some(ERROR_PIPE_BUSY)
-                    && attempt < PIPE_BUSY_MAX_RETRIES =>
-            {
-                tokio::time::sleep(PIPE_BUSY_RETRY_DELAY).await;
+            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => {
+                sleep_until(deadline.min(Instant::now() + delay)).await;
+                delay = (delay * 2).min(PIPE_BUSY_MAX_DELAY);
             }
             Err(err) => {
                 return Err(SandboxError::Transport(format!(
@@ -957,9 +958,6 @@ async fn connect_named_pipe(raw_pipe: &str) -> Result<BoxedControlStream, Sandbo
             }
         }
     }
-    Err(SandboxError::Transport(format!(
-        "timed out waiting for busy Windows Named Pipe '{pipe_path}'"
-    )))
 }
 
 #[cfg(not(windows))]
@@ -1479,6 +1477,46 @@ mod tests {
                 .await,
             Err(SandboxError::InvalidSpec(_))
         ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn busy_pipe_reconnects_promptly_and_bounds_persistent_contention() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        use tokio::time::{timeout, Instant};
+
+        let pipe_path = format!(
+            r"\\.\pipe\minipod-busy-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+        );
+        let _first = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_path)
+            .unwrap();
+        let _holder = connect_named_pipe(&pipe_path).await.unwrap();
+        let retry = connect_named_pipe(&pipe_path);
+        tokio::pin!(retry);
+        tokio::select! {
+            biased;
+            _ = &mut retry => panic!("the only pipe instance is occupied"),
+            _ = std::future::ready(()) => {}
+        }
+        let _next = ServerOptions::new().create(&pipe_path).unwrap();
+        let _second_holder = timeout(Duration::from_millis(10), retry)
+            .await
+            .expect("retry must pick up a newly available pipe")
+            .unwrap();
+
+        let start = Instant::now();
+        let result = timeout(
+            PIPE_BUSY_TIMEOUT + Duration::from_millis(5),
+            connect_named_pipe(&pipe_path),
+        )
+        .await
+        .expect("persistent contention must exhaust the retry budget");
+        assert!(matches!(result, Err(SandboxError::Transport(_))));
+        assert!(start.elapsed() >= PIPE_BUSY_TIMEOUT);
     }
 
     #[cfg(windows)]
