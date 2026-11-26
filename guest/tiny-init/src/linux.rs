@@ -136,10 +136,12 @@ fn early_initramfs_setup() -> io::Result<()> {
     ensure_standard_fds_open();
 
     if Path::new("/sbin/modprobe").exists() {
-        for module in REQUIRED_MODULES {
-            if let Err(err) = Command::new("/sbin/modprobe").args(["-q", module]).status() {
-                eprintln!("[tiny-init] warning: modprobe -q {module} failed to spawn: {err}");
-            }
+        if let Err(err) = Command::new("/sbin/modprobe")
+            .args(["-a", "-q"])
+            .args(REQUIRED_MODULES)
+            .status()
+        {
+            eprintln!("[tiny-init] warning: modprobe failed to spawn: {err}");
         }
     }
 
