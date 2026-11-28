@@ -1,0 +1,1 @@
+/out/xerj: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, BuildID[sha1]=6b7dd4b79663d62e0fd776b7227faa33c67c67e1, stripped

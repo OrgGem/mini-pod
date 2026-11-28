@@ -1,0 +1,84 @@
+{
+  "metadata": {
+    "manifest": {
+      "xerj_revision": "35ccd192508027cccc1b3e69f3b6721cb17cac64",
+      "corpus_revision": "e359a799946933c10b2c406d9b30c7a810ab15c2",
+      "file_count": 92,
+      "source_bytes": 3484440,
+      "queries_sha256": "a099f4013774a516617aa6d1b402e20ead47b1b8e4983159258ee3f9aabf2f1e",
+      "query_count": 32
+    },
+    "build": {
+      "release_lto": "thin",
+      "xerj_sha256": "6850361a0b5f82e6b7098b649089d19ea85013dc9b0e43cf8f9dc02495f89239",
+      "features": "--no-default-features",
+      "builder_image": "sha256:be25299c4f27c4fb2c681b461ca4057d0625b067101b4ec23371290028cd1cb5",
+      "source_revision": "35ccd192508027cccc1b3e69f3b6721cb17cac64",
+      "release_codegen_units": 16,
+      "cargo_lock_sha256": "c6565b13a8b107b5786ea1949d3d07b4e3dce1ed9e37e45c118e5c2723bea6ad",
+      "rust_base": "rust:alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409",
+      "target": "x86_64-unknown-linux-musl",
+      "rustflags": "-C target-cpu=x86-64 -C target-feature=+crt-static"
+    },
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-musl\nrelease: 1.100.0\nLLVM version: 23.1.5\n",
+    "host_cpu": {
+      "Name": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics     ",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 16
+    },
+    "host_revision": "e359a799946933c10b2c406d9b30c7a810ab15c2",
+    "ram_mib": 256,
+    "vcpus": 1,
+    "host_rss_budget_mib": 2048,
+    "network": "isolated",
+    "acceleration": "software",
+    "state_directory": ".cache\\xerj-spike\\s-e7f98271",
+    "xerj_sha256": "6850361a0b5f82e6b7098b649089d19ea85013dc9b0e43cf8f9dc02495f89239",
+    "xerj_bytes": 161287600,
+    "xerj_gzip_bytes": 39260753,
+    "transfer_parts": 5,
+    "guest_bench_sha256": "30475185f68ff8a3fcd233c24bfc3547cbb49c3ca3fbd8658b6324bcd84f5ddf",
+    "bundle_manifest_sha256": "9dc1bf1853cc648dcb50869269327d5b215b263b6ea5101907f46a892d8d131e",
+    "runs": [
+      {
+        "run": 1,
+        "spawn_ms": 4147.189899813384,
+        "copy_in_ms": 2839.55160016194,
+        "unpack_ms": 6539.786800043657,
+        "guest_exec_wall_ms": 251680.38800009526,
+        "cli_exit_code": 1,
+        "exec": {
+          "exit_code": 1,
+          "stderr": "benchmark failed: index exited signal: 15 (SIGTERM)\n",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        },
+        "error": "guest measurement failed: {'exit_code': 1, 'stderr': 'benchmark failed: index exited signal: 15 (SIGTERM)\\n', 'stderr_truncated': False, 'stdout': '', 'stdout_truncated': False, 'timed_out': False}",
+        "destroy_cli_exit_code": 0,
+        "destroy_output": "{\n  \"id\": \"mp-af1eccf570828e1558b6cdeb-1\",\n  \"remaining_artifacts\": [],\n  \"status\": \"AllResourcesCleaned\"\n}\n",
+        "host_monitor_errors": [],
+        "remaining_overlay_count": 0
+      }
+    ]
+  },
+  "operator_stop": {
+    "stopped_at_utc": "2026-11-28T19:07:38.813903+00:00",
+    "action": "SIGTERM to guest autoindex PID 703 after inspecting its arguments",
+    "reason": "Repeated parent memory circuit_breaking_exception during finalize-verify; 135245184 bytes requested vs 122535116-byte auto memory limit; indexer would retry for 600 seconds. Diagnostic trial stopped early, not a completed benchmark or observed OOM.",
+    "diagnostic_interference": "Three short guest log/process inspection commands before stopping; exclude this run from latency and quality tables."
+  },
+  "complete_benchmark": false,
+  "core_index_completed": false,
+  "search_quality_measured": false,
+  "observed_server_peak_hwm_kib": 161344,
+  "observed_indexer_peak_hwm_kib": 121188,
+  "observed_combined_peak_rss_kib": 185440,
+  "guest_min_available_kib": 1036,
+  "host_qemu_peak_rss_bytes": 390250496,
+  "observed_guest_measurement_duration_ms": 250801.526,
+  "refused_read_bytes": 135245184,
+  "memory_limit_bytes": 122535116,
+  "outcome": "Stopped by operator after repeated stored_values_decode memory circuit-breaker refusals in finalize-verify. Do not treat the ensuing SIGTERM as an upstream crash."
+}

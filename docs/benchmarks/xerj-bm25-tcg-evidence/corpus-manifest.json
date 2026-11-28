@@ -1,0 +1,378 @@
+{
+  "xerj_revision": "35ccd192508027cccc1b3e69f3b6721cb17cac64",
+  "corpus_revision": "e359a799946933c10b2c406d9b30c7a810ab15c2",
+  "files": {
+    "BRD.md": {
+      "bytes": 40429,
+      "sha256": "82302f1552e54ff70ee853fcbf81797c66e079e951d3e6374c9f284f17c12c9d"
+    },
+    "README.md": {
+      "bytes": 39937,
+      "sha256": "cbb6001245706d9eb077d566cf6ad6b7b55d0d4895a11174098838a01d9178e4"
+    },
+    "bins/sandbox-cli/src/cli.rs": {
+      "bytes": 96815,
+      "sha256": "b78137390e74d2750f50e844cd7a48fd07db5967058e4589b33fd899ac5a0e30"
+    },
+    "bins/sandbox-cli/src/compose.rs": {
+      "bytes": 140860,
+      "sha256": "58bff1601dfe6a6e9b183b5dab54bcfef3d27b0b858df7f450452a40f7173d3a"
+    },
+    "bins/sandbox-cli/src/doctor.rs": {
+      "bytes": 5809,
+      "sha256": "6d1d8f6d3c11453ba26e9e4662045fb2da3b6eeee097bc8d89d5208ba05343cb"
+    },
+    "bins/sandbox-cli/src/image_build.rs": {
+      "bytes": 25054,
+      "sha256": "10b40bc18dc600ca67666fe772b3de10bb78b1851d824bbc27bb11b4276db285"
+    },
+    "bins/sandbox-cli/src/main.rs": {
+      "bytes": 1577,
+      "sha256": "a19aba703ab6285338b20ae8ac149c6a6cf4fa2fe911bb36ad3f204bcfdbdf74"
+    },
+    "bins/sandbox-cli/src/run.rs": {
+      "bytes": 30677,
+      "sha256": "6a168f9da9007754d981ae65a53909bd493470de619e81ec67701dc16b2c381d"
+    },
+    "bins/sandbox-cli/src/tui.rs": {
+      "bytes": 128166,
+      "sha256": "1dc01b70bd6626ae04cdf6bef53bec8883cb67277d87b365701d975cdcdc437b"
+    },
+    "bins/sandbox-cli/tests/cli_e2e.rs": {
+      "bytes": 17865,
+      "sha256": "7ef944e9f07ab8b04c0b4a0e1e704823597fd50c7eb30e85cdb593286329f645"
+    },
+    "bins/sandbox-cli/tests/doctor_e2e.rs": {
+      "bytes": 13649,
+      "sha256": "085ba294c9e2603aafa968037b640deea2d46c742d9727866f0e36015159e5e0"
+    },
+    "bins/sandbox-cli/tests/doctor_smoke_e2e.rs": {
+      "bytes": 22545,
+      "sha256": "6bffc9e36f41d4124b385d68df97d5794963436a24fa70d83414495ba1069441"
+    },
+    "bins/sandbox-cli/tests/run_e2e.rs": {
+      "bytes": 57551,
+      "sha256": "66ab776800c129bd37a2bc47fa961ebcc9b79c8be09422d43f3fc869e732fc59"
+    },
+    "bins/sandboxd/src/config.rs": {
+      "bytes": 35046,
+      "sha256": "54e03fda5a25f690c5616926419321374b7f6fd56e89fe18fee0c6caa06c3cda"
+    },
+    "bins/sandboxd/src/doctor.rs": {
+      "bytes": 4602,
+      "sha256": "c752df4c8c69db56c16eb2e6dcb34acf707d187db2998721e0b2b5a862727da5"
+    },
+    "bins/sandboxd/src/lib.rs": {
+      "bytes": 210,
+      "sha256": "d0ad9be9db6f0d711aca23b178553035a17453cb067e3b1941075a3e6286f2f5"
+    },
+    "bins/sandboxd/src/main.rs": {
+      "bytes": 1351,
+      "sha256": "3efa075130c30db8a4f068809d4e31981c29f7a6185e3bcbd04a8f21293a4ac7"
+    },
+    "bins/sandboxd/src/mcp.rs": {
+      "bytes": 61621,
+      "sha256": "8479f0daa5b53e552f3af17ef56308fd5bec1c5311b6f771cb539dd35d310b60"
+    },
+    "bins/sandboxd/src/server.rs": {
+      "bytes": 126678,
+      "sha256": "be4fb6013805a47615214a4e645763ec3eb329664d46ab3651a6a7187bfb8c9b"
+    },
+    "bins/sandboxd/src/spawn_registry.rs": {
+      "bytes": 18393,
+      "sha256": "6fdd1cf18f48793d3a82e66146444b17c4728a2038aaf2f9a4d16e3dcd2557a4"
+    },
+    "bins/sandboxd/tests/phase7_rc_drill_and_ipc_e2e.rs": {
+      "bytes": 42777,
+      "sha256": "f2df7738b953db601a25a407c36907539484fde18b797f99203a79dd7795b58e"
+    },
+    "crates/sandbox-client/src/client.rs": {
+      "bytes": 66860,
+      "sha256": "d96c0f8b6822ade69064b2311acb14c0101629da97fd02946ba89cfd12e8582e"
+    },
+    "crates/sandbox-client/src/lib.rs": {
+      "bytes": 762,
+      "sha256": "7d7174d057d02196924de02736552d5fe0eec6dc96ca956d6e6c89b8e4fe2be5"
+    },
+    "crates/sandbox-client/src/safe_tar.rs": {
+      "bytes": 2588,
+      "sha256": "b0e6e888c3868e98053e714ae2a0d6d8719c34ad757ba7f5efa07132a96bd937"
+    },
+    "crates/sandbox-client/src/wire.rs": {
+      "bytes": 69847,
+      "sha256": "f0e3655f259c8388d85b7de5c02c0bd00a8505efa3b1e62889ec5092b04aafdd"
+    },
+    "crates/sandbox-core/src/arch.rs": {
+      "bytes": 2934,
+      "sha256": "93e83eb959c568da63bccc0bc2217b1bcde032073c3cfd01c726956e9b67b608"
+    },
+    "crates/sandbox-core/src/error.rs": {
+      "bytes": 1617,
+      "sha256": "dd80431b418a8790ae5a1cd8157abc1e970e175f882de59a56e6f71d663bc11a"
+    },
+    "crates/sandbox-core/src/exec.rs": {
+      "bytes": 767,
+      "sha256": "bb70b2f0dae0ea070df45fd11b65fa0ada4d43c01d456644fe60d89964240eda"
+    },
+    "crates/sandbox-core/src/lib.rs": {
+      "bytes": 8361,
+      "sha256": "65f58f64bc023bded5f3c488e79801025597c530d6793596e8baf01a6e3c1375"
+    },
+    "crates/sandbox-core/src/lifecycle.rs": {
+      "bytes": 4450,
+      "sha256": "16349445b73a591cacd42bdb88ead86f9da19741a8c157edfb6b8600a52cde8c"
+    },
+    "crates/sandbox-core/src/policy.rs": {
+      "bytes": 4804,
+      "sha256": "223384c46d82767fed479d6dc99fa51dbc025f6205bed6cd450916a7cd9b7b89"
+    },
+    "crates/sandbox-core/src/safe_tar.rs": {
+      "bytes": 78164,
+      "sha256": "3300415312abcfaead887979cddc580208ef554bf572dd2f0fadc8eb02137ad1"
+    },
+    "crates/sandbox-docker-compat/src/hijack.rs": {
+      "bytes": 7235,
+      "sha256": "c0449fd3d0a3710ddf3730c5f83d63716f0479dd34fb318467f71455a9dbe908"
+    },
+    "crates/sandbox-docker-compat/src/http1.rs": {
+      "bytes": 55565,
+      "sha256": "5ae7ce05e157674dbb2a6cd4d8811619b12223cdcc88d1255298be92600cb881"
+    },
+    "crates/sandbox-docker-compat/src/lib.rs": {
+      "bytes": 1255,
+      "sha256": "4c3042be8220d626485e93eff91fb1b77837edb8e0bc995a4a3138940b7a81c2"
+    },
+    "crates/sandbox-docker-compat/src/policy.rs": {
+      "bytes": 105339,
+      "sha256": "5b364510977240015529d81e5847fdf68107c7689b45e259e0dc8a39f30043f7"
+    },
+    "crates/sandbox-docker-compat/src/ports.rs": {
+      "bytes": 35926,
+      "sha256": "1865574f58d8ae89fbe6e4f6e5c88b954b07003987d403b55ad8d18297638c23"
+    },
+    "crates/sandbox-docker-compat/src/rewrite.rs": {
+      "bytes": 12713,
+      "sha256": "24924fb5494f9367cc03042bfadcf5d3e9ef96433e3cd42baf5bc5b095577c43"
+    },
+    "crates/sandbox-docker-compat/src/server.rs": {
+      "bytes": 139027,
+      "sha256": "8cb7e2d29c5855284d9f979a81919567846ec5419b7760b25ae9458efbaf3833"
+    },
+    "crates/sandbox-image/src/adapter.rs": {
+      "bytes": 16970,
+      "sha256": "ea02d650a82e99e6ee3e16b848c441d29e7c54765c898aacbf2ddfbc9895a395"
+    },
+    "crates/sandbox-image/src/bin/bundle-pack.rs": {
+      "bytes": 34764,
+      "sha256": "313955514754b9178c1538f43ba17bd4ecbde3570788a748958d4bb2636abf0b"
+    },
+    "crates/sandbox-image/src/crypto.rs": {
+      "bytes": 13264,
+      "sha256": "31a540e6fc050e88ee4e01505d0b557093d21e45ae15af28f890d47a32d1c389"
+    },
+    "crates/sandbox-image/src/installer.rs": {
+      "bytes": 80495,
+      "sha256": "4b106923cfbd4407417db929938556cb7bcc64b616f44c738f44b1f7267b3cd9"
+    },
+    "crates/sandbox-image/src/lib.rs": {
+      "bytes": 942,
+      "sha256": "538350cd5cd4eb6025ae387be1b867f28a562b8cfccbc97e537bc23418181db4"
+    },
+    "crates/sandbox-image/src/manifest.rs": {
+      "bytes": 28169,
+      "sha256": "088250a4e0f8c6e3537f3fef0d5b9fa3377620371590f4366beedb4b33f7e4dd"
+    },
+    "crates/sandbox-image/src/qcow2.rs": {
+      "bytes": 25465,
+      "sha256": "0ec33e89daf3f6d9a905ad3c7a40a09462d0f2a414189e663a28b4168c86c3b6"
+    },
+    "crates/sandbox-protocol/src/lib.rs": {
+      "bytes": 25643,
+      "sha256": "382cc40ad92cc97fd792d1ba6f72cf2d565223db8ee3370a8285719b70b229cf"
+    },
+    "crates/sandbox-protocol/src/message.rs": {
+      "bytes": 52312,
+      "sha256": "ddcaa68717579d4f9ebd9c3bd477fa1b021d4563bfda016ec981c84f1c8a518b"
+    },
+    "crates/sandbox-protocol/src/queue.rs": {
+      "bytes": 10924,
+      "sha256": "52c006061638ad769cf46d31d88b5bcf228d3100b52fcafbcb69f9d04d6ffb8a"
+    },
+    "crates/sandbox-runtime/src/admission.rs": {
+      "bytes": 32100,
+      "sha256": "3fa9b39449fec4ecdfc3afb223d8c6432de47afc110aba853148d0dd115222f6"
+    },
+    "crates/sandbox-runtime/src/benchmark.rs": {
+      "bytes": 21327,
+      "sha256": "b9fca129ed23672f44a34ace3d5137922d07ad5f3bcef863c378cb3b4b568d82"
+    },
+    "crates/sandbox-runtime/src/egress.rs": {
+      "bytes": 102280,
+      "sha256": "86cc9fe4e391aee8ece0ecfe4b8d44d43de22a0e7eef11c48e9a982b9ac3b63b"
+    },
+    "crates/sandbox-runtime/src/exec_stream.rs": {
+      "bytes": 27385,
+      "sha256": "e90c49c934ff4f29e12d291d43fc08e271c0bb725747f0709f8496bf32bfa902"
+    },
+    "crates/sandbox-runtime/src/journal.rs": {
+      "bytes": 39303,
+      "sha256": "372c35b28ecce08dcf8ef34781d687c5584fff92255601598567dab9bbde448b"
+    },
+    "crates/sandbox-runtime/src/lib.rs": {
+      "bytes": 3419,
+      "sha256": "89805c83becb33888947674462f7e37b19c2519f0f81868a7962e89551312705"
+    },
+    "crates/sandbox-runtime/src/manager.rs": {
+      "bytes": 296272,
+      "sha256": "0796ad5558d584a4ecb9e4a07ad0f7d729b7813f18548e4af49c63a0527fefa5"
+    },
+    "crates/sandbox-runtime/src/ports.rs": {
+      "bytes": 7054,
+      "sha256": "67e20fdd7f41d6eeb700b4dbae7c36c222e8073215abde51ba8af72731464da2"
+    },
+    "crates/sandbox-runtime/src/safe_tar.rs": {
+      "bytes": 342,
+      "sha256": "3fd883867cbb2efe2d0e155990bb90524588679809c08aaf8c2b2eb297137515"
+    },
+    "crates/sandbox-runtime/src/tunnel.rs": {
+      "bytes": 5417,
+      "sha256": "5b32c8f8b99eba81273004cfcc254cbf0e96c18ae9430c839e627bdd5da29909"
+    },
+    "crates/sandbox-runtime/src/warm_pool.rs": {
+      "bytes": 21743,
+      "sha256": "6aa7bf877b622a937581cab32db563c48f404f462413e80c3354fb8ce35be0b6"
+    },
+    "crates/sandbox-vmm/src/accel.rs": {
+      "bytes": 26119,
+      "sha256": "4bc0eb60c24296d062a1bcc561ce5e83d6e608ef865c120ed83aff66f1d08b94"
+    },
+    "crates/sandbox-vmm/src/driver.rs": {
+      "bytes": 215886,
+      "sha256": "7ddacfa1d17a829be8eae3049dca13fdc13783ce39111ad3f2c6c2de95bf9fea"
+    },
+    "crates/sandbox-vmm/src/ipc.rs": {
+      "bytes": 17657,
+      "sha256": "1d305bc5fee3b49b5817bc925003571f42e249d062e539477e55b34d18fc3cd5"
+    },
+    "crates/sandbox-vmm/src/launch.rs": {
+      "bytes": 16519,
+      "sha256": "706e20677078ca9f06489bb7a4e211bf226410e6af1ae115344f7bd10fbcad8e"
+    },
+    "crates/sandbox-vmm/src/lib.rs": {
+      "bytes": 1630,
+      "sha256": "f065d93ffdc8c52fcf2fdf2aa056085c09e977385ddb13f4648324070e908ed2"
+    },
+    "crates/sandbox-vmm/src/os/mod.rs": {
+      "bytes": 193,
+      "sha256": "d4ac5180764217b379663907fdf2ef43bc0d9fbad29a9bd2eff91e8c0a459d83"
+    },
+    "crates/sandbox-vmm/src/os/unix.rs": {
+      "bytes": 67432,
+      "sha256": "815941cb25f772f4a7a2c28d197611198468f547aaf82997ca02ffb9a3e6bd7c"
+    },
+    "crates/sandbox-vmm/src/os/windows.rs": {
+      "bytes": 64631,
+      "sha256": "fd49cb2e2e02eb6e40f2276917a62bfbb2d5514ac4a061070b049620f4c59a4f"
+    },
+    "crates/sandbox-vmm/src/os/windows_job.rs": {
+      "bytes": 68834,
+      "sha256": "09afa111b19abf889274f3179976a3478455049481f5960ab70e999832b748b4"
+    },
+    "crates/sandbox-vmm/src/process.rs": {
+      "bytes": 32735,
+      "sha256": "3ec27435c93aca762ee2a9cff0b8be2b218de46d4a656907a79097b0974fb651"
+    },
+    "crates/sandbox-vmm/src/spike.rs": {
+      "bytes": 31251,
+      "sha256": "213ef0541b2c1c54523732377f7d7cbcbb1ce09e3428f1602c78326328d8026b"
+    },
+    "crates/sandbox-vmm/tests/phase2_bundle_e2e.rs": {
+      "bytes": 11864,
+      "sha256": "d63b810647dd450d53a1f8cbf6e63dbfe011576ecae7a1ce4ce26c3e399f9c4a"
+    },
+    "crates/sandbox-vmm/tests/phase3_runtime_e2e.rs": {
+      "bytes": 41135,
+      "sha256": "0c7ef2ae3168fa2fb9a1dfc510056d296113791898eb798e9d8acbbc075d1d86"
+    },
+    "crates/sandbox-vmm/tests/phase4_docker_compat_e2e.rs": {
+      "bytes": 44599,
+      "sha256": "3ab93e575a0c258ced1f5bc8ced453305b2490ade723695c6b946b4a0dff8b6e"
+    },
+    "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs": {
+      "bytes": 46366,
+      "sha256": "47a94170da248587d3ff8693db9c2a5f7a838bc2584f81b9581f6390b466e492"
+    },
+    "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs": {
+      "bytes": 49860,
+      "sha256": "0b0615495d18655b1b96189b98172f02894da0795fa38c1f3cee282598a8a5ff"
+    },
+    "crates/sandbox-vmm/tests/spike_e2e.rs": {
+      "bytes": 7839,
+      "sha256": "ff96dacfd56e299f798ced5506023d814fb38abcb97189f601f22e20b6a1aa5f"
+    },
+    "crates/sandbox-vmm/tests/windows_owner_only_dir_e2e.rs": {
+      "bytes": 3541,
+      "sha256": "b569661edde05c1d8c34ef34054c2f9e861f190c06fbcccbe15ffcf860513753"
+    },
+    "docs/benchmarks/phase6-windows-x86_64.md": {
+      "bytes": 3534,
+      "sha256": "3042e7e39da2b8d213b571fdd43b3f664867a2577965cc40267b7cf8688b1dbc"
+    },
+    "docs/npm-release.md": {
+      "bytes": 3895,
+      "sha256": "f3e4a1ec7ef9e8bde801dc31ceb5597172bc8c4a710669b3267f59217180f21f"
+    },
+    "docs/release-candidate-v0.1.0.md": {
+      "bytes": 23850,
+      "sha256": "6b5a9864b945aaf751b0144cb0948fe46e0165a2988bce7b69cd878ca70eaa3e"
+    },
+    "guest/sandbox-agent/src/copy_tar.rs": {
+      "bytes": 51895,
+      "sha256": "7b5f187ecd89950375a403f104195921ac3616fe642789eaf0a4648dd0b1a8c2"
+    },
+    "guest/sandbox-agent/src/egress_listener.rs": {
+      "bytes": 19825,
+      "sha256": "937493faf1a685212aa7626298b5e63da714a461511b4056c3701e28963cb56d"
+    },
+    "guest/sandbox-agent/src/main.rs": {
+      "bytes": 103452,
+      "sha256": "c08e5acce15a798a44cb6319575a7ee45323f51d61f8276dc918ade726180fca"
+    },
+    "guest/sandbox-agent/src/podman.rs": {
+      "bytes": 21330,
+      "sha256": "209e0f2919c378c3212b5242ee7355f0a793841e8103fac939cff0d0ddbb3f25"
+    },
+    "guest/sandbox-agent/src/supervisor.rs": {
+      "bytes": 45758,
+      "sha256": "7eb24652ce10361befd7d8bb12ce759c822f82c96b22368cf26c06ca4a344cd4"
+    },
+    "guest/sandbox-agent/src/supervisor_unix.rs": {
+      "bytes": 34997,
+      "sha256": "de8b1d09f8ad1ff56b4da4ecb19073164f0c5e426f7d819ca8ad73cef4de38e4"
+    },
+    "guest/sandbox-agent/src/tunnel.rs": {
+      "bytes": 29440,
+      "sha256": "f9aeb40ad2ae2066f6723e2ff3624a6e70e2d0f4ea035929dc6b795acfb99dd9"
+    },
+    "guest/tiny-init/src/linux.rs": {
+      "bytes": 33543,
+      "sha256": "2f45fd7ff1dee90d5c933cc438503316802b5ff97e24b8d7456ac8f02d3f0f99"
+    },
+    "guest/tiny-init/src/main.rs": {
+      "bytes": 556,
+      "sha256": "e9fd40de55560e33938c89f423bdff721612e21454ddb2691ed8ac0402b4c1cb"
+    },
+    "guest/tiny-init/src/plan.rs": {
+      "bytes": 8127,
+      "sha256": "c7f2852e5b0366bafab2487bf11fbd627ca3dc9b9e1873252c482ac88878bd7d"
+    },
+    "diagnostics/events.jsonl": {
+      "bytes": 731,
+      "sha256": "a7cbeee92d9a1dff9624960e02cff6deb5b294baea758da4509c86da65b85179"
+    }
+  },
+  "file_count": 92,
+  "source_bytes": 3484440,
+  "queries_sha256": "a099f4013774a516617aa6d1b402e20ead47b1b8e4983159258ee3f9aabf2f1e",
+  "query_count": 32
+}

@@ -1,0 +1,106 @@
+autoindex: 1 scan threads, 1 index workers, 1 pdf workers, --bulk-mb 8 [cores=1 ram_total_mib=218 ram_available_mib=154 safe_zone_mib=256]
+autoindex: bulk HTTP request timeout: 300s
+xerj-bar [????????????????????????] pct unknown | walk | eta unknown
+xerj-progress phase=walk basis=none pct=unknown items=0/0 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=0.6
+autoindex: 92 files (3 MB) under /workspace/spike/corpus
+xerj-progress phase=walk basis=none pct=unknown items=0/0 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=4.4 phase_elapsed_s=4.4 elapsed_s=5.0
+autoindex: --plan default keeps 92 files. estimated index 6.5 MB for 92 files (3.3 MB source) Budget 1.4 GB (free 1.5 GB minus the 95% flood-stage reserve on 1.9 GB)
+xerj-bar [------------------------] 0.0% | hash | 0/92 items | eta unknown
+xerj-progress phase=hash basis=bytes pct=0.0 items=0/92 bytes=0/3484440 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=7.6
+xerj-progress phase=scan basis=bytes pct=0.0 items=0/92 bytes=0/3484440 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=7.8
+phase A: sniffing + sampling 92 files with 1 threads…
+xerj-bar [####--------------------] 17.8% | scan | 13/92 items | 272.9KB/s | eta unknown | waiting on bins/sandboxd/src/config.rs(34.2KB)
+xerj-progress phase=scan basis=bytes pct=17.8 items=13/92 bytes=620934/3484440 rate=279500.5 eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=2.2 elapsed_s=10.0 waiting_on=bins/sandboxd/src/config.rs(34.2KB)
+xerj-progress phase=scan basis=bytes pct=58.1 items=55/92 bytes=2024588/3484440 rate=279707.3 eta_s=5.2 eta_quality=good since_progress_s=0.0 phase_elapsed_s=7.2 elapsed_s=15.0 waiting_on=crates/sandbox-runtime/src/manager.rs(289.3KB)
+phase A: 2 datasets inferred, 0 junk/skipped files
+estimate: at least 10.5 s–10.5 s — a MEASURED FLOOR for client-side extraction, not a prediction of the whole run: server indexing, embedding and network time are not in it
+estimate: basis — measured on this machine during phase A: 92 file(s) / 3.3 MB read end to end across 3 family/families, scheduled over 1 worker(s). Covers 3.3 MB of the 3.3 MB planned (100% of planned bytes). Client-side extraction only.
+  estimate: code          86 files    3.2 MB at 316.0 KB/s measured over 86 files / 3.2 MB → 10.4 s
+  estimate: txt-prose      5 files  109.0 KB at 1.8 MB/s measured over 5 files / 109.0 KB → 0.1 s
+  estimate: jsonl          1 file      731 B at 54.7 KB/s measured over 1 file / 731 B → 0.0 s
+  estimate excludes: server-side indexing, embedding and merge time (autoindex cannot measure it without writing)
+  estimate excludes: network round trips to the endpoint
+  estimate excludes: relationship detection and edge writes (--no-graph removes these)
+  estimate excludes: families with no end-to-end read in phase A, listed under unmeasured_families
+work order: source-and-docs (91 files, 3.3 MB) → data (1 file, 731 B) — smallest first inside each band at 1 worker(s); a file that outlasts everything above it starts first regardless of band
+  source-and-docs  source code and documents — what a person searches for first
+  data             structured data: rows, records and tables
+gate: not triggered — the measured extraction floor 10.5 s–10.5 s is under --max-minutes 10. That is NOT a promise the run finishes in 10 minutes: server, network and embedding time are not measured before indexing starts
+xerj-bar [------------------------] 0.0% | prepare | 0/2 items | eta unknown
+xerj-progress phase=prepare basis=items pct=0.0 items=0/2 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=18.7
+xerj-progress phase=snapshot basis=bytes pct=0.0 items=0/92 bytes=0/3484440 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=19.5
+xerj-progress phase=snapshot basis=bytes pct=2.3 items=2/92 bytes=80366/3484440 rate=145714.3 eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.6 elapsed_s=20.0 waiting_on=bins/sandbox-cli/src/cli.rs(94.5KB)
+xerj-bar [###########-------------] 49.8% | snapshot | 47/92 items | 178.3KB/s | eta 10s | waiting on …/sandbox-protocol/src/message.rs(51.1KB)
+xerj-progress phase=snapshot basis=bytes pct=49.8 items=47/92 bytes=1735538/3484440 rate=182558.0 eta_s=9.6 eta_quality=good since_progress_s=0.0 phase_elapsed_s=5.6 elapsed_s=25.0 waiting_on=crates/sandbox-protocol/src/message.rs(51.1KB)
+xerj-progress phase=snapshot basis=bytes pct=90.0 items=82/92 bytes=3135517/3484440 rate=202016.7 eta_s=7.7 eta_quality=good since_progress_s=0.0 phase_elapsed_s=10.6 elapsed_s=30.1 waiting_on=guest/sandbox-agent/src/copy_tar.rs(50.7KB)
+xerj-bar [------------------------] 0.0% | index | 0/92 items | eta unknown
+xerj-progress phase=index basis=bytes pct=0.0 items=0/92 bytes=0/9636215 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=32.4
+xerj-progress phase=index basis=bytes pct=10.7 items=14/92 bytes=1031386/9636215 rate=384202.7 eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=2.7 elapsed_s=35.1 waiting_on=crates/sandbox-vmm/src/driver.rs(517.1KB)
+xerj-progress phase=index basis=bytes pct=62.8 items=51/92 bytes=6053034/9636215 rate=507786.9 eta_s=7.1 eta_quality=good since_progress_s=0.0 phase_elapsed_s=7.7 elapsed_s=40.1 waiting_on=bins/sandbox-cli/src/compose.rs(349.7KB)
+autoindex: server is shedding load — [parent] real memory circuit breaker tripped: rss=115MB plus 0MB already reserved for analysis plus 2MB for this batch would reach watermark=116MB (107% of limit=109MB); writes rejected to prevent an out-of-memory kill (raise limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB, or live with PUT _cluster/settings {"persistent":{"indices.breaker.total.limit":"<N>gb"}}); re-offering 55 rejected record(s) (waited 0s, giving up after 90s)
+xerj-progress phase=index basis=bytes pct=80.7 items=69/92 bytes=7773777/9636215 rate=474866.1 eta_s=5.6 eta_quality=good since_progress_s=0.0 phase_elapsed_s=12.7 elapsed_s=45.1 waiting_on=bins/sandbox-cli/src/cli.rs(233.7KB)
+xerj-bar [###################-----] 80.7% | index | 69/92 items | 463.7KB/s | eta 5s | waiting on bins/sandbox-cli/src/cli.rs(233.7KB)
+xerj-progress phase=index basis=bytes pct=80.7 items=69/92 bytes=7773777/9636215 rate=474866.1 eta_s=4.5 eta_quality=good since_progress_s=5.0 phase_elapsed_s=17.8 elapsed_s=50.1 waiting_on=bins/sandbox-cli/src/cli.rs(233.7KB)
+xerj-progress phase=index basis=bytes pct=80.7 items=69/92 bytes=7773777/9636215 rate=474866.1 eta_s=3.9 eta_quality=good since_progress_s=10.7 phase_elapsed_s=23.4 elapsed_s=55.7 waiting_on=bins/sandbox-cli/src/cli.rs(233.7KB)
+xerj-progress phase=index basis=bytes pct=80.7 items=69/92 bytes=7773777/9636215 rate=474866.1 eta_s=unknown eta_quality=stalled since_progress_s=15.7 phase_elapsed_s=28.4 elapsed_s=60.8 waiting_on=bins/sandbox-cli/src/cli.rs(233.7KB)
+xerj-bar [#####################---] 91.1% | index | 82/92 items | 380.5KB/s | eta 3s | waiting on crates/sandbox-vmm/src/os/mod.rs(2.4KB)
+xerj-progress phase=index basis=bytes pct=91.1 items=82/92 bytes=8781389/9636215 rate=389593.0 eta_s=3.1 eta_quality=good since_progress_s=0.0 phase_elapsed_s=33.5 elapsed_s=65.9 waiting_on=crates/sandbox-vmm/src/os/mod.rs(2.4KB)
+xerj-progress phase=finalize-catalog basis=items pct=0.0 items=0/2 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=66.6
+xerj-bar [------------------------] 0.0% | finalize-catalog-readback | 0/95 items | eta unknown
+xerj-progress phase=finalize-catalog-readback basis=items pct=0.0 items=0/95 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=70.2
+xerj-progress phase=finalize-catalog-commit basis=items pct=0.0 items=0/4 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=70.3
+xerj-progress phase=finalize-catalog-commit basis=items pct=25.0 items=1/4 bytes=0/0 rate=1.6 eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.6 elapsed_s=70.9 waiting_on=autoindex-catalog/_refresh
+xerj-bar [------------------------] 0.0% | finalize-refresh | 0/3 items | eta unknown
+xerj-progress phase=finalize-refresh basis=items pct=0.0 items=0/3 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=72.9
+xerj-progress phase=finalize-verify basis=items pct=0.0 items=0/3 bytes=0/0 rate=unknown eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=0.0 elapsed_s=73.0
+autoindex: server is shedding load — circuit_breaking_exception: [parent] Data too large: data for [stored_values_decode] would be [136355200/130.0mb], which is larger than the memory limit of [122535116/116.9mb] (process memory [93462528/89.1mb], transient read [42892672/40.9mb]); search rejected; retrying search (waited 1s, giving up after 600s)
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=unknown since_progress_s=0.0 phase_elapsed_s=2.9 elapsed_s=75.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=5.8 eta_quality=good since_progress_s=5.0 phase_elapsed_s=7.9 elapsed_s=80.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=5.8 eta_quality=good since_progress_s=10.0 phase_elapsed_s=12.9 elapsed_s=85.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 15s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=15.0 phase_elapsed_s=17.9 elapsed_s=90.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=20.0 phase_elapsed_s=22.9 elapsed_s=95.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=25.0 phase_elapsed_s=27.9 elapsed_s=100.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 30s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=30.0 phase_elapsed_s=32.9 elapsed_s=105.9 waiting_on=spike-docs
+autoindex: server is shedding load — circuit_breaking_exception: [parent] Data too large: data for [stored_values_decode] would be [136002944/129.7mb], which is larger than the memory limit of [122535116/116.9mb] (process memory [93110272/88.8mb], transient read [42892672/40.9mb]); search rejected; retrying search (waited 32s, giving up after 600s)
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=35.0 phase_elapsed_s=37.9 elapsed_s=110.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=40.0 phase_elapsed_s=42.9 elapsed_s=115.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 45s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=45.0 phase_elapsed_s=47.9 elapsed_s=120.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=50.0 phase_elapsed_s=52.9 elapsed_s=125.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=55.0 phase_elapsed_s=57.9 elapsed_s=130.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 1m00s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=60.0 phase_elapsed_s=62.9 elapsed_s=135.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=65.0 phase_elapsed_s=67.9 elapsed_s=140.9 waiting_on=spike-docs
+autoindex: server is shedding load — circuit_breaking_exception: [parent] Data too large: data for [stored_values_decode] would be [135392640/129.1mb], which is larger than the memory limit of [122535116/116.9mb] (process memory [92499968/88.2mb], transient read [42892672/40.9mb]); search rejected; retrying search (waited 68s, giving up after 600s)
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=70.0 phase_elapsed_s=72.9 elapsed_s=145.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 1m15s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=75.0 phase_elapsed_s=77.9 elapsed_s=150.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=80.0 phase_elapsed_s=83.0 elapsed_s=155.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=85.0 phase_elapsed_s=88.0 elapsed_s=160.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 1m30s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=90.0 phase_elapsed_s=93.0 elapsed_s=165.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=95.1 phase_elapsed_s=98.0 elapsed_s=170.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=100.1 phase_elapsed_s=103.0 elapsed_s=175.9 waiting_on=spike-docs
+autoindex: server is shedding load — circuit_breaking_exception: [parent] Data too large: data for [stored_values_decode] would be [135245184/129.0mb], which is larger than the memory limit of [122535116/116.9mb] (process memory [92352512/88.1mb], transient read [42892672/40.9mb]); search rejected; retrying search (waited 104s, giving up after 600s)
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 1m45s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=105.1 phase_elapsed_s=108.0 elapsed_s=180.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=110.1 phase_elapsed_s=113.0 elapsed_s=185.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=115.1 phase_elapsed_s=118.0 elapsed_s=190.9 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 2m00s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=120.1 phase_elapsed_s=123.0 elapsed_s=195.9 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=125.1 phase_elapsed_s=128.0 elapsed_s=201.0 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=130.1 phase_elapsed_s=133.0 elapsed_s=206.0 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 2m15s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=135.1 phase_elapsed_s=138.0 elapsed_s=211.0 waiting_on=spike-docs
+autoindex: server is shedding load — circuit_breaking_exception: [parent] Data too large: data for [stored_values_decode] would be [136547712/130.2mb], which is larger than the memory limit of [122535116/116.9mb] (process memory [93655040/89.3mb], transient read [42892672/40.9mb]); search rejected; retrying search (waited 140s, giving up after 600s)
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=140.1 phase_elapsed_s=143.0 elapsed_s=216.0 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=145.1 phase_elapsed_s=148.0 elapsed_s=221.0 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 2m30s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=150.1 phase_elapsed_s=153.0 elapsed_s=226.0 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=155.1 phase_elapsed_s=158.0 elapsed_s=231.0 waiting_on=spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=160.1 phase_elapsed_s=163.0 elapsed_s=236.0 waiting_on=spike-docs
+xerj-bar [#######-----------------] 33.3% | finalize-verify | 1/3 items | 0.3 items/s | eta unknown (stalled, no progress for 2m45s) | waiting on spike-docs
+xerj-progress phase=finalize-verify basis=items pct=33.3 items=1/3 bytes=0/0 rate=0.3 eta_s=unknown eta_quality=stalled since_progress_s=165.1 phase_elapsed_s=168.0 elapsed_s=241.0 waiting_on=spike-docs

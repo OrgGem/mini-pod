@@ -1,0 +1,4 @@
+{"timestamp":"2026-11-29T00:00:01Z","level":"ERROR","message":"stdout budget exceeded; execution process group terminated","fixture_kind":"synthetic","sandbox_id":"fixture-1"}
+{"timestamp":"2026-11-29T00:00:02Z","level":"ERROR","message":"guest handshake deadline expired during TCG boot","fixture_kind":"synthetic","sandbox_id":"fixture-2"}
+{"timestamp":"2026-11-29T00:00:03Z","level":"WARN","message":"overlay cleanup access denied; retaining journal for reconciliation retry","fixture_kind":"synthetic","sandbox_id":"fixture-3"}
+{"timestamp":"2026-11-29T00:00:04Z","level":"WARN","message":"host RSS admission rejected because total reserved memory exceeds configured limit","fixture_kind":"synthetic","sandbox_id":"fixture-4"}

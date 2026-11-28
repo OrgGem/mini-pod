@@ -1,0 +1,89 @@
+{
+  "raw_directory": ".cache/xerj-spike/runs/20261128T190309Z-256m",
+  "files": {
+    "daemon.log": {
+      "bytes": 80,
+      "sha256": "f809327ea50feda2d2caa1aef44a56d931d46e65dd38a8ca31de95b098c686fb"
+    },
+    "doctor.json": {
+      "bytes": 1080,
+      "sha256": "1104d74693dafc69123186ac72cd8609bf1fb0e407f410a445f1d7b857a8fc35"
+    },
+    "metadata.json": {
+      "bytes": 2962,
+      "sha256": "83f98bcc5b00bf82454bcd70b136e8d7b3e4facc356299b5813044d930897480"
+    },
+    "operator-stop.json": {
+      "bytes": 559,
+      "sha256": "0aa230f4424b65089ae91a89ca49ead53a30ece0f22f35a77fa5d525e1f07533"
+    },
+    "ready.json": {
+      "bytes": 82,
+      "sha256": "9dc829918d25b4b1fabef89e507d5e91066c0ba892895faa9ee2aa0b8be2f801"
+    },
+    "run-1/exec.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "run-1/exec.stdout": {
+      "bytes": 194,
+      "sha256": "0013f89c20a266b3e7a02e4b025615f663d3001074caa77b972d54e54c94c8b9"
+    },
+    "run-1/guest/banner.json": {
+      "bytes": 408,
+      "sha256": "ce2aa4b6426d269eff14906caaccb7e969f6591b7d1e8c2b7f0d764c753e6cca"
+    },
+    "run-1/guest/cpuinfo": {
+      "bytes": 775,
+      "sha256": "1d500cec13032a4a0139414f7a079e56ba2a45c899ecaceedc6fe9f9d3f8ac95"
+    },
+    "run-1/guest/index.log": {
+      "bytes": 19261,
+      "sha256": "75196214a83fd0fbc06ef5a42726cf1aaed3fdf8b7665335411af3c8ceee8b8a"
+    },
+    "run-1/guest/kernel.log": {
+      "bytes": 21754,
+      "sha256": "c0b8beb9aed928a6f3e33577fb7e14654f6f6435a1c55523dba6e4d4e2fa6de8"
+    },
+    "run-1/guest/measurements.tsv": {
+      "bytes": 33,
+      "sha256": "2f03ac6110680f86d1fe00fb57cf9313db6a5da1e042b84975e8edbbfe51978d"
+    },
+    "run-1/guest/meminfo": {
+      "bytes": 1447,
+      "sha256": "bfe772a8f417f9d827e366eee93e219dba3facf01aef3fa9fa4882791a0d6b77"
+    },
+    "run-1/guest/memory.tsv": {
+      "bytes": 59417,
+      "sha256": "c00e824185a89bf12a37ded3c1cdfe17e7d18dd76fd0095bc908ca89d7e9b074"
+    },
+    "run-1/guest/mounts": {
+      "bytes": 931,
+      "sha256": "905db25e6b952028392a673696397de656fac50274629828c4ecf231e60d8b2f"
+    },
+    "run-1/guest/net-route": {
+      "bytes": 128,
+      "sha256": "9bfb5e4beb5b2844bc6a69d6d480a47995940f888d810efdb2afbf2e8cc5292e"
+    },
+    "run-1/guest/server.log": {
+      "bytes": 4234,
+      "sha256": "e553f691a58787b60512fd414dd3d5e8ffd1cb44098ec6b57f311804b10671d4"
+    },
+    "run-1/guest-sha256.json": {
+      "bytes": 230,
+      "sha256": "fff6719d36f0ea689503ffd125782b97708c00daec9c0fde6f9610b2feea9c35"
+    },
+    "run-1/host-memory.tsv": {
+      "bytes": 26632,
+      "sha256": "0655241cb8a5ae3bf2308d317d3827e86152e7650378699bd76253fbe9956235"
+    },
+    "run-1/qemu.json": {
+      "bytes": 897,
+      "sha256": "a5a242439689a18f0a55c52a2b39f5c7e639fb824431acd45a51a521555a35dd"
+    },
+    "run-1/spawn.json": {
+      "bytes": 226,
+      "sha256": "8cf0c8cea69f6d378f1b38ef18552385626784beea0ddbea022985ae9e7edcfd"
+    }
+  }
+}

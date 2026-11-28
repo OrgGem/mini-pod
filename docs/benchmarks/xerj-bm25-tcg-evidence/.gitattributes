@@ -1,0 +1,6 @@
+# Preserve captured bytes and recognize Windows CRLF as a line ending.
+* -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# Kernel, /proc and disassembler output retain their native spacing.
+diagnostic-256m/kernel.log -whitespace
+**/cpuinfo -whitespace
+fault-disassembly.txt -whitespace

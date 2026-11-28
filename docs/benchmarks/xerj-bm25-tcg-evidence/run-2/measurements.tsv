@@ -1,0 +1,9 @@
+metric	value
+startup_ms	5551.485
+index_ms	55005.169
+initial_data_logical_bytes	4505370
+initial_data_allocated_bytes	6922240
+xerj-data_logical_bytes	4549415
+xerj-data_allocated_bytes	6967296
+autoindex-state_logical_bytes	9815294
+autoindex-state_allocated_bytes	10010624

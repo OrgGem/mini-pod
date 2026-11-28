@@ -1,0 +1,49 @@
+[2m2026-11-28T19:03:27.919161Z[0m [33m WARN[0m [2mxerj[0m[2m:[0m New data directory: if you expected existing indices or an owner account, restart with your previous --data-dir or --config. This node does not search for or migrate another directory.
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ XERJ CONSOLE  ·  first-launch setup                                          │
+│                                                                              │
+│ Open this link in your browser to claim the owner account by                 │
+│ enrolling a passkey.  Valid for 30 minutes.  Single use.                     │
+│                                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+  http://localhost:9200/_xerj-console/setup#token=svMjLPCAaA_wWWiOU6esJ0iUqTSVm5r-5bvyMa-Ot9w
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ Need a fresh link?  Restart this node: a new one is printed on boot.         │
+└──────────────────────────────────────────────────────────────────────────────┘
+  The same link is in xerj-data/owner-claim.txt
+
+
+  ██╗  ██╗███████╗██████╗      ██╗
+  ╚██╗██╔╝██╔════╝██╔══██╗     ██║
+   ╚███╔╝ █████╗  ██████╔╝     ██║
+   ██╔██╗ ██╔══╝  ██╔══██╗██   ██║
+  ██╔╝ ██╗███████╗██║  ██║╚█████╔╝
+  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚════╝   v1.0.0-rc.105
+
+ the unified search engine for AI — connect, autoindex, query
+
+ Native REST  127.0.0.1:9201 [plain]
+ ES-compat    127.0.0.1:9200 [plain]
+ gRPC         127.0.0.1:9202 [h2c — plaintext, no TLS]
+ Data dir     /workspace/spike/xerj-data
+ Data source  --data-dir
+ Data status  created this launch
+ New data directory: if you expected existing indices or an owner account, restart with your previous --data-dir or --config. This node does not search for or migrate another directory.
+ Started in   5946ms
+
+ Xerj Console UI    http://localhost:9200/_xerj-console/  (74 files bundled)
+
+ ┌─ Deployment posture (see PATH_TO_100_PCT_v0.6.0_to_v1.0.md) ──
+ │ ✓  Bind:   127.0.0.1 — loopback only; nothing off this host can reach the
+ │           listeners. Pass --bind 0.0.0.0 to expose the node.
+ │ ⚠  TLS:    listener is plain TCP — terminate TLS at a reverse proxy
+ │           (or enable in-process TLS: tls.enabled = true)
+ │ ⚠  Auth:   DISABLED (--insecure) — every caller on this machine can write
+ │ ✓  Audit:  hash-chained log of writes + searches + API-key ops, kept in <data_dir>/audit.jsonl
+ │           (last 4096 entries, one per request; /_audit/* requires read_audit)
+ │ ⚠  Encryption-at-rest: not engine-level — use OS FDE or S3 SSE for now
+ └────────────────────────────────────────────────────────────────
+
+[2m2026-11-28T19:04:21.010007Z[0m [33m WARN[0m [2mxerj_engine::governor[0m[2m:[0m RSS crossed the memory watermark — engaging the parent memory circuit breaker (writes → 429) [3mrss_mb[0m[2m=[0m119 [3mwatermark_mb[0m[2m=[0m116

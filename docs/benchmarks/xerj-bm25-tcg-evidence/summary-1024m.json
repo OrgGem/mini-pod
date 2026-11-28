@@ -1,0 +1,5103 @@
+{
+  "metadata": {
+    "manifest": {
+      "xerj_revision": "35ccd192508027cccc1b3e69f3b6721cb17cac64",
+      "corpus_revision": "e359a799946933c10b2c406d9b30c7a810ab15c2",
+      "file_count": 92,
+      "source_bytes": 3484440,
+      "queries_sha256": "a099f4013774a516617aa6d1b402e20ead47b1b8e4983159258ee3f9aabf2f1e",
+      "query_count": 32
+    },
+    "build": {
+      "release_lto": "thin",
+      "xerj_sha256": "6850361a0b5f82e6b7098b649089d19ea85013dc9b0e43cf8f9dc02495f89239",
+      "features": "--no-default-features",
+      "builder_image": "sha256:be25299c4f27c4fb2c681b461ca4057d0625b067101b4ec23371290028cd1cb5",
+      "source_revision": "35ccd192508027cccc1b3e69f3b6721cb17cac64",
+      "release_codegen_units": 16,
+      "cargo_lock_sha256": "c6565b13a8b107b5786ea1949d3d07b4e3dce1ed9e37e45c118e5c2723bea6ad",
+      "rust_base": "rust:alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409",
+      "target": "x86_64-unknown-linux-musl",
+      "rustflags": "-C target-cpu=x86-64 -C target-feature=+crt-static"
+    },
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-musl\nrelease: 1.100.0\nLLVM version: 23.1.5\n",
+    "host_cpu": {
+      "Name": "AMD Ryzen 7 7840HS w/ Radeon 780M Graphics     ",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 16
+    },
+    "host_revision": "e359a799946933c10b2c406d9b30c7a810ab15c2",
+    "ram_mib": 1024,
+    "vcpus": 1,
+    "host_rss_budget_mib": 2048,
+    "network": "isolated",
+    "acceleration": "software",
+    "state_directory": ".cache\\xerj-spike\\s-7f474b1c",
+    "xerj_sha256": "6850361a0b5f82e6b7098b649089d19ea85013dc9b0e43cf8f9dc02495f89239",
+    "xerj_bytes": 161287600,
+    "xerj_gzip_bytes": 39260753,
+    "transfer_parts": 5,
+    "guest_bench_sha256": "30475185f68ff8a3fcd233c24bfc3547cbb49c3ca3fbd8658b6324bcd84f5ddf",
+    "bundle_manifest_sha256": "9dc1bf1853cc648dcb50869269327d5b215b263b6ea5101907f46a892d8d131e",
+    "runs": [
+      {
+        "run": 1,
+        "spawn_ms": 4624.682399909943,
+        "copy_in_ms": 2707.6093000359833,
+        "unpack_ms": 7728.017799789086,
+        "guest_exec_wall_ms": 75757.98069988377,
+        "cli_exit_code": 0,
+        "exec": {
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "benchmark complete\n",
+          "stdout_truncated": false,
+          "timed_out": false
+        },
+        "completed": true,
+        "destroy_cli_exit_code": 0,
+        "destroy_output": "{\n  \"id\": \"mp-9fe94882c7660a911500cc7c-1\",\n  \"remaining_artifacts\": [],\n  \"status\": \"AllResourcesCleaned\"\n}\n",
+        "host_monitor_errors": [],
+        "remaining_overlay_count": 0
+      },
+      {
+        "run": 2,
+        "spawn_ms": 4951.2524001766,
+        "copy_in_ms": 3274.896699935198,
+        "unpack_ms": 6623.1384999118745,
+        "guest_exec_wall_ms": 72341.46120003425,
+        "cli_exit_code": 0,
+        "exec": {
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "benchmark complete\n",
+          "stdout_truncated": false,
+          "timed_out": false
+        },
+        "completed": true,
+        "destroy_cli_exit_code": 0,
+        "destroy_output": "{\n  \"id\": \"mp-509ddcb5fe5f760318b31166-2\",\n  \"remaining_artifacts\": [],\n  \"status\": \"AllResourcesCleaned\"\n}\n",
+        "host_monitor_errors": [],
+        "remaining_overlay_count": 0
+      },
+      {
+        "run": 3,
+        "spawn_ms": 4303.807800170034,
+        "copy_in_ms": 2683.3284001331776,
+        "unpack_ms": 6745.1568997930735,
+        "guest_exec_wall_ms": 73892.19510019757,
+        "cli_exit_code": 0,
+        "exec": {
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "benchmark complete\n",
+          "stdout_truncated": false,
+          "timed_out": false
+        },
+        "completed": true,
+        "destroy_cli_exit_code": 0,
+        "destroy_output": "{\n  \"id\": \"mp-e19610ee317baee30073ba74-3\",\n  \"remaining_artifacts\": [],\n  \"status\": \"AllResourcesCleaned\"\n}\n",
+        "host_monitor_errors": [],
+        "remaining_overlay_count": 0
+      }
+    ]
+  },
+  "method": "known-item file hit@1/hit@5 and MRR@5; nearest-rank latency percentiles",
+  "runs": [
+    {
+      "run": 1,
+      "measurements": {
+        "startup_ms": 5642.49,
+        "index_ms": 57506.355,
+        "initial_data_logical_bytes": 4505369.0,
+        "initial_data_allocated_bytes": 6922240.0,
+        "xerj-data_logical_bytes": 4549416.0,
+        "xerj-data_allocated_bytes": 6967296.0,
+        "autoindex-state_logical_bytes": 9815294.0,
+        "autoindex-state_allocated_bytes": 10010624.0
+      },
+      "quality": {
+        "all_positive": {
+          "n": 28,
+          "hit_at_1": 18,
+          "hit_at_5": 23,
+          "mrr_at_5": 0.7321428571428571
+        },
+        "english": {
+          "n": 8,
+          "hit_at_1": 2,
+          "hit_at_5": 7,
+          "mrr_at_5": 0.5625
+        },
+        "negative_exact": {
+          "n": 2,
+          "empty_results": 2
+        },
+        "negative_natural": {
+          "n": 2,
+          "empty_results": 1
+        },
+        "symbol": {
+          "n": 8,
+          "hit_at_1": 8,
+          "hit_at_5": 8,
+          "mrr_at_5": 1.0
+        },
+        "synthetic_log": {
+          "n": 4,
+          "hit_at_1": 0,
+          "hit_at_5": 0,
+          "mrr_at_5": 0.0
+        },
+        "vietnamese": {
+          "n": 8,
+          "hit_at_1": 8,
+          "hit_at_5": 8,
+          "mrr_at_5": 1.0
+        }
+      },
+      "queries": [
+        {
+          "id": "s01",
+          "category": "symbol",
+          "query": "validate_guest_path",
+          "relevant": [
+            "crates/sandbox-runtime/src/manager.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 2882,
+              "name": "validate_guest_path",
+              "score": 36.33274,
+              "index": "spike-docs",
+              "id": "655f4d05170c1396a5efdd25bc6d4425"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 892,
+              "name": "validate_guest_path",
+              "score": 36.33274,
+              "index": "spike-docs",
+              "id": "7e32599401e817161094c00d419ffcb2"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 1,
+              "name": null,
+              "score": 7.139806,
+              "index": "spike-docs",
+              "id": "4a4551192ba59fae5080b0a9c4ec3da5"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.2251606,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 3.837088,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "s02",
+          "category": "symbol",
+          "query": "is_forbidden_ipv6",
+          "relevant": [
+            "crates/sandbox-runtime/src/egress.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 53,
+              "name": "is_forbidden_ipv6",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "774aa7523674ccaf345cca2c07c6a453"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.970672,
+              "index": "spike-docs",
+              "id": "ed7b11edd03fc277f57040320631fdfd"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.1223626,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            }
+          ]
+        },
+        {
+          "id": "s03",
+          "category": "symbol",
+          "query": "extract_tar_safely",
+          "relevant": [
+            "crates/sandbox-core/src/safe_tar.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 410,
+              "name": "extract_tar_safely",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "a7d9db0963473520aa6330aaebd82dec"
+            },
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.229921,
+              "index": "spike-docs",
+              "id": "d42a837fdc108b6f701164e64d1ee553"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.4007916,
+              "index": "spike-docs",
+              "id": "1c13a41bb2a288ea8db192574c123b28"
+            },
+            {
+              "path": "crates/sandbox-client/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 4.994177,
+              "index": "spike-docs",
+              "id": "cbd6a3cc30998640ac4151eb78e699ac"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 4.9188557,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            }
+          ]
+        },
+        {
+          "id": "s04",
+          "category": "symbol",
+          "query": "WindowsJobObject",
+          "relevant": [
+            "crates/sandbox-vmm/src/os/windows_job.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 61,
+              "name": "WindowsJobObject",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "027045ab49528497f34a772582ce73ed"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.229921,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            }
+          ]
+        },
+        {
+          "id": "s05",
+          "category": "symbol",
+          "query": "BundleVerifier",
+          "relevant": [
+            "crates/sandbox-image/src/crypto.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 24,
+              "name": "BundleVerifier",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e36d706c041e9e9c0326497ab092a56f"
+            },
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 1,
+              "name": null,
+              "score": 14.906849,
+              "index": "spike-docs",
+              "id": "861e788af186f83489d9e18f19495a67"
+            },
+            {
+              "path": "bins/sandboxd/src/config.rs",
+              "line": 63,
+              "name": "load_verifier",
+              "score": 5.4485536,
+              "index": "spike-docs",
+              "id": "c88291dc00c7555daddca83fb4bd1460"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase2_bundle_e2e.rs",
+              "line": 54,
+              "name": "discover_phase2_artifacts",
+              "score": 5.1529903,
+              "index": "spike-docs",
+              "id": "27edcee7de8d8c610700633beb1afa06"
+            },
+            {
+              "path": "crates/sandbox-image/src/installer.rs",
+              "line": 194,
+              "name": "verify_installed_bundle_once",
+              "score": 4.8878436,
+              "index": "spike-docs",
+              "id": "4186b763d0a5cf1b81fde58fa4d0e6ac"
+            }
+          ]
+        },
+        {
+          "id": "s06",
+          "category": "symbol",
+          "query": "ClientExecStream",
+          "relevant": [
+            "crates/sandbox-client/src/client.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 268,
+              "name": "ClientExecStream",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "1f158f14f40c8a64075caedb4ae3e75c"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 1,
+              "name": null,
+              "score": 8.170652,
+              "index": "spike-docs",
+              "id": "4a4551192ba59fae5080b0a9c4ec3da5"
+            },
+            {
+              "path": "crates/sandbox-client/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.091058,
+              "index": "spike-docs",
+              "id": "21389335ff484d70313c38eeafa2d3ab"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 703,
+              "name": "exec_stream",
+              "score": 5.719555,
+              "index": "spike-docs",
+              "id": "fb35d6959015be9198f24210a62be3ec"
+            },
+            {
+              "path": "README.md",
+              "line": 594,
+              "name": null,
+              "score": 5.5529356,
+              "index": "spike-docs",
+              "id": "62c3f29141584aa66076677b609abc8a"
+            }
+          ]
+        },
+        {
+          "id": "s07",
+          "category": "symbol",
+          "query": "WarmPoolKey",
+          "relevant": [
+            "crates/sandbox-runtime/src/warm_pool.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 82,
+              "name": "WarmPoolKey",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e109af74a98654b5002de404f3dffb87"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.014936,
+              "index": "spike-docs",
+              "id": "7bac951f1fd003242a4f6e03441b92cf"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 333,
+              "name": "pop_for_checkout",
+              "score": 6.2793493,
+              "index": "spike-docs",
+              "id": "b778d83dc726681d603b19af7b5df4b1"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.608769,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 1.9269515,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "s08",
+          "category": "symbol",
+          "query": "cleanup_artifacts_with_backoff",
+          "relevant": [
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 428,
+              "name": "cleanup_artifacts_with_backoff",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e3f8f342192a7e62851da82263e27e10"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.604757,
+              "index": "spike-docs",
+              "id": "4e51ebe3dabebc08208afdf94d49336c"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.608769,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 2.38015,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "e01",
+          "category": "english",
+          "query": "kill QEMU when Windows job handle closes",
+          "relevant": [
+            "crates/sandbox-vmm/src/os/windows_job.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-vmm/src/os/mod.rs",
+              "line": 1,
+              "name": null,
+              "score": 19.500195,
+              "index": "spike-docs",
+              "id": "1c28d0b78ec25d3453d3797beff45171"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.550494,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            },
+            {
+              "path": "README.md",
+              "line": 75,
+              "name": null,
+              "score": 12.6666975,
+              "index": "spike-docs",
+              "id": "e01d680a9e5c062994e89f03f9e2ed0f"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/process.rs",
+              "line": 1,
+              "name": null,
+              "score": 12.426819,
+              "index": "spike-docs",
+              "id": "9fdf95ae0de6f47a2b87c1c60609b85a"
+            },
+            {
+              "path": "guest/sandbox-agent/src/tunnel.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.853205,
+              "index": "spike-docs",
+              "id": "5611c94b57029e093107339c297d7ea3"
+            }
+          ]
+        },
+        {
+          "id": "e02",
+          "category": "english",
+          "query": "reject symbolic links and parent directory traversal when extracting tar",
+          "relevant": [
+            "crates/sandbox-core/src/safe_tar.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "guest/sandbox-agent/src/copy_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 17.504097,
+              "index": "spike-docs",
+              "id": "c74f56eba05ee24f36944a177026c09d"
+            },
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 14.715469,
+              "index": "spike-docs",
+              "id": "d42a837fdc108b6f701164e64d1ee553"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 46,
+              "name": null,
+              "score": 11.565267,
+              "index": "spike-docs",
+              "id": "b0f500bb7f3916e4152220ff7e459f63"
+            },
+            {
+              "path": "README.md",
+              "line": 275,
+              "name": null,
+              "score": 10.646903,
+              "index": "spike-docs",
+              "id": "f85a25311a9f1755ad8df7c8dcc446b4"
+            },
+            {
+              "path": "bins/sandbox-cli/src/image_build.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.481231,
+              "index": "spike-docs",
+              "id": "3bd34e661ed94b8c12e86a5713c40435"
+            }
+          ]
+        },
+        {
+          "id": "e03",
+          "category": "english",
+          "query": "resolve DNS reject private IP connect validated address",
+          "relevant": [
+            "crates/sandbox-runtime/src/egress.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 35,
+              "name": null,
+              "score": 21.367285,
+              "index": "spike-docs",
+              "id": "dccfa3947b2a3150811a950e8710f80d"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 1,
+              "name": null,
+              "score": 20.390547,
+              "index": "spike-docs",
+              "id": "ed7b11edd03fc277f57040320631fdfd"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.95842,
+              "index": "spike-docs",
+              "id": "f81ad6027ff7cd8aabca6fc7c12191ec"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.565753,
+              "index": "spike-docs",
+              "id": "f0db40df18ed5fec673a7c79d752f443"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 78,
+              "name": null,
+              "score": 14.936654,
+              "index": "spike-docs",
+              "id": "42ddd61089d61578e276bf27230a9d60"
+            }
+          ]
+        },
+        {
+          "id": "e04",
+          "category": "english",
+          "query": "retry artifact cleanup exponential backoff",
+          "relevant": [
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 1,
+              "name": null,
+              "score": 19.002039,
+              "index": "spike-docs",
+              "id": "4e51ebe3dabebc08208afdf94d49336c"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/spike.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.89072,
+              "index": "spike-docs",
+              "id": "c5aafc0afd2d8827f9385826d01b0dff"
+            },
+            {
+              "path": "README.md",
+              "line": 411,
+              "name": null,
+              "score": 6.7359076,
+              "index": "spike-docs",
+              "id": "cc69753cc46c05624c024cbc8ef08802"
+            },
+            {
+              "path": "crates/sandbox-image/src/installer.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.637302,
+              "index": "spike-docs",
+              "id": "94cd9535914f42815f5a0b3115a5c630"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 82,
+              "name": null,
+              "score": 6.421246,
+              "index": "spike-docs",
+              "id": "48ded8a28b8f58b9844490786f045323"
+            }
+          ]
+        },
+        {
+          "id": "e05",
+          "category": "english",
+          "query": "collect stdout stderr execution deadline",
+          "relevant": [
+            "crates/sandbox-runtime/src/exec_stream.rs",
+            "crates/sandbox-client/src/client.rs"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "bins/sandboxd/src/doctor.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.159928,
+              "index": "spike-docs",
+              "id": "2c0ab19918e3f14eb77c1806ce47a622"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 18,
+              "name": "OutputStreamKind",
+              "score": 10.418163,
+              "index": "spike-docs",
+              "id": "5b58496b1e3091a439b792af0f372867"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 246,
+              "name": "ClientOutputKind",
+              "score": 10.418163,
+              "index": "spike-docs",
+              "id": "5fe8b481e55e7677ad1f3e21de0341f8"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.033989,
+              "index": "spike-docs",
+              "id": "83586400b3deb39e6b38b869b1944893"
+            },
+            {
+              "path": "bins/sandbox-cli/src/run.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.30718,
+              "index": "spike-docs",
+              "id": "87d06fec86acb4c222ba19b869ff0c09"
+            }
+          ]
+        },
+        {
+          "id": "e06",
+          "category": "english",
+          "query": "FIFO admission queue timeout",
+          "relevant": [
+            "crates/sandbox-runtime/src/admission.rs"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.730255,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/admission.rs",
+              "line": 1,
+              "name": null,
+              "score": 12.625036,
+              "index": "spike-docs",
+              "id": "ce7e37413e0e178405f10ca7b03a27e5"
+            },
+            {
+              "path": "README.md",
+              "line": 275,
+              "name": null,
+              "score": 11.587902,
+              "index": "spike-docs",
+              "id": "f85a25311a9f1755ad8df7c8dcc446b4"
+            },
+            {
+              "path": "crates/sandbox-protocol/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.458124,
+              "index": "spike-docs",
+              "id": "c89369d4f411f367525863206d7ae524"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.311155,
+              "index": "spike-docs",
+              "id": "f0db40df18ed5fec673a7c79d752f443"
+            }
+          ]
+        },
+        {
+          "id": "e07",
+          "category": "english",
+          "query": "Ed25519 manifest signature validation",
+          "relevant": [
+            "crates/sandbox-image/src/crypto.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-image/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.47587,
+              "index": "spike-docs",
+              "id": "50ce17b0de72cd0dd97b7542e721dc4a"
+            },
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.422195,
+              "index": "spike-docs",
+              "id": "861e788af186f83489d9e18f19495a67"
+            },
+            {
+              "path": "README.md",
+              "line": 66,
+              "name": null,
+              "score": 12.721809,
+              "index": "spike-docs",
+              "id": "a3991a7178b56ee171d77ccea4d83391"
+            },
+            {
+              "path": "README.md",
+              "line": 157,
+              "name": null,
+              "score": 11.849428,
+              "index": "spike-docs",
+              "id": "647a64dc0f478f6f99ed8e07f583f3ad"
+            },
+            {
+              "path": "crates/sandbox-image/src/manifest.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.26656,
+              "index": "spike-docs",
+              "id": "289607b116abb59721059e7b7ace4abb"
+            }
+          ]
+        },
+        {
+          "id": "e08",
+          "category": "english",
+          "query": "warm pool discard used virtual machines",
+          "relevant": [
+            "crates/sandbox-runtime/src/warm_pool.rs",
+            "crates/sandbox-runtime/src/manager.rs",
+            "BRD.md"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "README.md",
+              "line": 594,
+              "name": null,
+              "score": 9.607528,
+              "index": "spike-docs",
+              "id": "62c3f29141584aa66076677b609abc8a"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.297956,
+              "index": "spike-docs",
+              "id": "5a1777eb6750dc8e49e8346540ffa43e"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 54,
+              "name": null,
+              "score": 9.289403,
+              "index": "spike-docs",
+              "id": "31c6ca56e27b1856bae9f2166c67d770"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 82,
+              "name": null,
+              "score": 8.981519,
+              "index": "spike-docs",
+              "id": "48ded8a28b8f58b9844490786f045323"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 39,
+              "name": "Accelerator",
+              "score": 6.792992,
+              "index": "spike-docs",
+              "id": "136ee3ad771cedccae165a4fe2889123"
+            }
+          ]
+        },
+        {
+          "id": "v01",
+          "category": "vietnamese",
+          "query": "chặn địa chỉ IPv6 nội bộ",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/egress.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 27.714954,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 26.482615,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 273,
+              "name": null,
+              "score": 21.295849,
+              "index": "spike-docs",
+              "id": "71fb1b13555b3e05ad92a228555a0fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 258,
+              "name": null,
+              "score": 12.765456,
+              "index": "spike-docs",
+              "id": "893ad6b843ef743750a1693e6d8e330e"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 12.689932,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v02",
+          "category": "vietnamese",
+          "query": "từ chối symlink khi giải nén",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-core/src/safe_tar.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 26.940186,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 200,
+              "name": null,
+              "score": 19.110626,
+              "index": "spike-docs",
+              "id": "b8b2c0a0e314578de0688bb473ff295a"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 18.781235,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 17.125626,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 16.955118,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            }
+          ]
+        },
+        {
+          "id": "v03",
+          "category": "vietnamese",
+          "query": "thu hồi máy ảo khi hết hạn thuê",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/manager.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 29.716507,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            },
+            {
+              "path": "BRD.md",
+              "line": 289,
+              "name": null,
+              "score": 27.511322,
+              "index": "spike-docs",
+              "id": "9f1811bf0b2ed7ccab36e2127897bbca"
+            },
+            {
+              "path": "BRD.md",
+              "line": 278,
+              "name": null,
+              "score": 24.895338,
+              "index": "spike-docs",
+              "id": "934e30ac723f4086970a2482196a3cbe"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 23.291334,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 21.064007,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v04",
+          "category": "vietnamese",
+          "query": "không tự chuyển sang kernel dùng chung",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 25,
+              "name": null,
+              "score": 27.976181,
+              "index": "spike-docs",
+              "id": "5d5e50ccc935da6e429dc56dba40fd15"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 25.756826,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 22.88925,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 19.423792,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 212,
+              "name": null,
+              "score": 18.602676,
+              "index": "spike-docs",
+              "id": "34b2e74fa9365eef8219aa454863885c"
+            }
+          ]
+        },
+        {
+          "id": "v05",
+          "category": "vietnamese",
+          "query": "thư mục và socket chỉ chủ sở hữu được truy cập",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 172,
+              "name": null,
+              "score": 45.948013,
+              "index": "spike-docs",
+              "id": "89c9bcc84fff78bfe6deb3943cef2fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 35.687946,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 35.488148,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 30.69389,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 273,
+              "name": null,
+              "score": 28.742765,
+              "index": "spike-docs",
+              "id": "71fb1b13555b3e05ad92a228555a0fec"
+            }
+          ]
+        },
+        {
+          "id": "v06",
+          "category": "vietnamese",
+          "query": "kiểm tra chữ ký trước khi cài gói",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-image/src/crypto.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 212,
+              "name": null,
+              "score": 33.115578,
+              "index": "spike-docs",
+              "id": "34b2e74fa9365eef8219aa454863885c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 27.937466,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 27.361727,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 57,
+              "name": null,
+              "score": 23.550457,
+              "index": "spike-docs",
+              "id": "fe4fa75c4775e65cf29f7b79c91db3e8"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 22.56102,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            }
+          ]
+        },
+        {
+          "id": "v07",
+          "category": "vietnamese",
+          "query": "giới hạn bộ nhớ thực trên máy chủ",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 172,
+              "name": null,
+              "score": 34.180714,
+              "index": "spike-docs",
+              "id": "89c9bcc84fff78bfe6deb3943cef2fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 29.685446,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 25.379166,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 25.058754,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 25.008781,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v08",
+          "category": "vietnamese",
+          "query": "phục hồi tiến trình mồ côi sau crash",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 34.43523,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 31.225533,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            },
+            {
+              "path": "BRD.md",
+              "line": 278,
+              "name": null,
+              "score": 30.917372,
+              "index": "spike-docs",
+              "id": "934e30ac723f4086970a2482196a3cbe"
+            },
+            {
+              "path": "BRD.md",
+              "line": 289,
+              "name": null,
+              "score": 29.930733,
+              "index": "spike-docs",
+              "id": "9f1811bf0b2ed7ccab36e2127897bbca"
+            },
+            {
+              "path": "BRD.md",
+              "line": 152,
+              "name": null,
+              "score": 19.686296,
+              "index": "spike-docs",
+              "id": "81d9d8f4c4e0ae0a7d213c517c896c1e"
+            }
+          ]
+        },
+        {
+          "id": "l01",
+          "category": "synthetic_log",
+          "query": "stdout budget exceeded",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 985,
+              "name": "encode_resource_budget",
+              "score": 8.897972,
+              "index": "spike-docs",
+              "id": "e1d5ad0c1c0562a692c50c99ef1ffe96"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 202,
+              "name": "parse_accel_help",
+              "score": 6.247135,
+              "index": "spike-docs",
+              "id": "084fb2b4a52d26b9dff803a360822a69"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.9797144,
+              "index": "spike-docs",
+              "id": "83586400b3deb39e6b38b869b1944893"
+            },
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 571,
+              "name": "ExecWireEvent",
+              "score": 5.6042433,
+              "index": "spike-docs",
+              "id": "de8e2e1e6cfa8cb17f1b20f87b101a53"
+            },
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.4735665,
+              "index": "spike-docs",
+              "id": "4ea50a77a471ab91b985df53349fee8a"
+            }
+          ]
+        },
+        {
+          "id": "l02",
+          "category": "synthetic_log",
+          "query": "guest handshake deadline expired",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "guest/sandbox-agent/src/supervisor.rs",
+              "line": 328,
+              "name": "PreparedCommand",
+              "score": 8.778598,
+              "index": "spike-docs",
+              "id": "e41e55fa6833e29bcbac6357a71f5dbe"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.920901,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase3_runtime_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.426877,
+              "index": "spike-docs",
+              "id": "f3985803f0c8135960e9a497d9292213"
+            },
+            {
+              "path": "crates/sandbox-protocol/src/message.rs",
+              "line": 9,
+              "name": "ExecTargetWire",
+              "score": 5.7714167,
+              "index": "spike-docs",
+              "id": "550f26f2eb9ba33edab1ba65da985b9b"
+            },
+            {
+              "path": "crates/sandbox-core/src/exec.rs",
+              "line": 7,
+              "name": "ExecTarget",
+              "score": 5.7714167,
+              "index": "spike-docs",
+              "id": "c8c06a8704658e93efaa765683d12cde"
+            }
+          ]
+        },
+        {
+          "id": "l03",
+          "category": "synthetic_log",
+          "query": "overlay cleanup access denied",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "bins/sandboxd/tests/phase7_rc_drill_and_ipc_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.638678,
+              "index": "spike-docs",
+              "id": "604710de2dc84689b6f3f8a5a0f122ca"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase4_docker_compat_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.3077874,
+              "index": "spike-docs",
+              "id": "e25fa51a5cb884d4a3a738ebd17de037"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.106533,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 3189,
+              "name": "remove_overlay_artifacts_with",
+              "score": 6.068384,
+              "index": "spike-docs",
+              "id": "511cd5dc15910152eb1da4ef7004ae2e"
+            },
+            {
+              "path": "crates/sandbox-docker-compat/src/policy.rs",
+              "line": 110,
+              "name": "ReaperSocketPolicy",
+              "score": 5.860406,
+              "index": "spike-docs",
+              "id": "e6c269887abcdf9fab467dfbe9b590d0"
+            }
+          ]
+        },
+        {
+          "id": "l04",
+          "category": "synthetic_log",
+          "query": "host RSS admission rejected",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.730255,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 5,
+              "name": "admission",
+              "score": 9.108927,
+              "index": "spike-docs",
+              "id": "2cbe05367a032af7ccbe60dec400be2d"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/admission.rs",
+              "line": 1,
+              "name": null,
+              "score": 8.213571,
+              "index": "spike-docs",
+              "id": "ce7e37413e0e178405f10ca7b03a27e5"
+            },
+            {
+              "path": "README.md",
+              "line": 244,
+              "name": null,
+              "score": 7.7189593,
+              "index": "spike-docs",
+              "id": "6cadad650fa8424c49c7c09064bcd445"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 7.342722,
+              "index": "spike-docs",
+              "id": "f81ad6027ff7cd8aabca6fc7c12191ec"
+            }
+          ]
+        },
+        {
+          "id": "n01",
+          "category": "negative_exact",
+          "query": "absentmarkerf6cb739d48814df8ba66771268fabafe",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n02",
+          "category": "negative_exact",
+          "query": "absentmarker752de35d1f494afc94e40f5f61f5eb7e",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n03",
+          "category": "negative_natural",
+          "query": "photosynthesis chloroplast chlorophyll",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n04",
+          "category": "negative_natural",
+          "query": "diệp lục quang hợp lá cây",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 9.144461,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 152,
+              "name": null,
+              "score": 6.184545,
+              "index": "spike-docs",
+              "id": "81d9d8f4c4e0ae0a7d213c517c896c1e"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 4.3541713,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 57,
+              "name": null,
+              "score": 4.3541713,
+              "index": "spike-docs",
+              "id": "fe4fa75c4775e65cf29f7b79c91db3e8"
+            },
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 3.7029362,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            }
+          ]
+        }
+      ],
+      "indexed_records": 3719,
+      "indices": [
+        {
+          "health": "green",
+          "status": "open",
+          "index": "spike-docs",
+          "uuid": "188d6113-0794-bdcf-94ce-9baad7faee0a",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "3715",
+          "docs.deleted": "0",
+          "store.size": "4mb",
+          "pri.store.size": "4mb"
+        },
+        {
+          "health": "green",
+          "status": "open",
+          "index": "spike-diagnostics",
+          "uuid": "eae32a75-01bd-5686-116f-a1aa8836dd45",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "4",
+          "docs.deleted": "0",
+          "store.size": "13.1kb",
+          "pri.store.size": "13.1kb"
+        },
+        {
+          "health": "green",
+          "status": "open",
+          "index": "autoindex-catalog",
+          "uuid": "e1fe6145-1ddb-1bf1-6693-2fc9a0eb64bf",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "95",
+          "docs.deleted": "0",
+          "store.size": "83.8kb",
+          "pri.store.size": "83.8kb"
+        }
+      ],
+      "first_pass_ms": {
+        "n": 32,
+        "p50": 17.73,
+        "p95": 30.845,
+        "max": 279.936
+      },
+      "warm_ms": {
+        "n": 160,
+        "p50": 11.674,
+        "p95": 20.347,
+        "max": 27.796
+      },
+      "warm_category_ms": {
+        "english": {
+          "n": 40,
+          "p50": 11.554,
+          "p95": 17.996,
+          "max": 25.63
+        },
+        "negative_exact": {
+          "n": 10,
+          "p50": 9.697,
+          "p95": 18.3,
+          "max": 18.3
+        },
+        "negative_natural": {
+          "n": 10,
+          "p50": 10.627,
+          "p95": 24.577,
+          "max": 24.577
+        },
+        "symbol": {
+          "n": 40,
+          "p50": 11.598,
+          "p95": 17.729,
+          "max": 22.242
+        },
+        "synthetic_log": {
+          "n": 20,
+          "p50": 12.244,
+          "p95": 27.703,
+          "max": 27.796
+        },
+        "vietnamese": {
+          "n": 40,
+          "p50": 12.149,
+          "p95": 19.512,
+          "max": 20.475
+        }
+      },
+      "rank_changes_across_warm_rounds": 0,
+      "server_peak_hwm_kib": 276176,
+      "server_query_peak_rss_kib": 206324,
+      "indexer_observed_peak_hwm_kib": 133908,
+      "combined_sampled_peak_rss_kib": 404436,
+      "guest_min_available_kib": 547416,
+      "host_qemu_peak_rss_bytes": 728621056,
+      "host_sandbox_peak_allocated_bytes": 233963520,
+      "freshness_added_hit_at_5": false,
+      "incremental_probes": [
+        {
+          "probe": "unchanged-index",
+          "elapsed_ms": "979.555",
+          "error": "unchanged-index exited signal: 4 (SIGILL)"
+        },
+        {
+          "probe": "changed-index",
+          "elapsed_ms": "1004.856",
+          "error": "changed-index exited signal: 4 (SIGILL)"
+        }
+      ],
+      "integration_checks_passed": false,
+      "bm25_only_mapping_verified": true
+    },
+    {
+      "run": 2,
+      "measurements": {
+        "startup_ms": 5551.485,
+        "index_ms": 55005.169,
+        "initial_data_logical_bytes": 4505370.0,
+        "initial_data_allocated_bytes": 6922240.0,
+        "xerj-data_logical_bytes": 4549415.0,
+        "xerj-data_allocated_bytes": 6967296.0,
+        "autoindex-state_logical_bytes": 9815294.0,
+        "autoindex-state_allocated_bytes": 10010624.0
+      },
+      "quality": {
+        "all_positive": {
+          "n": 28,
+          "hit_at_1": 18,
+          "hit_at_5": 23,
+          "mrr_at_5": 0.7321428571428571
+        },
+        "english": {
+          "n": 8,
+          "hit_at_1": 2,
+          "hit_at_5": 7,
+          "mrr_at_5": 0.5625
+        },
+        "negative_exact": {
+          "n": 2,
+          "empty_results": 2
+        },
+        "negative_natural": {
+          "n": 2,
+          "empty_results": 1
+        },
+        "symbol": {
+          "n": 8,
+          "hit_at_1": 8,
+          "hit_at_5": 8,
+          "mrr_at_5": 1.0
+        },
+        "synthetic_log": {
+          "n": 4,
+          "hit_at_1": 0,
+          "hit_at_5": 0,
+          "mrr_at_5": 0.0
+        },
+        "vietnamese": {
+          "n": 8,
+          "hit_at_1": 8,
+          "hit_at_5": 8,
+          "mrr_at_5": 1.0
+        }
+      },
+      "queries": [
+        {
+          "id": "s01",
+          "category": "symbol",
+          "query": "validate_guest_path",
+          "relevant": [
+            "crates/sandbox-runtime/src/manager.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 2882,
+              "name": "validate_guest_path",
+              "score": 36.33274,
+              "index": "spike-docs",
+              "id": "655f4d05170c1396a5efdd25bc6d4425"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 892,
+              "name": "validate_guest_path",
+              "score": 36.33274,
+              "index": "spike-docs",
+              "id": "7e32599401e817161094c00d419ffcb2"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 1,
+              "name": null,
+              "score": 7.139806,
+              "index": "spike-docs",
+              "id": "4a4551192ba59fae5080b0a9c4ec3da5"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.2251606,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 3.837088,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "s02",
+          "category": "symbol",
+          "query": "is_forbidden_ipv6",
+          "relevant": [
+            "crates/sandbox-runtime/src/egress.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 53,
+              "name": "is_forbidden_ipv6",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "774aa7523674ccaf345cca2c07c6a453"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.970672,
+              "index": "spike-docs",
+              "id": "ed7b11edd03fc277f57040320631fdfd"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.1223626,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            }
+          ]
+        },
+        {
+          "id": "s03",
+          "category": "symbol",
+          "query": "extract_tar_safely",
+          "relevant": [
+            "crates/sandbox-core/src/safe_tar.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 410,
+              "name": "extract_tar_safely",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "a7d9db0963473520aa6330aaebd82dec"
+            },
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.229921,
+              "index": "spike-docs",
+              "id": "d42a837fdc108b6f701164e64d1ee553"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.4007916,
+              "index": "spike-docs",
+              "id": "1c13a41bb2a288ea8db192574c123b28"
+            },
+            {
+              "path": "crates/sandbox-client/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 4.994177,
+              "index": "spike-docs",
+              "id": "cbd6a3cc30998640ac4151eb78e699ac"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 4.9188557,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            }
+          ]
+        },
+        {
+          "id": "s04",
+          "category": "symbol",
+          "query": "WindowsJobObject",
+          "relevant": [
+            "crates/sandbox-vmm/src/os/windows_job.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 61,
+              "name": "WindowsJobObject",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "027045ab49528497f34a772582ce73ed"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.229921,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            }
+          ]
+        },
+        {
+          "id": "s05",
+          "category": "symbol",
+          "query": "BundleVerifier",
+          "relevant": [
+            "crates/sandbox-image/src/crypto.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 24,
+              "name": "BundleVerifier",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e36d706c041e9e9c0326497ab092a56f"
+            },
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 1,
+              "name": null,
+              "score": 14.906849,
+              "index": "spike-docs",
+              "id": "861e788af186f83489d9e18f19495a67"
+            },
+            {
+              "path": "bins/sandboxd/src/config.rs",
+              "line": 63,
+              "name": "load_verifier",
+              "score": 5.4485536,
+              "index": "spike-docs",
+              "id": "c88291dc00c7555daddca83fb4bd1460"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase2_bundle_e2e.rs",
+              "line": 54,
+              "name": "discover_phase2_artifacts",
+              "score": 5.1529903,
+              "index": "spike-docs",
+              "id": "27edcee7de8d8c610700633beb1afa06"
+            },
+            {
+              "path": "crates/sandbox-image/src/installer.rs",
+              "line": 194,
+              "name": "verify_installed_bundle_once",
+              "score": 4.8878436,
+              "index": "spike-docs",
+              "id": "4186b763d0a5cf1b81fde58fa4d0e6ac"
+            }
+          ]
+        },
+        {
+          "id": "s06",
+          "category": "symbol",
+          "query": "ClientExecStream",
+          "relevant": [
+            "crates/sandbox-client/src/client.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 268,
+              "name": "ClientExecStream",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "1f158f14f40c8a64075caedb4ae3e75c"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 1,
+              "name": null,
+              "score": 8.170652,
+              "index": "spike-docs",
+              "id": "4a4551192ba59fae5080b0a9c4ec3da5"
+            },
+            {
+              "path": "crates/sandbox-client/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.091058,
+              "index": "spike-docs",
+              "id": "21389335ff484d70313c38eeafa2d3ab"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 703,
+              "name": "exec_stream",
+              "score": 5.719555,
+              "index": "spike-docs",
+              "id": "fb35d6959015be9198f24210a62be3ec"
+            },
+            {
+              "path": "README.md",
+              "line": 594,
+              "name": null,
+              "score": 5.5529356,
+              "index": "spike-docs",
+              "id": "62c3f29141584aa66076677b609abc8a"
+            }
+          ]
+        },
+        {
+          "id": "s07",
+          "category": "symbol",
+          "query": "WarmPoolKey",
+          "relevant": [
+            "crates/sandbox-runtime/src/warm_pool.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 82,
+              "name": "WarmPoolKey",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e109af74a98654b5002de404f3dffb87"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.014936,
+              "index": "spike-docs",
+              "id": "7bac951f1fd003242a4f6e03441b92cf"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 333,
+              "name": "pop_for_checkout",
+              "score": 6.2793493,
+              "index": "spike-docs",
+              "id": "b778d83dc726681d603b19af7b5df4b1"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.608769,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 1.9269515,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "s08",
+          "category": "symbol",
+          "query": "cleanup_artifacts_with_backoff",
+          "relevant": [
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 428,
+              "name": "cleanup_artifacts_with_backoff",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e3f8f342192a7e62851da82263e27e10"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.604757,
+              "index": "spike-docs",
+              "id": "4e51ebe3dabebc08208afdf94d49336c"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.608769,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 2.38015,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "e01",
+          "category": "english",
+          "query": "kill QEMU when Windows job handle closes",
+          "relevant": [
+            "crates/sandbox-vmm/src/os/windows_job.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-vmm/src/os/mod.rs",
+              "line": 1,
+              "name": null,
+              "score": 19.500195,
+              "index": "spike-docs",
+              "id": "1c28d0b78ec25d3453d3797beff45171"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.550494,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            },
+            {
+              "path": "README.md",
+              "line": 75,
+              "name": null,
+              "score": 12.6666975,
+              "index": "spike-docs",
+              "id": "e01d680a9e5c062994e89f03f9e2ed0f"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/process.rs",
+              "line": 1,
+              "name": null,
+              "score": 12.426819,
+              "index": "spike-docs",
+              "id": "9fdf95ae0de6f47a2b87c1c60609b85a"
+            },
+            {
+              "path": "guest/sandbox-agent/src/tunnel.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.853205,
+              "index": "spike-docs",
+              "id": "5611c94b57029e093107339c297d7ea3"
+            }
+          ]
+        },
+        {
+          "id": "e02",
+          "category": "english",
+          "query": "reject symbolic links and parent directory traversal when extracting tar",
+          "relevant": [
+            "crates/sandbox-core/src/safe_tar.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "guest/sandbox-agent/src/copy_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 17.504097,
+              "index": "spike-docs",
+              "id": "c74f56eba05ee24f36944a177026c09d"
+            },
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 14.715469,
+              "index": "spike-docs",
+              "id": "d42a837fdc108b6f701164e64d1ee553"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 46,
+              "name": null,
+              "score": 11.565267,
+              "index": "spike-docs",
+              "id": "b0f500bb7f3916e4152220ff7e459f63"
+            },
+            {
+              "path": "README.md",
+              "line": 275,
+              "name": null,
+              "score": 10.646903,
+              "index": "spike-docs",
+              "id": "f85a25311a9f1755ad8df7c8dcc446b4"
+            },
+            {
+              "path": "bins/sandbox-cli/src/image_build.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.481231,
+              "index": "spike-docs",
+              "id": "3bd34e661ed94b8c12e86a5713c40435"
+            }
+          ]
+        },
+        {
+          "id": "e03",
+          "category": "english",
+          "query": "resolve DNS reject private IP connect validated address",
+          "relevant": [
+            "crates/sandbox-runtime/src/egress.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 35,
+              "name": null,
+              "score": 21.367285,
+              "index": "spike-docs",
+              "id": "dccfa3947b2a3150811a950e8710f80d"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 1,
+              "name": null,
+              "score": 20.390547,
+              "index": "spike-docs",
+              "id": "ed7b11edd03fc277f57040320631fdfd"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.95842,
+              "index": "spike-docs",
+              "id": "f81ad6027ff7cd8aabca6fc7c12191ec"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.565753,
+              "index": "spike-docs",
+              "id": "f0db40df18ed5fec673a7c79d752f443"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 78,
+              "name": null,
+              "score": 14.936654,
+              "index": "spike-docs",
+              "id": "42ddd61089d61578e276bf27230a9d60"
+            }
+          ]
+        },
+        {
+          "id": "e04",
+          "category": "english",
+          "query": "retry artifact cleanup exponential backoff",
+          "relevant": [
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 1,
+              "name": null,
+              "score": 19.002039,
+              "index": "spike-docs",
+              "id": "4e51ebe3dabebc08208afdf94d49336c"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/spike.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.89072,
+              "index": "spike-docs",
+              "id": "c5aafc0afd2d8827f9385826d01b0dff"
+            },
+            {
+              "path": "README.md",
+              "line": 411,
+              "name": null,
+              "score": 6.7359076,
+              "index": "spike-docs",
+              "id": "cc69753cc46c05624c024cbc8ef08802"
+            },
+            {
+              "path": "crates/sandbox-image/src/installer.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.637302,
+              "index": "spike-docs",
+              "id": "94cd9535914f42815f5a0b3115a5c630"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 82,
+              "name": null,
+              "score": 6.421246,
+              "index": "spike-docs",
+              "id": "48ded8a28b8f58b9844490786f045323"
+            }
+          ]
+        },
+        {
+          "id": "e05",
+          "category": "english",
+          "query": "collect stdout stderr execution deadline",
+          "relevant": [
+            "crates/sandbox-runtime/src/exec_stream.rs",
+            "crates/sandbox-client/src/client.rs"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "bins/sandboxd/src/doctor.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.159928,
+              "index": "spike-docs",
+              "id": "2c0ab19918e3f14eb77c1806ce47a622"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 18,
+              "name": "OutputStreamKind",
+              "score": 10.418163,
+              "index": "spike-docs",
+              "id": "5b58496b1e3091a439b792af0f372867"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 246,
+              "name": "ClientOutputKind",
+              "score": 10.418163,
+              "index": "spike-docs",
+              "id": "5fe8b481e55e7677ad1f3e21de0341f8"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.033989,
+              "index": "spike-docs",
+              "id": "83586400b3deb39e6b38b869b1944893"
+            },
+            {
+              "path": "bins/sandbox-cli/src/run.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.30718,
+              "index": "spike-docs",
+              "id": "87d06fec86acb4c222ba19b869ff0c09"
+            }
+          ]
+        },
+        {
+          "id": "e06",
+          "category": "english",
+          "query": "FIFO admission queue timeout",
+          "relevant": [
+            "crates/sandbox-runtime/src/admission.rs"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.730255,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/admission.rs",
+              "line": 1,
+              "name": null,
+              "score": 12.625036,
+              "index": "spike-docs",
+              "id": "ce7e37413e0e178405f10ca7b03a27e5"
+            },
+            {
+              "path": "README.md",
+              "line": 275,
+              "name": null,
+              "score": 11.587902,
+              "index": "spike-docs",
+              "id": "f85a25311a9f1755ad8df7c8dcc446b4"
+            },
+            {
+              "path": "crates/sandbox-protocol/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.458124,
+              "index": "spike-docs",
+              "id": "c89369d4f411f367525863206d7ae524"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.311155,
+              "index": "spike-docs",
+              "id": "f0db40df18ed5fec673a7c79d752f443"
+            }
+          ]
+        },
+        {
+          "id": "e07",
+          "category": "english",
+          "query": "Ed25519 manifest signature validation",
+          "relevant": [
+            "crates/sandbox-image/src/crypto.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-image/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.47587,
+              "index": "spike-docs",
+              "id": "50ce17b0de72cd0dd97b7542e721dc4a"
+            },
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.422195,
+              "index": "spike-docs",
+              "id": "861e788af186f83489d9e18f19495a67"
+            },
+            {
+              "path": "README.md",
+              "line": 66,
+              "name": null,
+              "score": 12.721809,
+              "index": "spike-docs",
+              "id": "a3991a7178b56ee171d77ccea4d83391"
+            },
+            {
+              "path": "README.md",
+              "line": 157,
+              "name": null,
+              "score": 11.849428,
+              "index": "spike-docs",
+              "id": "647a64dc0f478f6f99ed8e07f583f3ad"
+            },
+            {
+              "path": "crates/sandbox-image/src/manifest.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.26656,
+              "index": "spike-docs",
+              "id": "289607b116abb59721059e7b7ace4abb"
+            }
+          ]
+        },
+        {
+          "id": "e08",
+          "category": "english",
+          "query": "warm pool discard used virtual machines",
+          "relevant": [
+            "crates/sandbox-runtime/src/warm_pool.rs",
+            "crates/sandbox-runtime/src/manager.rs",
+            "BRD.md"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "README.md",
+              "line": 594,
+              "name": null,
+              "score": 9.607528,
+              "index": "spike-docs",
+              "id": "62c3f29141584aa66076677b609abc8a"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.297956,
+              "index": "spike-docs",
+              "id": "5a1777eb6750dc8e49e8346540ffa43e"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 54,
+              "name": null,
+              "score": 9.289403,
+              "index": "spike-docs",
+              "id": "31c6ca56e27b1856bae9f2166c67d770"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 82,
+              "name": null,
+              "score": 8.981519,
+              "index": "spike-docs",
+              "id": "48ded8a28b8f58b9844490786f045323"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 39,
+              "name": "Accelerator",
+              "score": 6.792992,
+              "index": "spike-docs",
+              "id": "136ee3ad771cedccae165a4fe2889123"
+            }
+          ]
+        },
+        {
+          "id": "v01",
+          "category": "vietnamese",
+          "query": "chặn địa chỉ IPv6 nội bộ",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/egress.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 27.714954,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 26.482615,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 273,
+              "name": null,
+              "score": 21.295849,
+              "index": "spike-docs",
+              "id": "71fb1b13555b3e05ad92a228555a0fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 258,
+              "name": null,
+              "score": 12.765456,
+              "index": "spike-docs",
+              "id": "893ad6b843ef743750a1693e6d8e330e"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 12.689932,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v02",
+          "category": "vietnamese",
+          "query": "từ chối symlink khi giải nén",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-core/src/safe_tar.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 26.940186,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 200,
+              "name": null,
+              "score": 19.110626,
+              "index": "spike-docs",
+              "id": "b8b2c0a0e314578de0688bb473ff295a"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 18.781235,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 17.125626,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 16.955118,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            }
+          ]
+        },
+        {
+          "id": "v03",
+          "category": "vietnamese",
+          "query": "thu hồi máy ảo khi hết hạn thuê",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/manager.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 29.716507,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            },
+            {
+              "path": "BRD.md",
+              "line": 289,
+              "name": null,
+              "score": 27.511322,
+              "index": "spike-docs",
+              "id": "9f1811bf0b2ed7ccab36e2127897bbca"
+            },
+            {
+              "path": "BRD.md",
+              "line": 278,
+              "name": null,
+              "score": 24.895338,
+              "index": "spike-docs",
+              "id": "934e30ac723f4086970a2482196a3cbe"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 23.291334,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 21.064007,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v04",
+          "category": "vietnamese",
+          "query": "không tự chuyển sang kernel dùng chung",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 25,
+              "name": null,
+              "score": 27.976181,
+              "index": "spike-docs",
+              "id": "5d5e50ccc935da6e429dc56dba40fd15"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 25.756826,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 22.88925,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 19.423792,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 212,
+              "name": null,
+              "score": 18.602676,
+              "index": "spike-docs",
+              "id": "34b2e74fa9365eef8219aa454863885c"
+            }
+          ]
+        },
+        {
+          "id": "v05",
+          "category": "vietnamese",
+          "query": "thư mục và socket chỉ chủ sở hữu được truy cập",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 172,
+              "name": null,
+              "score": 45.948013,
+              "index": "spike-docs",
+              "id": "89c9bcc84fff78bfe6deb3943cef2fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 35.687946,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 35.488148,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 30.69389,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 273,
+              "name": null,
+              "score": 28.742765,
+              "index": "spike-docs",
+              "id": "71fb1b13555b3e05ad92a228555a0fec"
+            }
+          ]
+        },
+        {
+          "id": "v06",
+          "category": "vietnamese",
+          "query": "kiểm tra chữ ký trước khi cài gói",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-image/src/crypto.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 212,
+              "name": null,
+              "score": 33.115578,
+              "index": "spike-docs",
+              "id": "34b2e74fa9365eef8219aa454863885c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 27.937466,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 27.361727,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 57,
+              "name": null,
+              "score": 23.550457,
+              "index": "spike-docs",
+              "id": "fe4fa75c4775e65cf29f7b79c91db3e8"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 22.56102,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            }
+          ]
+        },
+        {
+          "id": "v07",
+          "category": "vietnamese",
+          "query": "giới hạn bộ nhớ thực trên máy chủ",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 172,
+              "name": null,
+              "score": 34.180714,
+              "index": "spike-docs",
+              "id": "89c9bcc84fff78bfe6deb3943cef2fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 29.685446,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 25.379166,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 25.058754,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 25.008781,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v08",
+          "category": "vietnamese",
+          "query": "phục hồi tiến trình mồ côi sau crash",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 34.43523,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 31.225533,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            },
+            {
+              "path": "BRD.md",
+              "line": 278,
+              "name": null,
+              "score": 30.917372,
+              "index": "spike-docs",
+              "id": "934e30ac723f4086970a2482196a3cbe"
+            },
+            {
+              "path": "BRD.md",
+              "line": 289,
+              "name": null,
+              "score": 29.930733,
+              "index": "spike-docs",
+              "id": "9f1811bf0b2ed7ccab36e2127897bbca"
+            },
+            {
+              "path": "BRD.md",
+              "line": 152,
+              "name": null,
+              "score": 19.686296,
+              "index": "spike-docs",
+              "id": "81d9d8f4c4e0ae0a7d213c517c896c1e"
+            }
+          ]
+        },
+        {
+          "id": "l01",
+          "category": "synthetic_log",
+          "query": "stdout budget exceeded",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 985,
+              "name": "encode_resource_budget",
+              "score": 8.897972,
+              "index": "spike-docs",
+              "id": "e1d5ad0c1c0562a692c50c99ef1ffe96"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 202,
+              "name": "parse_accel_help",
+              "score": 6.247135,
+              "index": "spike-docs",
+              "id": "084fb2b4a52d26b9dff803a360822a69"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.9797144,
+              "index": "spike-docs",
+              "id": "83586400b3deb39e6b38b869b1944893"
+            },
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 571,
+              "name": "ExecWireEvent",
+              "score": 5.6042433,
+              "index": "spike-docs",
+              "id": "de8e2e1e6cfa8cb17f1b20f87b101a53"
+            },
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.4735665,
+              "index": "spike-docs",
+              "id": "4ea50a77a471ab91b985df53349fee8a"
+            }
+          ]
+        },
+        {
+          "id": "l02",
+          "category": "synthetic_log",
+          "query": "guest handshake deadline expired",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "guest/sandbox-agent/src/supervisor.rs",
+              "line": 328,
+              "name": "PreparedCommand",
+              "score": 8.778598,
+              "index": "spike-docs",
+              "id": "e41e55fa6833e29bcbac6357a71f5dbe"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.920901,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase3_runtime_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.426877,
+              "index": "spike-docs",
+              "id": "f3985803f0c8135960e9a497d9292213"
+            },
+            {
+              "path": "crates/sandbox-protocol/src/message.rs",
+              "line": 9,
+              "name": "ExecTargetWire",
+              "score": 5.7714167,
+              "index": "spike-docs",
+              "id": "550f26f2eb9ba33edab1ba65da985b9b"
+            },
+            {
+              "path": "crates/sandbox-core/src/exec.rs",
+              "line": 7,
+              "name": "ExecTarget",
+              "score": 5.7714167,
+              "index": "spike-docs",
+              "id": "c8c06a8704658e93efaa765683d12cde"
+            }
+          ]
+        },
+        {
+          "id": "l03",
+          "category": "synthetic_log",
+          "query": "overlay cleanup access denied",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "bins/sandboxd/tests/phase7_rc_drill_and_ipc_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.638678,
+              "index": "spike-docs",
+              "id": "604710de2dc84689b6f3f8a5a0f122ca"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase4_docker_compat_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.3077874,
+              "index": "spike-docs",
+              "id": "e25fa51a5cb884d4a3a738ebd17de037"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.106533,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 3189,
+              "name": "remove_overlay_artifacts_with",
+              "score": 6.068384,
+              "index": "spike-docs",
+              "id": "511cd5dc15910152eb1da4ef7004ae2e"
+            },
+            {
+              "path": "crates/sandbox-docker-compat/src/policy.rs",
+              "line": 110,
+              "name": "ReaperSocketPolicy",
+              "score": 5.860406,
+              "index": "spike-docs",
+              "id": "e6c269887abcdf9fab467dfbe9b590d0"
+            }
+          ]
+        },
+        {
+          "id": "l04",
+          "category": "synthetic_log",
+          "query": "host RSS admission rejected",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.730255,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 5,
+              "name": "admission",
+              "score": 9.108927,
+              "index": "spike-docs",
+              "id": "2cbe05367a032af7ccbe60dec400be2d"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/admission.rs",
+              "line": 1,
+              "name": null,
+              "score": 8.213571,
+              "index": "spike-docs",
+              "id": "ce7e37413e0e178405f10ca7b03a27e5"
+            },
+            {
+              "path": "README.md",
+              "line": 244,
+              "name": null,
+              "score": 7.7189593,
+              "index": "spike-docs",
+              "id": "6cadad650fa8424c49c7c09064bcd445"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 7.342722,
+              "index": "spike-docs",
+              "id": "f81ad6027ff7cd8aabca6fc7c12191ec"
+            }
+          ]
+        },
+        {
+          "id": "n01",
+          "category": "negative_exact",
+          "query": "absentmarkerf6cb739d48814df8ba66771268fabafe",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n02",
+          "category": "negative_exact",
+          "query": "absentmarker752de35d1f494afc94e40f5f61f5eb7e",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n03",
+          "category": "negative_natural",
+          "query": "photosynthesis chloroplast chlorophyll",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n04",
+          "category": "negative_natural",
+          "query": "diệp lục quang hợp lá cây",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 9.144461,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 152,
+              "name": null,
+              "score": 6.184545,
+              "index": "spike-docs",
+              "id": "81d9d8f4c4e0ae0a7d213c517c896c1e"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 4.3541713,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 57,
+              "name": null,
+              "score": 4.3541713,
+              "index": "spike-docs",
+              "id": "fe4fa75c4775e65cf29f7b79c91db3e8"
+            },
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 3.7029362,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            }
+          ]
+        }
+      ],
+      "indexed_records": 3719,
+      "indices": [
+        {
+          "health": "green",
+          "status": "open",
+          "index": "spike-diagnostics",
+          "uuid": "eae32a75-01bd-5686-116f-a1aa8836dd45",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "4",
+          "docs.deleted": "0",
+          "store.size": "13.1kb",
+          "pri.store.size": "13.1kb"
+        },
+        {
+          "health": "green",
+          "status": "open",
+          "index": "autoindex-catalog",
+          "uuid": "e1fe6145-1ddb-1bf1-6693-2fc9a0eb64bf",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "95",
+          "docs.deleted": "0",
+          "store.size": "83.8kb",
+          "pri.store.size": "83.8kb"
+        },
+        {
+          "health": "green",
+          "status": "open",
+          "index": "spike-docs",
+          "uuid": "188d6113-0794-bdcf-94ce-9baad7faee0a",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "3715",
+          "docs.deleted": "0",
+          "store.size": "4mb",
+          "pri.store.size": "4mb"
+        }
+      ],
+      "first_pass_ms": {
+        "n": 32,
+        "p50": 15.537,
+        "p95": 30.194,
+        "max": 276.097
+      },
+      "warm_ms": {
+        "n": 160,
+        "p50": 10.679,
+        "p95": 17.642,
+        "max": 23.728
+      },
+      "warm_category_ms": {
+        "english": {
+          "n": 40,
+          "p50": 10.741,
+          "p95": 13.563,
+          "max": 14.479
+        },
+        "negative_exact": {
+          "n": 10,
+          "p50": 9.438,
+          "p95": 23.728,
+          "max": 23.728
+        },
+        "negative_natural": {
+          "n": 10,
+          "p50": 11.901,
+          "p95": 20.247,
+          "max": 20.247
+        },
+        "symbol": {
+          "n": 40,
+          "p50": 10.602,
+          "p95": 18.278,
+          "max": 22.977
+        },
+        "synthetic_log": {
+          "n": 20,
+          "p50": 10.971,
+          "p95": 15.995,
+          "max": 18.739
+        },
+        "vietnamese": {
+          "n": 40,
+          "p50": 9.732,
+          "p95": 15.068,
+          "max": 16.315
+        }
+      },
+      "rank_changes_across_warm_rounds": 0,
+      "server_peak_hwm_kib": 274988,
+      "server_query_peak_rss_kib": 199040,
+      "indexer_observed_peak_hwm_kib": 134436,
+      "combined_sampled_peak_rss_kib": 403384,
+      "guest_min_available_kib": 547756,
+      "host_qemu_peak_rss_bytes": 726417408,
+      "host_sandbox_peak_allocated_bytes": 233897984,
+      "freshness_added_hit_at_5": false,
+      "incremental_probes": [
+        {
+          "probe": "unchanged-index",
+          "elapsed_ms": "949.729",
+          "error": "unchanged-index exited signal: 4 (SIGILL)"
+        },
+        {
+          "probe": "changed-index",
+          "elapsed_ms": "969.737",
+          "error": "changed-index exited signal: 4 (SIGILL)"
+        }
+      ],
+      "integration_checks_passed": false,
+      "bm25_only_mapping_verified": true
+    },
+    {
+      "run": 3,
+      "measurements": {
+        "startup_ms": 5965.135,
+        "index_ms": 54906.376,
+        "initial_data_logical_bytes": 4505374.0,
+        "initial_data_allocated_bytes": 6922240.0,
+        "xerj-data_logical_bytes": 4549425.0,
+        "xerj-data_allocated_bytes": 6967296.0,
+        "autoindex-state_logical_bytes": 9815294.0,
+        "autoindex-state_allocated_bytes": 10010624.0
+      },
+      "quality": {
+        "all_positive": {
+          "n": 28,
+          "hit_at_1": 18,
+          "hit_at_5": 23,
+          "mrr_at_5": 0.7321428571428571
+        },
+        "english": {
+          "n": 8,
+          "hit_at_1": 2,
+          "hit_at_5": 7,
+          "mrr_at_5": 0.5625
+        },
+        "negative_exact": {
+          "n": 2,
+          "empty_results": 2
+        },
+        "negative_natural": {
+          "n": 2,
+          "empty_results": 1
+        },
+        "symbol": {
+          "n": 8,
+          "hit_at_1": 8,
+          "hit_at_5": 8,
+          "mrr_at_5": 1.0
+        },
+        "synthetic_log": {
+          "n": 4,
+          "hit_at_1": 0,
+          "hit_at_5": 0,
+          "mrr_at_5": 0.0
+        },
+        "vietnamese": {
+          "n": 8,
+          "hit_at_1": 8,
+          "hit_at_5": 8,
+          "mrr_at_5": 1.0
+        }
+      },
+      "queries": [
+        {
+          "id": "s01",
+          "category": "symbol",
+          "query": "validate_guest_path",
+          "relevant": [
+            "crates/sandbox-runtime/src/manager.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 2882,
+              "name": "validate_guest_path",
+              "score": 36.33274,
+              "index": "spike-docs",
+              "id": "655f4d05170c1396a5efdd25bc6d4425"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 892,
+              "name": "validate_guest_path",
+              "score": 36.33274,
+              "index": "spike-docs",
+              "id": "7e32599401e817161094c00d419ffcb2"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 1,
+              "name": null,
+              "score": 7.139806,
+              "index": "spike-docs",
+              "id": "4a4551192ba59fae5080b0a9c4ec3da5"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.2251606,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 3.837088,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "s02",
+          "category": "symbol",
+          "query": "is_forbidden_ipv6",
+          "relevant": [
+            "crates/sandbox-runtime/src/egress.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 53,
+              "name": "is_forbidden_ipv6",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "774aa7523674ccaf345cca2c07c6a453"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.970672,
+              "index": "spike-docs",
+              "id": "ed7b11edd03fc277f57040320631fdfd"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.1223626,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            }
+          ]
+        },
+        {
+          "id": "s03",
+          "category": "symbol",
+          "query": "extract_tar_safely",
+          "relevant": [
+            "crates/sandbox-core/src/safe_tar.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 410,
+              "name": "extract_tar_safely",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "a7d9db0963473520aa6330aaebd82dec"
+            },
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.229921,
+              "index": "spike-docs",
+              "id": "d42a837fdc108b6f701164e64d1ee553"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.4007916,
+              "index": "spike-docs",
+              "id": "1c13a41bb2a288ea8db192574c123b28"
+            },
+            {
+              "path": "crates/sandbox-client/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 4.994177,
+              "index": "spike-docs",
+              "id": "cbd6a3cc30998640ac4151eb78e699ac"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 4.9188557,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            }
+          ]
+        },
+        {
+          "id": "s04",
+          "category": "symbol",
+          "query": "WindowsJobObject",
+          "relevant": [
+            "crates/sandbox-vmm/src/os/windows_job.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 61,
+              "name": "WindowsJobObject",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "027045ab49528497f34a772582ce73ed"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.229921,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            }
+          ]
+        },
+        {
+          "id": "s05",
+          "category": "symbol",
+          "query": "BundleVerifier",
+          "relevant": [
+            "crates/sandbox-image/src/crypto.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 24,
+              "name": "BundleVerifier",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e36d706c041e9e9c0326497ab092a56f"
+            },
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 1,
+              "name": null,
+              "score": 14.906849,
+              "index": "spike-docs",
+              "id": "861e788af186f83489d9e18f19495a67"
+            },
+            {
+              "path": "bins/sandboxd/src/config.rs",
+              "line": 63,
+              "name": "load_verifier",
+              "score": 5.4485536,
+              "index": "spike-docs",
+              "id": "c88291dc00c7555daddca83fb4bd1460"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase2_bundle_e2e.rs",
+              "line": 54,
+              "name": "discover_phase2_artifacts",
+              "score": 5.1529903,
+              "index": "spike-docs",
+              "id": "27edcee7de8d8c610700633beb1afa06"
+            },
+            {
+              "path": "crates/sandbox-image/src/installer.rs",
+              "line": 194,
+              "name": "verify_installed_bundle_once",
+              "score": 4.8878436,
+              "index": "spike-docs",
+              "id": "4186b763d0a5cf1b81fde58fa4d0e6ac"
+            }
+          ]
+        },
+        {
+          "id": "s06",
+          "category": "symbol",
+          "query": "ClientExecStream",
+          "relevant": [
+            "crates/sandbox-client/src/client.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 268,
+              "name": "ClientExecStream",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "1f158f14f40c8a64075caedb4ae3e75c"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 1,
+              "name": null,
+              "score": 8.170652,
+              "index": "spike-docs",
+              "id": "4a4551192ba59fae5080b0a9c4ec3da5"
+            },
+            {
+              "path": "crates/sandbox-client/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.091058,
+              "index": "spike-docs",
+              "id": "21389335ff484d70313c38eeafa2d3ab"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 703,
+              "name": "exec_stream",
+              "score": 5.719555,
+              "index": "spike-docs",
+              "id": "fb35d6959015be9198f24210a62be3ec"
+            },
+            {
+              "path": "README.md",
+              "line": 594,
+              "name": null,
+              "score": 5.5529356,
+              "index": "spike-docs",
+              "id": "62c3f29141584aa66076677b609abc8a"
+            }
+          ]
+        },
+        {
+          "id": "s07",
+          "category": "symbol",
+          "query": "WarmPoolKey",
+          "relevant": [
+            "crates/sandbox-runtime/src/warm_pool.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 82,
+              "name": "WarmPoolKey",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e109af74a98654b5002de404f3dffb87"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.014936,
+              "index": "spike-docs",
+              "id": "7bac951f1fd003242a4f6e03441b92cf"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/warm_pool.rs",
+              "line": 333,
+              "name": "pop_for_checkout",
+              "score": 6.2793493,
+              "index": "spike-docs",
+              "id": "b778d83dc726681d603b19af7b5df4b1"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.608769,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 1.9269515,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "s08",
+          "category": "symbol",
+          "query": "cleanup_artifacts_with_backoff",
+          "relevant": [
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 428,
+              "name": "cleanup_artifacts_with_backoff",
+              "score": 38.886868,
+              "index": "spike-docs",
+              "id": "e3f8f342192a7e62851da82263e27e10"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.604757,
+              "index": "spike-docs",
+              "id": "4e51ebe3dabebc08208afdf94d49336c"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.608769,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 2.38015,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            }
+          ]
+        },
+        {
+          "id": "e01",
+          "category": "english",
+          "query": "kill QEMU when Windows job handle closes",
+          "relevant": [
+            "crates/sandbox-vmm/src/os/windows_job.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-vmm/src/os/mod.rs",
+              "line": 1,
+              "name": null,
+              "score": 19.500195,
+              "index": "spike-docs",
+              "id": "1c28d0b78ec25d3453d3797beff45171"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.550494,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            },
+            {
+              "path": "README.md",
+              "line": 75,
+              "name": null,
+              "score": 12.6666975,
+              "index": "spike-docs",
+              "id": "e01d680a9e5c062994e89f03f9e2ed0f"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/process.rs",
+              "line": 1,
+              "name": null,
+              "score": 12.426819,
+              "index": "spike-docs",
+              "id": "9fdf95ae0de6f47a2b87c1c60609b85a"
+            },
+            {
+              "path": "guest/sandbox-agent/src/tunnel.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.853205,
+              "index": "spike-docs",
+              "id": "5611c94b57029e093107339c297d7ea3"
+            }
+          ]
+        },
+        {
+          "id": "e02",
+          "category": "english",
+          "query": "reject symbolic links and parent directory traversal when extracting tar",
+          "relevant": [
+            "crates/sandbox-core/src/safe_tar.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "guest/sandbox-agent/src/copy_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 17.504097,
+              "index": "spike-docs",
+              "id": "c74f56eba05ee24f36944a177026c09d"
+            },
+            {
+              "path": "crates/sandbox-core/src/safe_tar.rs",
+              "line": 1,
+              "name": null,
+              "score": 14.715469,
+              "index": "spike-docs",
+              "id": "d42a837fdc108b6f701164e64d1ee553"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 46,
+              "name": null,
+              "score": 11.565267,
+              "index": "spike-docs",
+              "id": "b0f500bb7f3916e4152220ff7e459f63"
+            },
+            {
+              "path": "README.md",
+              "line": 275,
+              "name": null,
+              "score": 10.646903,
+              "index": "spike-docs",
+              "id": "f85a25311a9f1755ad8df7c8dcc446b4"
+            },
+            {
+              "path": "bins/sandbox-cli/src/image_build.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.481231,
+              "index": "spike-docs",
+              "id": "3bd34e661ed94b8c12e86a5713c40435"
+            }
+          ]
+        },
+        {
+          "id": "e03",
+          "category": "english",
+          "query": "resolve DNS reject private IP connect validated address",
+          "relevant": [
+            "crates/sandbox-runtime/src/egress.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 35,
+              "name": null,
+              "score": 21.367285,
+              "index": "spike-docs",
+              "id": "dccfa3947b2a3150811a950e8710f80d"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/egress.rs",
+              "line": 1,
+              "name": null,
+              "score": 20.390547,
+              "index": "spike-docs",
+              "id": "ed7b11edd03fc277f57040320631fdfd"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.95842,
+              "index": "spike-docs",
+              "id": "f81ad6027ff7cd8aabca6fc7c12191ec"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.565753,
+              "index": "spike-docs",
+              "id": "f0db40df18ed5fec673a7c79d752f443"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 78,
+              "name": null,
+              "score": 14.936654,
+              "index": "spike-docs",
+              "id": "42ddd61089d61578e276bf27230a9d60"
+            }
+          ]
+        },
+        {
+          "id": "e04",
+          "category": "english",
+          "query": "retry artifact cleanup exponential backoff",
+          "relevant": [
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/journal.rs",
+              "line": 1,
+              "name": null,
+              "score": 19.002039,
+              "index": "spike-docs",
+              "id": "4e51ebe3dabebc08208afdf94d49336c"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/spike.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.89072,
+              "index": "spike-docs",
+              "id": "c5aafc0afd2d8827f9385826d01b0dff"
+            },
+            {
+              "path": "README.md",
+              "line": 411,
+              "name": null,
+              "score": 6.7359076,
+              "index": "spike-docs",
+              "id": "cc69753cc46c05624c024cbc8ef08802"
+            },
+            {
+              "path": "crates/sandbox-image/src/installer.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.637302,
+              "index": "spike-docs",
+              "id": "94cd9535914f42815f5a0b3115a5c630"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 82,
+              "name": null,
+              "score": 6.421246,
+              "index": "spike-docs",
+              "id": "48ded8a28b8f58b9844490786f045323"
+            }
+          ]
+        },
+        {
+          "id": "e05",
+          "category": "english",
+          "query": "collect stdout stderr execution deadline",
+          "relevant": [
+            "crates/sandbox-runtime/src/exec_stream.rs",
+            "crates/sandbox-client/src/client.rs"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "bins/sandboxd/src/doctor.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.159928,
+              "index": "spike-docs",
+              "id": "2c0ab19918e3f14eb77c1806ce47a622"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 18,
+              "name": "OutputStreamKind",
+              "score": 10.418163,
+              "index": "spike-docs",
+              "id": "5b58496b1e3091a439b792af0f372867"
+            },
+            {
+              "path": "crates/sandbox-client/src/client.rs",
+              "line": 246,
+              "name": "ClientOutputKind",
+              "score": 10.418163,
+              "index": "spike-docs",
+              "id": "5fe8b481e55e7677ad1f3e21de0341f8"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 1,
+              "name": null,
+              "score": 10.033989,
+              "index": "spike-docs",
+              "id": "83586400b3deb39e6b38b869b1944893"
+            },
+            {
+              "path": "bins/sandbox-cli/src/run.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.30718,
+              "index": "spike-docs",
+              "id": "87d06fec86acb4c222ba19b869ff0c09"
+            }
+          ]
+        },
+        {
+          "id": "e06",
+          "category": "english",
+          "query": "FIFO admission queue timeout",
+          "relevant": [
+            "crates/sandbox-runtime/src/admission.rs"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.730255,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/admission.rs",
+              "line": 1,
+              "name": null,
+              "score": 12.625036,
+              "index": "spike-docs",
+              "id": "ce7e37413e0e178405f10ca7b03a27e5"
+            },
+            {
+              "path": "README.md",
+              "line": 275,
+              "name": null,
+              "score": 11.587902,
+              "index": "spike-docs",
+              "id": "f85a25311a9f1755ad8df7c8dcc446b4"
+            },
+            {
+              "path": "crates/sandbox-protocol/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.458124,
+              "index": "spike-docs",
+              "id": "c89369d4f411f367525863206d7ae524"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase6_warm_pool_and_bench_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.311155,
+              "index": "spike-docs",
+              "id": "f0db40df18ed5fec673a7c79d752f443"
+            }
+          ]
+        },
+        {
+          "id": "e07",
+          "category": "english",
+          "query": "Ed25519 manifest signature validation",
+          "relevant": [
+            "crates/sandbox-image/src/crypto.rs",
+            "docs/release-candidate-v0.1.0.md"
+          ],
+          "rank_at_5": 2,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-image/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.47587,
+              "index": "spike-docs",
+              "id": "50ce17b0de72cd0dd97b7542e721dc4a"
+            },
+            {
+              "path": "crates/sandbox-image/src/crypto.rs",
+              "line": 1,
+              "name": null,
+              "score": 16.422195,
+              "index": "spike-docs",
+              "id": "861e788af186f83489d9e18f19495a67"
+            },
+            {
+              "path": "README.md",
+              "line": 66,
+              "name": null,
+              "score": 12.721809,
+              "index": "spike-docs",
+              "id": "a3991a7178b56ee171d77ccea4d83391"
+            },
+            {
+              "path": "README.md",
+              "line": 157,
+              "name": null,
+              "score": 11.849428,
+              "index": "spike-docs",
+              "id": "647a64dc0f478f6f99ed8e07f583f3ad"
+            },
+            {
+              "path": "crates/sandbox-image/src/manifest.rs",
+              "line": 1,
+              "name": null,
+              "score": 11.26656,
+              "index": "spike-docs",
+              "id": "289607b116abb59721059e7b7ace4abb"
+            }
+          ]
+        },
+        {
+          "id": "e08",
+          "category": "english",
+          "query": "warm pool discard used virtual machines",
+          "relevant": [
+            "crates/sandbox-runtime/src/warm_pool.rs",
+            "crates/sandbox-runtime/src/manager.rs",
+            "BRD.md"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "README.md",
+              "line": 594,
+              "name": null,
+              "score": 9.607528,
+              "index": "spike-docs",
+              "id": "62c3f29141584aa66076677b609abc8a"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 1,
+              "name": null,
+              "score": 9.297956,
+              "index": "spike-docs",
+              "id": "5a1777eb6750dc8e49e8346540ffa43e"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 54,
+              "name": null,
+              "score": 9.289403,
+              "index": "spike-docs",
+              "id": "31c6ca56e27b1856bae9f2166c67d770"
+            },
+            {
+              "path": "docs/release-candidate-v0.1.0.md",
+              "line": 82,
+              "name": null,
+              "score": 8.981519,
+              "index": "spike-docs",
+              "id": "48ded8a28b8f58b9844490786f045323"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 39,
+              "name": "Accelerator",
+              "score": 6.792992,
+              "index": "spike-docs",
+              "id": "136ee3ad771cedccae165a4fe2889123"
+            }
+          ]
+        },
+        {
+          "id": "v01",
+          "category": "vietnamese",
+          "query": "chặn địa chỉ IPv6 nội bộ",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/egress.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 27.714954,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 26.482615,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 273,
+              "name": null,
+              "score": 21.295849,
+              "index": "spike-docs",
+              "id": "71fb1b13555b3e05ad92a228555a0fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 258,
+              "name": null,
+              "score": 12.765456,
+              "index": "spike-docs",
+              "id": "893ad6b843ef743750a1693e6d8e330e"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 12.689932,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v02",
+          "category": "vietnamese",
+          "query": "từ chối symlink khi giải nén",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-core/src/safe_tar.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 26.940186,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 200,
+              "name": null,
+              "score": 19.110626,
+              "index": "spike-docs",
+              "id": "b8b2c0a0e314578de0688bb473ff295a"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 18.781235,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 17.125626,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 16.955118,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            }
+          ]
+        },
+        {
+          "id": "v03",
+          "category": "vietnamese",
+          "query": "thu hồi máy ảo khi hết hạn thuê",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/manager.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 29.716507,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            },
+            {
+              "path": "BRD.md",
+              "line": 289,
+              "name": null,
+              "score": 27.511322,
+              "index": "spike-docs",
+              "id": "9f1811bf0b2ed7ccab36e2127897bbca"
+            },
+            {
+              "path": "BRD.md",
+              "line": 278,
+              "name": null,
+              "score": 24.895338,
+              "index": "spike-docs",
+              "id": "934e30ac723f4086970a2482196a3cbe"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 23.291334,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 21.064007,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v04",
+          "category": "vietnamese",
+          "query": "không tự chuyển sang kernel dùng chung",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 25,
+              "name": null,
+              "score": 27.976181,
+              "index": "spike-docs",
+              "id": "5d5e50ccc935da6e429dc56dba40fd15"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 25.756826,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 238,
+              "name": null,
+              "score": 22.88925,
+              "index": "spike-docs",
+              "id": "102f3bddd716c91d9b8118063b11186b"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 19.423792,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 212,
+              "name": null,
+              "score": 18.602676,
+              "index": "spike-docs",
+              "id": "34b2e74fa9365eef8219aa454863885c"
+            }
+          ]
+        },
+        {
+          "id": "v05",
+          "category": "vietnamese",
+          "query": "thư mục và socket chỉ chủ sở hữu được truy cập",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 172,
+              "name": null,
+              "score": 45.948013,
+              "index": "spike-docs",
+              "id": "89c9bcc84fff78bfe6deb3943cef2fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 35.687946,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 35.488148,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            },
+            {
+              "path": "BRD.md",
+              "line": 191,
+              "name": null,
+              "score": 30.69389,
+              "index": "spike-docs",
+              "id": "3032e133bc3af76b1b5d34cd1ed4243d"
+            },
+            {
+              "path": "BRD.md",
+              "line": 273,
+              "name": null,
+              "score": 28.742765,
+              "index": "spike-docs",
+              "id": "71fb1b13555b3e05ad92a228555a0fec"
+            }
+          ]
+        },
+        {
+          "id": "v06",
+          "category": "vietnamese",
+          "query": "kiểm tra chữ ký trước khi cài gói",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-image/src/crypto.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 212,
+              "name": null,
+              "score": 33.115578,
+              "index": "spike-docs",
+              "id": "34b2e74fa9365eef8219aa454863885c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 27.937466,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 27.361727,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 57,
+              "name": null,
+              "score": 23.550457,
+              "index": "spike-docs",
+              "id": "fe4fa75c4775e65cf29f7b79c91db3e8"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 22.56102,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            }
+          ]
+        },
+        {
+          "id": "v07",
+          "category": "vietnamese",
+          "query": "giới hạn bộ nhớ thực trên máy chủ",
+          "relevant": [
+            "BRD.md"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 172,
+              "name": null,
+              "score": 34.180714,
+              "index": "spike-docs",
+              "id": "89c9bcc84fff78bfe6deb3943cef2fec"
+            },
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 29.685446,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 265,
+              "name": null,
+              "score": 25.379166,
+              "index": "spike-docs",
+              "id": "ace93773b92ad9411fd452e2459e86ea"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 25.058754,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            },
+            {
+              "path": "BRD.md",
+              "line": 252,
+              "name": null,
+              "score": 25.008781,
+              "index": "spike-docs",
+              "id": "4cb03492ba2467f6db69d219d9e045a5"
+            }
+          ]
+        },
+        {
+          "id": "v08",
+          "category": "vietnamese",
+          "query": "phục hồi tiến trình mồ côi sau crash",
+          "relevant": [
+            "BRD.md",
+            "crates/sandbox-runtime/src/journal.rs"
+          ],
+          "rank_at_5": 1,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 34.43523,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            },
+            {
+              "path": "BRD.md",
+              "line": 226,
+              "name": null,
+              "score": 31.225533,
+              "index": "spike-docs",
+              "id": "755b5e7eed4d6a81152e75423a68a442"
+            },
+            {
+              "path": "BRD.md",
+              "line": 278,
+              "name": null,
+              "score": 30.917372,
+              "index": "spike-docs",
+              "id": "934e30ac723f4086970a2482196a3cbe"
+            },
+            {
+              "path": "BRD.md",
+              "line": 289,
+              "name": null,
+              "score": 29.930733,
+              "index": "spike-docs",
+              "id": "9f1811bf0b2ed7ccab36e2127897bbca"
+            },
+            {
+              "path": "BRD.md",
+              "line": 152,
+              "name": null,
+              "score": 19.686296,
+              "index": "spike-docs",
+              "id": "81d9d8f4c4e0ae0a7d213c517c896c1e"
+            }
+          ]
+        },
+        {
+          "id": "l01",
+          "category": "synthetic_log",
+          "query": "stdout budget exceeded",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 985,
+              "name": "encode_resource_budget",
+              "score": 8.897972,
+              "index": "spike-docs",
+              "id": "e1d5ad0c1c0562a692c50c99ef1ffe96"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/accel.rs",
+              "line": 202,
+              "name": "parse_accel_help",
+              "score": 6.247135,
+              "index": "spike-docs",
+              "id": "084fb2b4a52d26b9dff803a360822a69"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/exec_stream.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.9797144,
+              "index": "spike-docs",
+              "id": "83586400b3deb39e6b38b869b1944893"
+            },
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 571,
+              "name": "ExecWireEvent",
+              "score": 5.6042433,
+              "index": "spike-docs",
+              "id": "de8e2e1e6cfa8cb17f1b20f87b101a53"
+            },
+            {
+              "path": "crates/sandbox-client/src/wire.rs",
+              "line": 1,
+              "name": null,
+              "score": 5.4735665,
+              "index": "spike-docs",
+              "id": "4ea50a77a471ab91b985df53349fee8a"
+            }
+          ]
+        },
+        {
+          "id": "l02",
+          "category": "synthetic_log",
+          "query": "guest handshake deadline expired",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "guest/sandbox-agent/src/supervisor.rs",
+              "line": 328,
+              "name": "PreparedCommand",
+              "score": 8.778598,
+              "index": "spike-docs",
+              "id": "e41e55fa6833e29bcbac6357a71f5dbe"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.920901,
+              "index": "spike-docs",
+              "id": "73729b4c9ac436a00769066a2b702286"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase3_runtime_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.426877,
+              "index": "spike-docs",
+              "id": "f3985803f0c8135960e9a497d9292213"
+            },
+            {
+              "path": "crates/sandbox-protocol/src/message.rs",
+              "line": 9,
+              "name": "ExecTargetWire",
+              "score": 5.7714167,
+              "index": "spike-docs",
+              "id": "550f26f2eb9ba33edab1ba65da985b9b"
+            },
+            {
+              "path": "crates/sandbox-core/src/exec.rs",
+              "line": 7,
+              "name": "ExecTarget",
+              "score": 5.7714167,
+              "index": "spike-docs",
+              "id": "c8c06a8704658e93efaa765683d12cde"
+            }
+          ]
+        },
+        {
+          "id": "l03",
+          "category": "synthetic_log",
+          "query": "overlay cleanup access denied",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "bins/sandboxd/tests/phase7_rc_drill_and_ipc_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.638678,
+              "index": "spike-docs",
+              "id": "604710de2dc84689b6f3f8a5a0f122ca"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase4_docker_compat_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.3077874,
+              "index": "spike-docs",
+              "id": "e25fa51a5cb884d4a3a738ebd17de037"
+            },
+            {
+              "path": "crates/sandbox-vmm/src/os/windows_job.rs",
+              "line": 1,
+              "name": null,
+              "score": 6.106533,
+              "index": "spike-docs",
+              "id": "df76e0a106d01e9b71fa40522fe70f0f"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/manager.rs",
+              "line": 3189,
+              "name": "remove_overlay_artifacts_with",
+              "score": 6.068384,
+              "index": "spike-docs",
+              "id": "511cd5dc15910152eb1da4ef7004ae2e"
+            },
+            {
+              "path": "crates/sandbox-docker-compat/src/policy.rs",
+              "line": 110,
+              "name": "ReaperSocketPolicy",
+              "score": 5.860406,
+              "index": "spike-docs",
+              "id": "e6c269887abcdf9fab467dfbe9b590d0"
+            }
+          ]
+        },
+        {
+          "id": "l04",
+          "category": "synthetic_log",
+          "query": "host RSS admission rejected",
+          "relevant": [
+            "diagnostics/events.jsonl"
+          ],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 1,
+              "name": null,
+              "score": 15.730255,
+              "index": "spike-docs",
+              "id": "392689000c5e5e66d4b4c0ef8cd661bc"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/lib.rs",
+              "line": 5,
+              "name": "admission",
+              "score": 9.108927,
+              "index": "spike-docs",
+              "id": "2cbe05367a032af7ccbe60dec400be2d"
+            },
+            {
+              "path": "crates/sandbox-runtime/src/admission.rs",
+              "line": 1,
+              "name": null,
+              "score": 8.213571,
+              "index": "spike-docs",
+              "id": "ce7e37413e0e178405f10ca7b03a27e5"
+            },
+            {
+              "path": "README.md",
+              "line": 244,
+              "name": null,
+              "score": 7.7189593,
+              "index": "spike-docs",
+              "id": "6cadad650fa8424c49c7c09064bcd445"
+            },
+            {
+              "path": "crates/sandbox-vmm/tests/phase5_egress_and_resources_e2e.rs",
+              "line": 1,
+              "name": null,
+              "score": 7.342722,
+              "index": "spike-docs",
+              "id": "f81ad6027ff7cd8aabca6fc7c12191ec"
+            }
+          ]
+        },
+        {
+          "id": "n01",
+          "category": "negative_exact",
+          "query": "absentmarkerf6cb739d48814df8ba66771268fabafe",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n02",
+          "category": "negative_exact",
+          "query": "absentmarker752de35d1f494afc94e40f5f61f5eb7e",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n03",
+          "category": "negative_natural",
+          "query": "photosynthesis chloroplast chlorophyll",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": true,
+          "hits": []
+        },
+        {
+          "id": "n04",
+          "category": "negative_natural",
+          "query": "diệp lục quang hợp lá cây",
+          "relevant": [],
+          "rank_at_5": null,
+          "empty": false,
+          "hits": [
+            {
+              "path": "BRD.md",
+              "line": 296,
+              "name": null,
+              "score": 9.144461,
+              "index": "spike-docs",
+              "id": "f3397f9b02232daae97ec127c522ad17"
+            },
+            {
+              "path": "BRD.md",
+              "line": 152,
+              "name": null,
+              "score": 6.184545,
+              "index": "spike-docs",
+              "id": "81d9d8f4c4e0ae0a7d213c517c896c1e"
+            },
+            {
+              "path": "BRD.md",
+              "line": 1,
+              "name": null,
+              "score": 4.3541713,
+              "index": "spike-docs",
+              "id": "56d678fe7dd7a509b7728775778d486c"
+            },
+            {
+              "path": "BRD.md",
+              "line": 57,
+              "name": null,
+              "score": 4.3541713,
+              "index": "spike-docs",
+              "id": "fe4fa75c4775e65cf29f7b79c91db3e8"
+            },
+            {
+              "path": "BRD.md",
+              "line": 179,
+              "name": null,
+              "score": 3.7029362,
+              "index": "spike-docs",
+              "id": "be17725ed3e6bbbd8084b3b396d695eb"
+            }
+          ]
+        }
+      ],
+      "indexed_records": 3719,
+      "indices": [
+        {
+          "health": "green",
+          "status": "open",
+          "index": "spike-diagnostics",
+          "uuid": "eae32a75-01bd-5686-116f-a1aa8836dd45",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "4",
+          "docs.deleted": "0",
+          "store.size": "13.1kb",
+          "pri.store.size": "13.1kb"
+        },
+        {
+          "health": "green",
+          "status": "open",
+          "index": "spike-docs",
+          "uuid": "188d6113-0794-bdcf-94ce-9baad7faee0a",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "3715",
+          "docs.deleted": "0",
+          "store.size": "4mb",
+          "pri.store.size": "4mb"
+        },
+        {
+          "health": "green",
+          "status": "open",
+          "index": "autoindex-catalog",
+          "uuid": "e1fe6145-1ddb-1bf1-6693-2fc9a0eb64bf",
+          "pri": "1",
+          "rep": "0",
+          "docs.count": "95",
+          "docs.deleted": "0",
+          "store.size": "83.8kb",
+          "pri.store.size": "83.8kb"
+        }
+      ],
+      "first_pass_ms": {
+        "n": 32,
+        "p50": 25.69,
+        "p95": 75.37,
+        "max": 451.765
+      },
+      "warm_ms": {
+        "n": 160,
+        "p50": 14.398,
+        "p95": 22.951,
+        "max": 33.962
+      },
+      "warm_category_ms": {
+        "english": {
+          "n": 40,
+          "p50": 13.78,
+          "p95": 25.629,
+          "max": 33.962
+        },
+        "negative_exact": {
+          "n": 10,
+          "p50": 10.819,
+          "p95": 19.666,
+          "max": 19.666
+        },
+        "negative_natural": {
+          "n": 10,
+          "p50": 13.085,
+          "p95": 16.8,
+          "max": 16.8
+        },
+        "symbol": {
+          "n": 40,
+          "p50": 14.08,
+          "p95": 20.211,
+          "max": 25.146
+        },
+        "synthetic_log": {
+          "n": 20,
+          "p50": 14.649,
+          "p95": 21.803,
+          "max": 22.441
+        },
+        "vietnamese": {
+          "n": 40,
+          "p50": 14.75,
+          "p95": 22.369,
+          "max": 26.782
+        }
+      },
+      "rank_changes_across_warm_rounds": 0,
+      "server_peak_hwm_kib": 267380,
+      "server_query_peak_rss_kib": 199148,
+      "indexer_observed_peak_hwm_kib": 133716,
+      "combined_sampled_peak_rss_kib": 392928,
+      "guest_min_available_kib": 553692,
+      "host_qemu_peak_rss_bytes": 714027008,
+      "host_sandbox_peak_allocated_bytes": 212467712,
+      "freshness_added_hit_at_5": false,
+      "incremental_probes": [
+        {
+          "probe": "unchanged-index",
+          "elapsed_ms": "1012.332",
+          "error": "unchanged-index exited signal: 4 (SIGILL)"
+        },
+        {
+          "probe": "changed-index",
+          "elapsed_ms": "882.965",
+          "error": "changed-index exited signal: 4 (SIGILL)"
+        }
+      ],
+      "integration_checks_passed": false,
+      "bm25_only_mapping_verified": true
+    }
+  ]
+}

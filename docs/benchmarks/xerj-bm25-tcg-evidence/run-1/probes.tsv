@@ -1,0 +1,3 @@
+probe	elapsed_ms	error
+unchanged-index	979.555	unchanged-index exited signal: 4 (SIGILL)
+changed-index	1004.856	changed-index exited signal: 4 (SIGILL)

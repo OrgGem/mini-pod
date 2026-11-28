@@ -1,0 +1,13 @@
+
+/out/xerj:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000f005a8 <.text+0xade528>:
+  f005a8:	66 0f 38 2b c1       	packusdw xmm0,xmm1
+  f005ad:	c3                   	ret
+  f005ae:	66 90                	xchg   ax,ax
+  f005b0:	66 0f 38 04 05 b7 55 	pmaddubsw xmm0,XMMWORD PTR [rip+0x34755b7]        # 0x4375b70
+  f005b7:	47 03 
+  f005b9:	c3                   	ret

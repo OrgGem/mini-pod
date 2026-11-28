@@ -1,0 +1,2 @@
+[   84.731060] traps: xerj-rt[1066] trap invalid opcode ip:7fe7e5b005b0 sp:7fe7c2c67fa8 error:0 in xerj[7fe7e5022000+3ebf000]
+[   85.805092] traps: xerj-rt[1155] trap invalid opcode ip:7f52353005b0 sp:7f521f730fa8 error:0 in xerj[7f5234822000+3ebf000]
